@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qagents"
+version = "0.1.0"
+description = "A small, explicit agent framework: one loop, typed tools, durable sessions, provider-neutral with first-class QCloud support."
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["agents", "llm", "tools", "qcloud", "openai-compatible"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.25,<1",
+    "pydantic>=2.6,<3",
+]
+
+[project.optional-dependencies]
+# qcloud-ai is not on PyPI yet. Until it is, install the SDK from source first
+# (see README), then this extra resolves against the installed package.
+qcloud = ["qcloud-ai>=0.4.0"]
+otel = ["opentelemetry-api>=1.20"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+    "opentelemetry-sdk>=1.20",
+    "fastapi>=0.110",  # for examples/serve_fastapi.py and its test
+]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.26",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qagents"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Markdown is left alone: the formatter rewrites snippet-include lines in code blocks.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+# Tool.run takes the run's per-call limit as ``timeout`` and applies it itself.
+ignore = ["ASYNC109"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests keep wire payloads and expected values on one line so they read as tables.
+"tests/*" = ["E501"]
