@@ -1,0 +1,458 @@
+"""The command line, driven through main(argv) with a scripted provider and no network."""
+
+from __future__ import annotations
+
+import io
+import json
+import subprocess
+import sys
+
+import httpx
+import pytest
+
+from qagents.cli import main
+from qagents.errors import ModelServerError
+from qagents.messages import Usage
+from qagents.models import base as model_base
+from qagents.models.base import ModelCapabilities
+from qagents.models.testing import ScriptedModel, call
+
+
+class PricedModel(ScriptedModel):
+    """A scripted model whose catalog lists prices, so cost limits can be enforced."""
+
+    async def capabilities(self) -> ModelCapabilities:
+        return ModelCapabilities(input_price_per_million=1.0, output_price_per_million=2.0)
+
+
+@pytest.fixture
+def script(monkeypatch):
+    """Register the provider prefix "test"; it answers with the replies given.
+
+    Returns the list of every model built so far: the newest is last.
+    """
+    monkeypatch.delenv("QAGENTS_MODEL", raising=False)
+    built: list[ScriptedModel] = []
+
+    def install(*replies, priced: bool = False, usage: Usage | None = None):
+        def factory(name: str) -> ScriptedModel:
+            model = (PricedModel if priced else ScriptedModel)(
+                list(replies), name=name, usage=usage
+            )
+            built.append(model)
+            return model
+
+        monkeypatch.setitem(model_base._PROVIDERS, "test", factory)
+        return built
+
+    return install
+
+
+def cli(*argv: str, stdin: str = "") -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    code = main(list(argv), stdin=io.StringIO(stdin), stdout=out, stderr=err)
+    return code, out.getvalue(), err.getvalue()
+
+
+# --- run ------------------------------------------------------------------------------
+
+
+def test_run_prints_the_answer_and_the_usage(script):
+    models = script("Hello there.", usage=Usage(requests=1, input_tokens=12, output_tokens=3))
+
+    code, out, err = cli("run", "Hi", "--model", "test:echo")
+
+    assert code == 0 and err == ""
+    assert (
+        out == "Hello there.\n\n[usage] 1 request, 12 input + 3 output tokens, cost not reported\n"
+    )
+    (request,) = models[0].requests
+    assert [m.role for m in request.messages] == ["user"]  # no instructions were added
+    assert request.tools == []
+
+
+def test_run_shows_tool_activity_on_stderr_and_only_the_answer_on_stdout(script):
+    models = script(call("current_time", timezone="UTC"), "It is noon.")
+
+    code, out, err = cli("run", "What time is it?", "--model", "test:m", "--tools", "time")
+
+    assert code == 0
+    assert out.startswith("It is noon.\n\n[usage] 2 requests")
+    assert '  -> current_time(timezone="UTC")\n' in err
+    assert "  <- current_time: " in err
+    assert [spec.name for spec in models[0].requests[0].tools] == ["current_time"]
+
+
+def test_run_passes_instructions_and_limits(script):
+    models = script(call("current_time"), "never sent")
+
+    code, out, err = cli(
+        "run", "Time?", "--model", "test:m", "--tools", "time",
+        "--instructions", "Be brief.", "--max-turns", "1", "--max-tokens", "50",
+    )  # fmt: skip
+
+    assert code == 1
+    assert "The run stopped without an answer: max_turns." in err
+    (request,) = models[0].requests
+    assert request.messages[0].role == "system" and request.messages[0].text == "Be brief."
+    assert request.settings.max_tokens == 50
+
+
+def test_run_as_json(script):
+    script(call("current_time"), "Noon.")
+
+    code, out, _ = cli("run", "Time?", "--model", "test:m", "--tools", "time", "--json")
+
+    assert code == 0
+    data = json.loads(out)
+    assert data["status"] == "completed" and data["output"] == "Noon."
+    assert data["usage"]["requests"] == 2
+    assert [m["role"] for m in data["messages"]] == ["user", "assistant", "tool", "assistant"]
+
+
+def test_run_exits_non_zero_when_the_model_fails(script):
+    script(ModelServerError("upstream is down", provider="test"))
+
+    code, out, err = cli("run", "Hi", "--model", "test:m")
+    assert code == 1 and out == ""
+    assert "error: upstream is down" in err
+
+    script(ModelServerError("upstream is down", provider="test"))
+    code, out, _ = cli("run", "Hi", "--model", "test:m", "--json")
+    assert code == 1
+    assert json.loads(out) == {
+        "status": "error",
+        "error": {"type": "ModelServerError", "message": "upstream is down"},
+    }
+
+
+def test_run_reads_the_prompt_from_stdin(script):
+    models = script("Read it.")
+
+    code, out, _ = cli("run", "-", "--model", "test:m", stdin="A long prompt\nover two lines\n")
+
+    assert code == 0 and out.startswith("Read it.")
+    assert models[0].requests[0].messages[-1].text == "A long prompt\nover two lines\n"
+
+
+def test_run_asks_before_a_tool_with_side_effects(script, tmp_path):
+    models = script(call("write_file", path="hello.txt", content="hi"), "Written.")
+
+    code, out, err = cli(
+        "run", "Write hello.txt", "--model", "test:m", "--tools", "files",
+        "--workspace", str(tmp_path), stdin="y\n",
+    )  # fmt: skip
+
+    assert code == 0
+    assert '  [approve] write_file(path="hello.txt", content="hi")? [y/N] ' in err
+    assert (tmp_path / "hello.txt").read_text() == "hi"
+    assert models[0].requests[1].messages[-1].tool_results[0].is_error is False
+
+
+def test_run_declines_when_there_is_no_answer(script, tmp_path):
+    models = script(call("write_file", path="hello.txt", content="hi"), "I could not write it.")
+
+    code, out, err = cli(
+        "run", "Write hello.txt", "--model", "test:m", "--tools", "files",
+        "--workspace", str(tmp_path),
+    )  # fmt: skip
+
+    assert code == 0 and not (tmp_path / "hello.txt").exists()
+    assert "(no answer: declined)" in err and "  !! write_file:" in err
+    result = models[0].requests[1].messages[-1].tool_results[0]
+    assert result.is_error and "declined" in result.content
+
+
+# --- chat ----------------------------------------------------------------------------
+
+
+def test_chat_streams_answers_and_handles_commands(script):
+    models = script("Hi!", "Bye!", usage=Usage(requests=1, input_tokens=10, output_tokens=2))
+
+    code, out, err = cli(
+        "chat", "--model", "test:m", stdin="hello\n/usage\n\n/help\n/nope\nagain\n/exit\nignored\n"
+    )
+
+    assert code == 0 and err == ""
+    assert out.startswith("qagents chat with test:m (no tools), conversation kept in memory.\n")
+    assert "\nyou> Hi!\n" in out and "\nyou> Bye!\n" in out
+    assert "1 request, 10 input + 2 output tokens, cost not reported" in out
+    assert "/reset  start a new conversation" in out
+    assert "Unknown command /nope." in out
+    # The second prompt continues the same conversation.
+    assert [m.role for m in models[0].requests[1].messages] == ["user", "assistant", "user"]
+
+
+def test_chat_ends_at_the_end_of_input(script):
+    script("One.")
+    code, out, _ = cli("chat", "--model", "test:m", stdin="first\n")
+    assert code == 0 and out.endswith("you> \n")
+
+
+def test_chat_reset_starts_a_new_conversation(script):
+    models = script("One.", "Two.")
+
+    code, out, _ = cli("chat", "--model", "test:m", stdin="first\n/reset\nsecond\n")
+
+    assert code == 0 and "Started a new conversation" in out
+    assert [m.text for m in models[0].requests[1].messages] == ["second"]
+
+
+def test_chat_keeps_the_conversation_in_a_database(script, tmp_path):
+    db = str(tmp_path / "chat.db")
+    script("Nice to meet you, Maria.")
+    assert (
+        cli("chat", "--model", "test:m", "--db", db, "--session", "u1", stdin="I am Maria.\n")[0]
+        == 0
+    )
+
+    models = script("You are Maria.")
+    code, out, _ = cli(
+        "chat", "--model", "test:m", "--db", db, "--session", "u1", stdin="Who am I?\n"
+    )
+
+    assert code == 0 and "session 'u1' in" in out
+    assert [m.text for m in models[-1].requests[0].messages] == [
+        "I am Maria.",
+        "Nice to meet you, Maria.",
+        "Who am I?",
+    ]
+
+
+def test_chat_reset_with_a_database_keeps_the_old_conversation(script, tmp_path):
+    db = str(tmp_path / "chat.db")
+    models = script("One.", "Two.")
+
+    code, out, _ = cli("chat", "--model", "test:m", "--db", db, stdin="first\n/reset\nsecond\n")
+
+    assert code == 0 and "session 'default~" in out
+    assert [m.text for m in models[0].requests[1].messages] == ["second"]
+    later = script("Still here.")
+    cli("chat", "--model", "test:m", "--db", db, stdin="again\n")
+    assert [m.text for m in later[-1].requests[0].messages] == ["first", "One.", "again"]
+
+
+def test_chat_shows_tool_calls_and_asks_inline(script, tmp_path):
+    script(call("write_file", path="a.txt", content="x"), "Done.")
+
+    code, out, _ = cli(
+        "chat", "--model", "test:m", "--tools", "files,time", "--workspace", str(tmp_path),
+        stdin="write a.txt\ny\n/exit\n",
+    )  # fmt: skip
+
+    assert code == 0 and (tmp_path / "a.txt").read_text() == "x"
+    assert "(tools: files, time)" in out
+    assert '  [approve] write_file(path="a.txt", content="x")? [y/N] ' in out
+    assert "  -> write_file(" in out and "  <- write_file: " in out
+    assert out.index("  <- write_file") < out.index("Done.")
+
+
+def test_chat_reports_errors_and_carries_on(script):
+    script(ModelServerError("upstream is down", provider="test"), "Back again.")
+
+    code, out, _ = cli("chat", "--model", "test:m", stdin="one\ntwo\n")
+
+    assert code == 0
+    assert "error: upstream is down" in out and "Back again." in out
+
+
+def test_chat_answers_questions_from_the_agent(script):
+    pytest.importorskip("qagents.toolkits.human")
+    models = script(call("ask_user", question="Which city?", choices=["Athens", "Rome"]), "Athens.")
+
+    code, out, _ = cli("chat", "--model", "test:m", "--tools", "ask", stdin="Plan a trip\nAthens\n")
+
+    assert code == 0
+    assert "  [ask_user] Which city? (Athens / Rome)\n  answer> " in out
+    assert models[0].requests[1].messages[-1].tool_results[0].content == "Athens"
+
+
+def test_max_cost_spans_the_whole_chat(script):
+    models = script("One.", "Two.", "Three.", priced=True, usage=Usage(requests=1, cost_usd=0.6))
+
+    code, out, _ = cli("chat", "--model", "test:m", "--max-cost", "1", stdin="a\nb\nc\n/usage\n")
+
+    assert code == 0
+    assert len(models[0].requests) == 2
+    assert "The --max-cost budget of $1 is used up" in out
+    assert "2 requests, 0 input + 0 output tokens, $1.200000" in out
+
+
+def test_max_cost_needs_a_priced_model(script):
+    script("never")
+    code, _, err = cli("run", "Hi", "--model", "test:m", "--max-cost", "0.5")
+    assert code == 2
+    assert "--max-cost needs a model with known prices" in err
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["run", "Hi"], "--model is required"),
+        (["run", "Hi", "--model", "nowhere:m"], "Unknown model provider 'nowhere'"),
+        (["run", "Hi", "--model", "test:m", "--tools", "time,lasers"], "unknown tool set 'lasers'"),
+        (["run", "Hi", "--model", "test:m", "--session", "s"], "add --db PATH"),
+        (["run", "Hi", "--model", "test:m", "--workspace", "no/such/dir"], "is not a directory"),
+        (["run", "Hi", "--model", "test:m", "--max-turns", "0"], "at least 1"),
+        (["run", "  ", "--model", "test:m"], "the prompt is empty"),
+        (["fly"], "invalid choice"),
+        (["models", "elsewhere"], "invalid choice"),
+    ],
+)
+def test_command_line_mistakes_exit_with_2(script, argv, message):
+    script("never")
+    code, out, err = cli(*argv)
+    assert code == 2 and message in err
+
+
+def test_help_goes_to_stdout():
+    code, out, _ = cli("chat", "--help")
+    assert code == 0 and "--max-cost USD" in out
+
+
+def test_python_dash_m_runs_the_command():
+    done = subprocess.run(
+        [sys.executable, "-m", "qagents", "--help"], capture_output=True, text=True, timeout=60
+    )
+    assert done.returncode == 0 and "chat" in done.stdout and "models" in done.stdout
+
+
+# --- models ---------------------------------------------------------------------------
+
+
+CATALOG = {
+    "object": "list",
+    "data": [
+        {
+            "id": "zeta-large",
+            "display_name": "Zeta",
+            "context_length": 200000,
+            "capabilities": ["tools", "vision"],
+            "pricing": {"input_per_million": 3, "output_per_million": 15},
+        },
+        {
+            "id": "alpha-mini",
+            "display_name": "Alpha",
+            "context_length": 128000,
+            "capabilities": ["tools"],
+            "pricing": {"input_per_million": 0.15, "output_per_million": 0.6},
+        },
+        {
+            "id": "text-only",
+            "display_name": "Plain",
+            "context_length": 8000,
+            "capabilities": [],
+            "pricing": {"input_per_million": 0.005, "output_per_million": 0.01},
+        },
+    ],
+    "catalog": {"last_updated_at": "2026-11-10T08:00:00Z", "stale": False},
+}
+
+
+@pytest.fixture
+def catalog(monkeypatch):
+    """Answer httpx.get with a canned catalog and record the requests."""
+    seen: list[tuple[str, dict]] = []
+    replies: list = [httpx.Response(200, json=CATALOG)]
+
+    def fake_get(url, **options):
+        seen.append((url, options))
+        reply = replies[0]
+        if isinstance(reply, Exception):
+            raise reply
+        reply.request = httpx.Request("GET", url)
+        return reply
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.delenv("QCLOUD_BASE_URL", raising=False)
+    return seen, replies
+
+
+def test_models_lists_tool_capable_models_with_prices(catalog):
+    seen, _ = catalog
+
+    code, out, err = cli("models", "qcloud")
+
+    assert code == 0 and err == ""
+    lines = out.splitlines()
+    assert lines[0].split() == [
+        "MODEL",
+        "CONTEXT",
+        "INPUT",
+        "$/1M",
+        "OUTPUT",
+        "$/1M",
+        "CAPABILITIES",
+    ]
+    assert lines[1].split() == ["alpha-mini", "128,000", "0.15", "0.60", "tools"]
+    assert lines[2].split() == ["zeta-large", "200,000", "3.00", "15.00", "tools,", "vision"]
+    assert "text-only" not in out
+    assert "Use one with --model qcloud:alpha-mini" in out
+    ((url, options),) = seen
+    assert url == "https://platform.qcloud.host/api/public/models"
+    assert "authorization" not in {key.lower() for key in options.get("headers", {})}
+
+
+def test_models_as_json_and_with_all_models(catalog, monkeypatch):
+    seen, _ = catalog
+    monkeypatch.setenv("QCLOUD_BASE_URL", "https://staging.example.test/api/v1/")
+
+    code, out, _ = cli("models", "qcloud", "--all", "--json")
+
+    assert code == 0
+    rows = json.loads(out)
+    assert [row["id"] for row in rows] == ["alpha-mini", "text-only", "zeta-large"]
+    assert rows[1] == {
+        "id": "text-only",
+        "name": "Plain",
+        "context_length": 8000,
+        "max_output_tokens": None,
+        "capabilities": [],
+        "input_per_million": 0.005,
+        "output_per_million": 0.01,
+    }
+    assert seen[0][0] == "https://staging.example.test/api/public/models"
+
+
+def test_models_reports_an_unreachable_catalog(catalog):
+    _, replies = catalog
+    replies[0] = httpx.ConnectError("no route to host")
+
+    code, out, err = cli("models", "qcloud", "--base-url", "https://qcloud.example.test/api/v1")
+
+    assert code == 1 and out == ""
+    assert (
+        "Could not read the QCloud catalog at https://qcloud.example.test/api/public/models" in err
+    )
+    assert "no route to host" in err
+
+
+def test_models_reports_a_bad_answer_and_a_stale_catalog(catalog):
+    _, replies = catalog
+    replies[0] = httpx.Response(503, json={"error": {"message": "catalog unavailable"}})
+    code, _, err = cli("models", "qcloud")
+    assert code == 1 and "503" in err
+
+    replies[0] = httpx.Response(200, json={"object": "list"})
+    code, _, err = cli("models", "qcloud")
+    assert code == 1 and "did not return a model list" in err
+
+    replies[0] = httpx.Response(
+        200, json={**CATALOG, "catalog": {"stale": True, "last_updated_at": "2026-11-01"}}
+    )
+    code, out, err = cli("models", "qcloud")
+    assert code == 0 and "alpha-mini" in out
+    assert "stale (last updated: 2026-11-01)" in err
+
+
+def test_models_search_filters_by_id_and_name(catalog):
+    code, out, _ = cli("models", "qcloud", "--search", "ZETA")
+    assert code == 0 and "zeta-large" in out and "alpha-mini" not in out
+
+    code, out, _ = cli("models", "qcloud", "--search", "Plain")
+    assert (
+        code == 0 and out == "The catalog lists no models that can call tools matching 'Plain'.\n"
+    )
+
+    code, out, _ = cli("models", "qcloud", "--search", "plain", "--all", "--json")
+    assert [row["id"] for row in json.loads(out)] == ["text-only"]

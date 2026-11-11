@@ -15,30 +15,46 @@ Entry kinds:
 | `message` | a message joined the conversation (`message`) |
 | `tool_started` | a tool call began executing (`tool_call_id`, `name`) |
 | `tool_result` | a tool call finished (`result`) |
+| `tool_deferred` | a tool call waits for a result from outside the run (`input`) |
+| `state_updated` | the session state changed; the full new values (`values`) |
 | `agent_switched` | a handoff changed the active agent (`agent`) |
-| `run_paused` | the run is waiting for approvals (`pending`) |
+| `run_paused` | the run waits for approvals and inputs (`pending`, `inputs`) |
 | `run_finished` | the run ended (`status`, `stop_reason`) |
 | `run_failed` | the run raised and stays open for a resume (`error`) |
 | `compaction` | the history was replaced by a shorter one (`messages`) |
 | `workflow_step` | a workflow step completed (`name`, `result`) |
 
-Readers must ignore kinds they do not know: new ones may be added.
+Readers must ignore kinds they do not know: new ones may be added. A
+`run_paused` entry written before 0.2 has no ``inputs``; it loads as a pause
+with no pending inputs.
+
+Run status and leases (0.2) are optional store capabilities that
+`qagents.runtime.AgentRuntime` builds on. A store that has them keeps one
+`SessionStatus` row per session next to the journal, updated in the same
+transaction as every `append`, so finding the sessions whose run is
+``"running"`` or ``"failed"`` does not mean reading every journal. A lease
+names the one worker allowed to drive a session's run; `append_leased`
+writes only while the caller still holds it. `InMemoryStore`, `SQLiteStore`
+and `qagents.stores.postgres.PostgresStore` implement both.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sqlite3
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field
 
+from .errors import LeaseError, SessionError
 from .messages import Message, ToolResultPart
 
 
@@ -58,6 +74,29 @@ class PendingApproval(BaseModel):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     reason: str | None = None
+    token: str | None = None
+    """Opaque token that proves the pause is genuine, when pauses are signed."""
+
+
+class PendingInput(BaseModel):
+    """A tool call whose result must come from outside the run.
+
+    The loop creates one for every call of a tool declared ``deferred=True``
+    and for every call whose tool raised `DeferToolCall`. Supply the result
+    with ``agent.resume(session, results={tool_call_id: value})``.
+    """
+
+    tool_call_id: str
+    name: str
+    """Name of the tool the model called."""
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    """The arguments of the call, after approvals and hooks changed them."""
+    reason: str | None = None
+    """``None`` for a deferred tool; the reason given to `DeferToolCall` otherwise."""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    """Data the tool attached with `DeferToolCall`, for example an external job id."""
+    token: str | None = None
+    """Opaque token that proves the pause is genuine, when pauses are signed."""
 
 
 class SessionState(BaseModel):
@@ -73,6 +112,11 @@ class SessionState(BaseModel):
     started_tools: list[str] = Field(default_factory=list)
     """Tool calls that began executing and have no recorded result."""
     pending_approvals: list[PendingApproval] = Field(default_factory=list)
+    """Tool calls of the paused run that wait for a decision."""
+    pending_inputs: list[PendingInput] = Field(default_factory=list)
+    """Tool calls of the open run that wait for a result from outside the run."""
+    values: dict[str, Any] = Field(default_factory=dict)
+    """The session state that tools and hooks see as ``ctx.state``, as last journaled."""
     run_messages: int = 0
     """How many messages the latest run has written to the journal."""
 
@@ -85,9 +129,19 @@ class SessionState(BaseModel):
 
 
 def derive_state(entries: list[Entry]) -> SessionState:
-    """Replay a journal into the current `SessionState`."""
+    """Replay a journal into the current `SessionState`.
+
+    Args:
+        entries: The session's entries, oldest first. Unknown kinds are ignored.
+
+    Returns:
+        The state after the last entry. ``values`` is a copy: changing it does
+        not change the journal.
+    """
     state = SessionState()
     started: dict[str, None] = {}
+    inputs: dict[str, PendingInput] = {}
+    values: dict[str, Any] = {}
     for entry in entries:
         kind, data = entry.kind, entry.data
         if kind == "message":
@@ -96,12 +150,23 @@ def derive_state(entries: list[Entry]) -> SessionState:
             state.tool_results = {}
             state.pending_approvals = []
             started = {}
+            inputs = {}
         elif kind == "tool_started":
             started[data["tool_call_id"]] = None
         elif kind == "tool_result":
             result = ToolResultPart.model_validate(data["result"])
             state.tool_results[result.tool_call_id] = result
             started.pop(result.tool_call_id, None)
+            inputs.pop(result.tool_call_id, None)
+            state.pending_approvals = [
+                item for item in state.pending_approvals if item.tool_call_id != result.tool_call_id
+            ]
+        elif kind == "tool_deferred":
+            waiting = PendingInput.model_validate(data["input"])
+            started.pop(waiting.tool_call_id, None)
+            inputs[waiting.tool_call_id] = waiting
+        elif kind == "state_updated":
+            values = data.get("values", {})
         elif kind == "run_started":
             state.open_run_id = entry.run_id
             state.agent = data.get("agent")
@@ -112,18 +177,121 @@ def derive_state(entries: list[Entry]) -> SessionState:
             state.pending_approvals = [
                 PendingApproval.model_validate(item) for item in data.get("pending", [])
             ]
+            if "inputs" in data:  # absent in journals written before 0.2
+                listed = [PendingInput.model_validate(item) for item in data["inputs"]]
+                inputs = {item.tool_call_id: item for item in listed}
         elif kind == "run_finished":
             if entry.run_id == state.open_run_id:
                 state.open_run_id = None
                 state.pending_approvals = []
+                inputs = {}
         elif kind == "compaction":
             state.messages = [Message.model_validate(item) for item in data["messages"]]
     state.started_tools = list(started)
+    state.pending_inputs = list(inputs.values())
+    state.values = copy.deepcopy(values)
     return state
 
 
+SessionRunStatus = Literal["idle", "running", "paused", "failed"]
+"""Where a session's latest run stands, as the store tracks it (`SessionStatus.status`)."""
+
+_RUN_STATUSES = frozenset(get_args(SessionRunStatus))
+
+
+class SessionStatus(BaseModel):
+    """What a store tracks about a session next to its journal.
+
+    Returned by `SessionStore.status` and `SessionStore.list_sessions`. The
+    run fields follow the entry kinds that `append` writes:
+
+    | After | ``status`` |
+    |---|---|
+    | `run_started` | ``"running"`` |
+    | `run_paused` | ``"paused"`` |
+    | `run_failed` | ``"failed"``: the run raised and is still open, so it can be resumed |
+    | `run_finished` of the open run | ``"idle"`` |
+    | any other entry of a paused or failed open run | ``"running"``: it was resumed |
+
+    A resumed run writes no `run_started`, so a paused or failed run turns
+    ``"running"`` again with its first new entry. Until then it keeps its old
+    status: a resume that is waiting for the model still shows ``"failed"``.
+    """
+
+    session_id: str
+    status: SessionRunStatus = "idle"
+    open_run_id: str | None = None
+    """Id of the run that started and has not finished."""
+    agent: str | None = None
+    """Name of the agent that started the latest run, from its `run_started`
+    entry. After a handoff it is still the first agent: the one to call
+    ``resume`` on."""
+    failures: int = 0
+    """How many `run_failed` entries the open run has written."""
+    updated_at: float | None = None
+    """When entries were last appended, in seconds since the epoch on the
+    store's clock. ``None`` when the session has no entries."""
+    lease_owner: str | None = None
+    """The worker that holds the lease, or held it until it expired. ``None``
+    when the lease was released or never taken."""
+    lease_expires_at: float | None = None
+    """When the lease expires, in seconds since the epoch on the store's clock."""
+
+    def lease_active(self, now: float | None = None) -> bool:
+        """True when a worker holds a lease that has not expired.
+
+        Args:
+            now: The current time on the store's clock. Defaults to
+                ``time.time()``, which is the clock of `InMemoryStore` and
+                `SQLiteStore`. `PostgresStore` uses the database server's
+                clock, so with it this is only as exact as the two clocks agree.
+        """
+        if self.lease_owner is None or self.lease_expires_at is None:
+            return False
+        return self.lease_expires_at > (time.time() if now is None else now)
+
+
+def advance_status(status: SessionStatus, entry: Entry) -> None:
+    """Update ``status`` in place for one appended entry. For store implementers.
+
+    Stores call it for every entry inside the transaction of `append`, so the
+    status always matches the journal. It reads only ``entry.kind``,
+    ``entry.run_id`` and, for `run_started`, ``entry.data["agent"]``. Entries
+    that do not belong to the open run (a workflow step, the late close of an
+    older run) leave the status as it is.
+    """
+    kind = entry.kind
+    if kind == "run_started":
+        status.status = "running"
+        status.open_run_id = entry.run_id
+        status.agent = entry.data.get("agent")
+        status.failures = 0
+    elif status.open_run_id is None or entry.run_id != status.open_run_id:
+        return
+    elif kind == "run_finished":
+        status.status = "idle"
+        status.open_run_id = None
+        status.failures = 0
+    elif kind == "run_paused":
+        status.status = "paused"
+    elif kind == "run_failed":
+        status.status = "failed"
+        status.failures += 1
+    else:
+        status.status = "running"
+
+
 class SessionStore(ABC):
-    """Where journals live. Implement three methods to add a backend."""
+    """Where journals live. Implement three methods to add a backend.
+
+    `append`, `load` and `delete` are all a session needs. The other methods
+    are optional capabilities used by `qagents.runtime.AgentRuntime`: run
+    status (`status`, `list_sessions`) and leases (`acquire_lease`,
+    `renew_lease`, `release_lease`, `append_leased`). Their defaults raise
+    `NotImplementedError`. A store that implements them must update the
+    status in the same transaction as the entries (see `advance_status`) and
+    check the lease in the same transaction as an `append_leased` write.
+    """
 
     @abstractmethod
     async def append(self, session_id: str, entries: list[Entry]) -> None:
@@ -140,29 +308,220 @@ class SessionStore(ABC):
     async def aclose(self) -> None:  # noqa: B027 - optional to override
         """Release what the store holds."""
 
+    # -- optional: run status --------------------------------------------------------
+
+    async def status(self, session_id: str) -> SessionStatus:
+        """Return the tracked status of one session.
+
+        A session the store has never seen comes back as ``"idle"`` with
+        ``updated_at=None``.
+        """
+        raise NotImplementedError(_unsupported(self, "run status"))
+
+    async def list_sessions(
+        self,
+        status: str | Iterable[str] | None = None,
+        prefix: str | None = None,
+        limit: int | None = None,
+    ) -> list[SessionStatus]:
+        """List sessions that have entries, least recently updated first.
+
+        Args:
+            status: Keep only sessions with this status, or with any of these
+                statuses (``"idle"``, ``"running"``, ``"paused"``, ``"failed"``).
+            prefix: Keep only session ids that start with this text.
+            limit: Return at most this many.
+
+        Raises:
+            ValueError: ``status`` names an unknown status, or ``limit`` is negative.
+        """
+        raise NotImplementedError(_unsupported(self, "run status"))
+
+    # -- optional: leases ------------------------------------------------------------
+
+    async def acquire_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
+        """Take the session's lease for ``ttl_s`` seconds.
+
+        Succeeds when the lease is free, has expired, or is already held by
+        ``owner`` (which renews it). The session need not have entries yet.
+
+        Returns:
+            True when ``owner`` now holds the lease.
+        """
+        raise NotImplementedError(_unsupported(self, "leases"))
+
+    async def renew_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
+        """Extend ``owner``'s lease to ``ttl_s`` seconds from now.
+
+        Returns:
+            True when ``owner`` still held the lease. A lease that expired but
+            was not taken by another worker is still held and is renewed.
+        """
+        raise NotImplementedError(_unsupported(self, "leases"))
+
+    async def release_lease(self, session_id: str, owner: str) -> None:
+        """Give up ``owner``'s lease. Does nothing when ``owner`` does not hold it."""
+        raise NotImplementedError(_unsupported(self, "leases"))
+
+    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
+        """Append like `append`, but only while ``owner`` holds the session's lease.
+
+        The lease check and the write happen in one transaction, so a worker
+        whose lease was taken over can no longer write to the journal (the
+        lease acts as a fencing token).
+
+        Raises:
+            LeaseError: ``owner`` does not hold the lease. Nothing was written.
+        """
+        raise NotImplementedError(_unsupported(self, "leases"))
+
+
+def _unsupported(store: SessionStore, capability: str) -> str:
+    return (
+        f"{type(store).__name__} does not support {capability}. Use InMemoryStore, SQLiteStore "
+        "or qagents.stores.postgres.PostgresStore, or implement the optional SessionStore "
+        "methods (status, list_sessions, acquire_lease, renew_lease, release_lease, "
+        "append_leased)."
+    )
+
+
+def _status_filter(status: str | Iterable[str] | None) -> set[str] | None:
+    """Normalise the ``status`` argument of `SessionStore.list_sessions`."""
+    if status is None:
+        return None
+    wanted = {status} if isinstance(status, str) else set(status)
+    unknown = sorted(wanted - _RUN_STATUSES)
+    if unknown:
+        raise ValueError(
+            f"Unknown session status {unknown}; use one or more of {sorted(_RUN_STATUSES)}."
+        )
+    return wanted
+
+
+def _check_limit(limit: int | None) -> None:
+    if limit is not None and limit < 0:
+        raise ValueError(f"limit must be None or at least 0, not {limit}.")
+
+
+def _check_ttl(ttl_s: float) -> None:
+    if not ttl_s > 0 or ttl_s == float("inf"):
+        raise ValueError(f"A lease needs a finite ttl_s above 0 seconds, not {ttl_s!r}.")
+
+
+def _lease_lost(session_id: str, owner: str, holder: str | None) -> str:
+    who = f"worker {holder!r} holds it now" if holder else "nobody holds it now"
+    return (
+        f"Worker {owner!r} no longer holds the lease on session {session_id!r} ({who}), so "
+        "its entries were not written. Another worker may be driving this run; stop this one."
+    )
+
 
 class InMemoryStore(SessionStore):
-    """Keeps journals in a dict. For tests and for sessions that need not survive a restart."""
+    """Keeps journals in a dict. For tests and for sessions that need not survive a restart.
+
+    Run status and leases are supported, with ``time.time()`` as the clock.
+    They only coordinate tasks of one process, since nothing else can see
+    the store.
+    """
 
     def __init__(self) -> None:
         self._sessions: dict[str, list[Entry]] = {}
+        self._status: dict[str, SessionStatus] = {}
+
+    def _row(self, session_id: str) -> SessionStatus:
+        return self._status.setdefault(session_id, SessionStatus(session_id=session_id))
+
+    def _write(self, session_id: str, entries: list[Entry]) -> None:
+        if not entries:
+            return
+        journal = self._sessions.setdefault(session_id, [])
+        row = self._row(session_id)
+        for entry in entries:
+            stored = entry.model_copy(update={"seq": len(journal) + 1})
+            journal.append(stored)
+            advance_status(row, stored)
+        row.updated_at = time.time()
 
     async def append(self, session_id: str, entries: list[Entry]) -> None:
-        journal = self._sessions.setdefault(session_id, [])
-        for entry in entries:
-            journal.append(entry.model_copy(update={"seq": len(journal) + 1}))
+        self._write(session_id, entries)
+
+    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
+        row = self._status.get(session_id)
+        holder = row.lease_owner if row is not None else None
+        if holder != owner:
+            raise LeaseError(_lease_lost(session_id, owner, holder))
+        self._write(session_id, entries)
 
     async def load(self, session_id: str) -> list[Entry]:
         return list(self._sessions.get(session_id, []))
 
     async def delete(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
+        self._status.pop(session_id, None)
+
+    async def status(self, session_id: str) -> SessionStatus:
+        row = self._status.get(session_id)
+        return row.model_copy() if row is not None else SessionStatus(session_id=session_id)
+
+    async def list_sessions(
+        self,
+        status: str | Iterable[str] | None = None,
+        prefix: str | None = None,
+        limit: int | None = None,
+    ) -> list[SessionStatus]:
+        wanted = _status_filter(status)
+        _check_limit(limit)
+        rows = [
+            row
+            for row in self._status.values()
+            if row.updated_at is not None
+            and (wanted is None or row.status in wanted)
+            and (prefix is None or row.session_id.startswith(prefix))
+        ]
+        rows.sort(key=lambda row: (row.updated_at or 0.0, row.session_id))
+        return [row.model_copy() for row in rows[:limit]]
+
+    async def acquire_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
+        _check_ttl(ttl_s)
+        now = time.time()
+        row = self._row(session_id)
+        if row.lease_owner not in (None, owner) and (row.lease_expires_at or 0.0) > now:
+            return False
+        row.lease_owner, row.lease_expires_at = owner, now + ttl_s
+        return True
+
+    async def renew_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
+        _check_ttl(ttl_s)
+        row = self._status.get(session_id)
+        if row is None or row.lease_owner != owner:
+            return False
+        row.lease_expires_at = time.time() + ttl_s
+        return True
+
+    async def release_lease(self, session_id: str, owner: str) -> None:
+        row = self._status.get(session_id)
+        if row is not None and row.lease_owner == owner:
+            row.lease_owner, row.lease_expires_at = None, None
+
+
+_SQLITE_SCHEMA_VERSION = 1
+"""Stored in ``PRAGMA user_version``. 0 is a 0.1 database: the entries table only."""
+
+_SQLITE_STATUS_COLUMNS = (
+    "session_id, status, open_run_id, agent, failures, updated_at, lease_owner, lease_expires_at"
+)
 
 
 class SQLiteStore(SessionStore):
     """Journals in one SQLite file (WAL mode). Good for a single host.
 
     Calls run on worker threads, so the event loop is never blocked on disk.
+
+    Run status and leases are kept in a ``sessions`` table next to the
+    ``entries`` table. A database written by qagents 0.1 is migrated in place
+    the first time it is opened: the table is added and filled from the
+    journals, and no entry is changed. Leases use ``time.time()``, which every
+    process on the host shares; do not share the file across hosts.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -173,29 +532,107 @@ class SQLiteStore(SessionStore):
     def _connect(self) -> sqlite3.Connection:
         if self._connection is None:
             connection = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=NORMAL")
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS entries ("
-                " session_id TEXT NOT NULL, seq INTEGER NOT NULL, ts REAL NOT NULL,"
-                " run_id TEXT, kind TEXT NOT NULL, data TEXT NOT NULL,"
-                " PRIMARY KEY (session_id, seq))"
-            )
+            try:
+                _enable_wal(connection)
+                connection.execute("PRAGMA synchronous=NORMAL")
+                self._migrate(connection)
+            except BaseException:
+                connection.close()
+                raise
             self._connection = connection
         return self._connection
 
-    def _append(self, session_id: str, entries: list[Entry]) -> None:
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        """Bring the schema to `_SQLITE_SCHEMA_VERSION`, keeping every entry."""
+        (version,) = connection.execute("PRAGMA user_version").fetchone()
+        if version == _SQLITE_SCHEMA_VERSION:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            (version,) = connection.execute("PRAGMA user_version").fetchone()  # another process?
+            if version > _SQLITE_SCHEMA_VERSION:
+                raise SessionError(
+                    f"{self.path} was written by a newer qagents (schema version {version}; "
+                    f"this version reads up to {_SQLITE_SCHEMA_VERSION}). Upgrade qagents."
+                )
+            if version < 1:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS entries ("
+                    " session_id TEXT NOT NULL, seq INTEGER NOT NULL, ts REAL NOT NULL,"
+                    " run_id TEXT, kind TEXT NOT NULL, data TEXT NOT NULL,"
+                    " PRIMARY KEY (session_id, seq))"
+                )
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS sessions ("
+                    " session_id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'idle',"
+                    " open_run_id TEXT, agent TEXT, failures INTEGER NOT NULL DEFAULT 0,"
+                    " updated_at REAL, lease_owner TEXT, lease_expires_at REAL)"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS sessions_by_status ON sessions (status, updated_at)"
+                )
+                self._backfill(connection)
+            connection.execute(f"PRAGMA user_version = {_SQLITE_SCHEMA_VERSION}")
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _backfill(connection: sqlite3.Connection) -> None:
+        """Derive a status row for every session of a 0.1 journal."""
+        rows: list[SessionStatus] = []
+        current: SessionStatus | None = None
+        cursor = connection.execute(
+            "SELECT session_id, ts, run_id, kind,"
+            " CASE WHEN kind = 'run_started' THEN data END"
+            " FROM entries ORDER BY session_id, seq"
+        )
+        for session_id, ts, run_id, kind, data in cursor:
+            if current is None or current.session_id != session_id:
+                current = SessionStatus(session_id=session_id)
+                rows.append(current)
+            entry = Entry(kind=kind, run_id=run_id, ts=ts, data=json.loads(data) if data else {})
+            advance_status(current, entry)
+            current.updated_at = ts
+        connection.executemany(
+            "INSERT OR REPLACE INTO sessions"
+            " (session_id, status, open_run_id, agent, failures, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    row.session_id,
+                    row.status,
+                    row.open_run_id,
+                    row.agent,
+                    row.failures,
+                    row.updated_at,
+                )
+                for row in rows
+            ],
+        )
+
+    def _append(self, session_id: str, entries: list[Entry], owner: str | None = None) -> None:
         with self._lock:
             connection = self._connect()
             connection.execute("BEGIN IMMEDIATE")
             try:
+                found = connection.execute(
+                    "SELECT status, open_run_id, agent, failures, lease_owner FROM sessions"
+                    " WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if owner is not None and (found is None or found[4] != owner):
+                    raise LeaseError(_lease_lost(session_id, owner, found and found[4]))
+                status = SessionStatus(session_id=session_id)
+                if found is not None:
+                    status.status, status.open_run_id, status.agent, status.failures = found[:4]
                 (last,) = connection.execute(
                     "SELECT COALESCE(MAX(seq), 0) FROM entries WHERE session_id = ?", (session_id,)
                 ).fetchone()
-                connection.executemany(
-                    "INSERT INTO entries (session_id, seq, ts, run_id, kind, data)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    [
+                rows = []
+                for offset, entry in enumerate(entries, start=1):
+                    rows.append(
                         (
                             session_id,
                             last + offset,
@@ -204,8 +641,28 @@ class SQLiteStore(SessionStore):
                             entry.kind,
                             json.dumps(entry.data, ensure_ascii=False),
                         )
-                        for offset, entry in enumerate(entries, start=1)
-                    ],
+                    )
+                    advance_status(status, entry)
+                connection.executemany(
+                    "INSERT INTO entries (session_id, seq, ts, run_id, kind, data)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+                connection.execute(
+                    "INSERT INTO sessions"
+                    " (session_id, status, open_run_id, agent, failures, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET"
+                    " status = excluded.status, open_run_id = excluded.open_run_id,"
+                    " agent = excluded.agent, failures = excluded.failures,"
+                    " updated_at = excluded.updated_at",
+                    (
+                        session_id,
+                        status.status,
+                        status.open_run_id,
+                        status.agent,
+                        status.failures,
+                        time.time(),
+                    ),
                 )
                 connection.execute("COMMIT")
             except BaseException:
@@ -230,7 +687,74 @@ class SQLiteStore(SessionStore):
 
     def _delete(self, session_id: str) -> None:
         with self._lock:
-            self._connect().execute("DELETE FROM entries WHERE session_id = ?", (session_id,))
+            connection = self._connect()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("DELETE FROM entries WHERE session_id = ?", (session_id,))
+                connection.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def _status(self, session_id: str) -> SessionStatus:
+        with self._lock:
+            found = (
+                self._connect()
+                .execute(
+                    f"SELECT {_SQLITE_STATUS_COLUMNS} FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                )
+                .fetchone()
+            )
+        return _status_row(found) if found else SessionStatus(session_id=session_id)
+
+    def _list(self, wanted: set[str] | None, prefix: str | None, limit: int | None) -> list[Any]:
+        clauses, params = ["updated_at IS NOT NULL"], []
+        if wanted is not None:
+            clauses.append(f"status IN ({', '.join('?' * len(wanted))})")
+            params.extend(sorted(wanted))
+        if prefix is not None:
+            clauses.append("substr(session_id, 1, ?) = ?")
+            params.extend([len(prefix), prefix])
+        query = (
+            f"SELECT {_SQLITE_STATUS_COLUMNS} FROM sessions WHERE {' AND '.join(clauses)}"
+            " ORDER BY updated_at, session_id"
+        )
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._lock:
+            return self._connect().execute(query, params).fetchall()
+
+    def _acquire(self, session_id: str, owner: str, ttl_s: float) -> bool:
+        now = time.time()
+        with self._lock:
+            cursor = self._connect().execute(
+                "INSERT INTO sessions (session_id, lease_owner, lease_expires_at) VALUES (?, ?, ?)"
+                " ON CONFLICT (session_id) DO UPDATE SET lease_owner = excluded.lease_owner,"
+                " lease_expires_at = excluded.lease_expires_at"
+                " WHERE sessions.lease_owner IS NULL OR sessions.lease_owner = excluded.lease_owner"
+                " OR sessions.lease_expires_at <= ?",
+                (session_id, owner, now + ttl_s, now),
+            )
+            return cursor.rowcount == 1
+
+    def _renew(self, session_id: str, owner: str, ttl_s: float) -> bool:
+        with self._lock:
+            cursor = self._connect().execute(
+                "UPDATE sessions SET lease_expires_at = ? WHERE session_id = ? AND lease_owner = ?",
+                (time.time() + ttl_s, session_id, owner),
+            )
+            return cursor.rowcount == 1
+
+    def _release(self, session_id: str, owner: str) -> None:
+        with self._lock:
+            self._connect().execute(
+                "UPDATE sessions SET lease_owner = NULL, lease_expires_at = NULL"
+                " WHERE session_id = ? AND lease_owner = ?",
+                (session_id, owner),
+            )
 
     def _close(self) -> None:
         with self._lock:
@@ -242,14 +766,76 @@ class SQLiteStore(SessionStore):
         if entries:
             await asyncio.to_thread(self._append, session_id, entries)
 
+    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
+        if entries:
+            await asyncio.to_thread(self._append, session_id, entries, owner)
+
     async def load(self, session_id: str) -> list[Entry]:
         return await asyncio.to_thread(self._load, session_id)
 
     async def delete(self, session_id: str) -> None:
         await asyncio.to_thread(self._delete, session_id)
 
+    async def status(self, session_id: str) -> SessionStatus:
+        return await asyncio.to_thread(self._status, session_id)
+
+    async def list_sessions(
+        self,
+        status: str | Iterable[str] | None = None,
+        prefix: str | None = None,
+        limit: int | None = None,
+    ) -> list[SessionStatus]:
+        wanted = _status_filter(status)
+        _check_limit(limit)
+        rows = await asyncio.to_thread(self._list, wanted, prefix, limit)
+        return [_status_row(row) for row in rows]
+
+    async def acquire_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
+        _check_ttl(ttl_s)
+        return await asyncio.to_thread(self._acquire, session_id, owner, ttl_s)
+
+    async def renew_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
+        _check_ttl(ttl_s)
+        return await asyncio.to_thread(self._renew, session_id, owner, ttl_s)
+
+    async def release_lease(self, session_id: str, owner: str) -> None:
+        await asyncio.to_thread(self._release, session_id, owner)
+
     async def aclose(self) -> None:
         await asyncio.to_thread(self._close)
+
+
+def _enable_wal(connection: sqlite3.Connection, timeout_s: float = 5.0) -> None:
+    """Switch the database to WAL mode, waiting while another connection is switching it.
+
+    Changing the journal mode does not wait for locks the way other statements
+    do, so processes that open a new database at the same time retry here.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            (mode,) = connection.execute("PRAGMA journal_mode").fetchone()
+            if str(mode).lower() != "wal":
+                connection.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error) or time.monotonic() > deadline:
+                raise
+            time.sleep(0.02)
+
+
+def _status_row(row: Any) -> SessionStatus:
+    session_id, status, open_run_id, agent, failures, updated_at, owner, expires = row
+    return SessionStatus(
+        session_id=session_id,
+        status=status,
+        open_run_id=open_run_id,
+        agent=agent,
+        failures=failures,
+        updated_at=updated_at,
+        lease_owner=owner,
+        lease_expires_at=expires,
+    )
 
 
 class Session:

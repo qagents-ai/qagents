@@ -43,7 +43,8 @@ class RunContext(Generic[DepsT]):
 
     ``deps`` is whatever you passed to ``agent.run(..., deps=...)``: a database
     handle, the current user, an HTTP client. ``usage`` and ``messages`` are
-    snapshots taken when the context was created.
+    snapshots taken when the context was created. ``state`` is live: one dict
+    shared by everything in the run, and saved with the session.
     """
 
     deps: DepsT = None  # type: ignore[assignment]
@@ -58,8 +59,36 @@ class RunContext(Generic[DepsT]):
     the system the tool talks to (a payment API, a queue, a database)."""
     usage: Usage = field(default_factory=Usage)
     messages: Sequence[Message] = ()
+    state: dict[str, Any] = field(default_factory=dict)
+    """Structured memory of the session, kept outside the transcript.
+
+    The same dict object is passed to every tool, hook and instructions
+    function of a run. It is restored from the journal when a run starts, so
+    it persists across runs and resumes of the session. After each tool call
+    and after the ``before_model``, ``after_model``, ``before_tool`` and
+    ``after_tool`` hooks, a change is journaled as a ``state_updated`` entry
+    and announced with a `StateUpdated` event.
+
+    Values must survive a JSON round trip unchanged: strings, numbers, booleans,
+    ``None``, lists and dicts with string keys. Tuples, sets, dates and models
+    are refused with an error that names the key; store
+    ``model.model_dump(mode="json")`` or an ISO date string instead.
+
+    Tools that run in parallel (read-only tools, by default) must not change
+    it: their writes would race. Give a tool that writes state
+    ``read_only=False``, which runs it on its own."""
+    parent_run_id: str | None = None
+    """Run id of the calling run, for a child run started with ``parent=ctx``
+    (an agent used as a tool is one); ``None`` for a top-level run."""
+    parent_tool_call_id: str | None = None
+    """The parent's tool call that started this run, for a child run."""
+    depth: int = 0
+    """How many runs this one is nested in: 0 for a top-level run, 1 for a
+    sub-agent it calls, and so on, up to ``Limits.max_depth``."""
     _emit: Callable[[Any], None] | None = field(default=None, repr=False)
     _add_usage: Callable[[Usage], None] | None = field(default=None, repr=False)
+    _run: Any = field(default=None, repr=False, compare=False)
+    """The run this context belongs to; a child run reads its remaining limits."""
 
     def emit(self, event: Any) -> None:
         """Put a custom event on the run's event stream (from inside a tool)."""
@@ -88,6 +117,7 @@ class Tool:
         idempotent: bool = False,
         timeout: float | None = None,
         strict: bool = False,
+        deferred: bool = False,
     ) -> None:
         if not _NAME_PATTERN.match(name):
             raise ConfigurationError(
@@ -108,6 +138,10 @@ class Tool:
         self.timeout = timeout
         """Seconds before the call is abandoned; ``None`` uses the run's limit."""
         self.strict = strict
+        self.deferred = deferred
+        """The loop never calls the function: each call pauses the run as a
+        `PendingInput` until ``agent.resume(..., results=...)`` supplies its
+        result. The signature still defines the arguments the model sees."""
         self.parameters = _clean_schema(arguments_model.model_json_schema())
 
     @property
@@ -172,11 +206,28 @@ def tool(
     idempotent: bool = False,
     timeout: float | None = None,
     strict: bool = False,
+    deferred: bool = False,
 ) -> Any:
     """Turn a function into a `Tool`. Use bare or with options.
 
     A first parameter annotated ``RunContext`` (or named ``ctx``) receives the
     run context and is hidden from the model.
+
+    Args:
+        function: The function to wrap. Leave it out to use ``@tool(...)`` with options.
+        name: Tool name the model sees; defaults to the function name.
+        description: Description the model sees; defaults to the docstring's summary.
+        requires_approval: Ask a human before running (unless a permission rule allows it).
+        read_only: The tool changes nothing, so it may run in parallel with
+            other read-only calls. It must not change ``ctx.state`` either.
+        idempotent: Running it twice has the same effect as once, so it is
+            safe to repeat after a crash.
+        timeout: Seconds before a call is abandoned; ``None`` uses the run's limit.
+        strict: Ask the provider to enforce the schema exactly, where supported.
+        deferred: Never run the function. After the permission check, each
+            call pauses the run as a `PendingInput`; its result comes from
+            ``agent.resume(session, results={tool_call_id: value})``. Use it for
+            work done outside the process: a human's answer, an external job.
     """
 
     def build(target: Callable[..., Any]) -> Tool:
@@ -189,6 +240,7 @@ def tool(
             idempotent=idempotent,
             timeout=timeout,
             strict=strict,
+            deferred=deferred,
         )
 
     return build(function) if function is not None else build

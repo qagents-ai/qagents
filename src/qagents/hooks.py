@@ -12,12 +12,33 @@ The loop, with its hook points:
         for each tool call:
             before_tool  -> tool ->  after_tool
     on_run_end
+
+Hooks may read and change ``ctx.state``. A change made in ``before_model``,
+``after_model``, ``before_tool`` or ``after_tool`` is journaled right after the
+hook returns; a change made in ``on_run_start`` or ``on_event`` is journaled at
+the next of those points or when the run stops. Changes made in
+``on_run_end`` are not saved.
+
+Calls of a tool declared ``deferred=True`` pass the permission check but run
+no tool hooks. A call whose tool raised `DeferToolCall` ran ``before_tool``
+but has no result yet, so ``after_tool`` does not run for it; a result
+supplied later with ``agent.resume(results=...)`` is recorded as given.
+
+Child runs (an agent used as a tool, or any run started with ``parent=ctx``)
+use their own hooks plus the hooks of the parent run whose class sets
+``propagate = True``. A tracer attached once to the top agent then sees the
+whole tree of runs; ``ctx.parent_run_id``, ``ctx.parent_tool_call_id`` and
+``ctx.depth`` tell it where each run belongs. A hook object is used at most
+once per run, even when both agents list it.
+
+The final-answer call of ``output_mode="tool"`` is not a tool and runs no
+tool hooks.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .messages import ToolCallPart, ToolResultPart
 from .models.base import ModelRequest, ModelResponse
@@ -28,6 +49,12 @@ if TYPE_CHECKING:
 
 
 class Hooks:
+    """Override the methods you need; the defaults do nothing."""
+
+    propagate: ClassVar[bool] = False
+    """Also apply this hook to child runs started from the run it is attached to,
+    at any depth. Set it on tracers, loggers and cost meters."""
+
     async def on_run_start(self, ctx: RunContext[Any]) -> None:
         """The run is about to start."""
 
@@ -61,7 +88,13 @@ class Hooks:
     async def on_run_end(
         self, ctx: RunContext[Any], result: RunResult | None, error: BaseException | None
     ) -> None:
-        """The run finished (``result``) or failed (``error``)."""
+        """The run finished (``result``), failed or was stopped (``error``).
+
+        ``error`` is the exception that failed the run, or the
+        ``asyncio.CancelledError`` or ``GeneratorExit`` that stopped it (a
+        cancelled task, or a stream closed before its end). A stopped run stays
+        open in the journal and can be resumed.
+        """
 
 
 class HookChain(Hooks):

@@ -16,6 +16,12 @@ A typical run:
       text_delta ...
       model_responded
     run_finished
+
+A run that pauses ends with ``approval_required`` and ``input_required``
+events before ``run_finished``. ``state_updated`` follows every change of
+``ctx.state``. A run that a guardrail blocks emits ``guardrail_tripped`` before
+``run_finished``: right after ``run_started`` for an input guardrail, after the
+last ``model_responded`` for an output guardrail.
 """
 
 from __future__ import annotations
@@ -26,8 +32,8 @@ from pydantic import BaseModel
 
 from .messages import ToolCallPart, ToolResultPart
 from .models.base import ModelResponse, ReasoningDelta, TextDelta, ToolCallDelta
-from .results import RunResult
-from .session import PendingApproval
+from .results import GuardrailStage, RunResult
+from .session import PendingApproval, PendingInput
 
 
 class RunStarted(BaseModel):
@@ -36,6 +42,10 @@ class RunStarted(BaseModel):
     session_id: str
     agent: str
     resumed: bool = False
+    parent_run_id: str | None = None
+    """The calling run, for a child run started with ``parent=ctx``."""
+    depth: int = 0
+    """0 for a top-level run, 1 for a run it started, and so on."""
 
 
 class TurnStarted(BaseModel):
@@ -78,6 +88,41 @@ class ApprovalRequired(BaseModel):
     agent: str
 
 
+class InputRequired(BaseModel):
+    """A tool call waits for a result from outside the run.
+
+    Emitted for calls of tools declared ``deferred=True`` and for calls whose
+    tool raised `DeferToolCall`. The run ends as ``paused`` after these;
+    supply the result with ``agent.resume(session, results=...)``.
+    """
+
+    type: Literal["input_required"] = "input_required"
+    input: PendingInput
+    agent: str
+
+
+class StateUpdated(BaseModel):
+    """``ctx.state`` changed and the new values were journaled."""
+
+    type: Literal["state_updated"] = "state_updated"
+    values: dict[str, Any]
+    """The full state after the change (a copy)."""
+    agent: str
+
+
+class GuardrailTriggered(BaseModel):
+    """A guardrail blocked the prompt or the final answer. The run ends as ``blocked``."""
+
+    type: Literal["guardrail_tripped"] = "guardrail_tripped"
+    name: str
+    """Name of the guardrail that tripped."""
+    reason: str
+    """The reason given to `GuardrailTripped`."""
+    stage: GuardrailStage
+    """``"input"`` for the prompt, ``"output"`` for the final answer."""
+    agent: str
+
+
 class AgentSwitched(BaseModel):
     """A handoff made another agent the active one."""
 
@@ -115,6 +160,9 @@ Event = (
     | ToolCallStarted
     | ToolCallFinished
     | ApprovalRequired
+    | InputRequired
+    | StateUpdated
+    | GuardrailTriggered
     | AgentSwitched
     | SubagentEvent
     | RunFinished
@@ -124,10 +172,13 @@ __all__ = [
     "AgentSwitched",
     "ApprovalRequired",
     "Event",
+    "GuardrailTriggered",
+    "InputRequired",
     "ModelResponded",
     "ReasoningDelta",
     "RunFinished",
     "RunStarted",
+    "StateUpdated",
     "SubagentEvent",
     "TextDelta",
     "ToolCallDelta",

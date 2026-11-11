@@ -13,20 +13,46 @@ deciding (an exception in your callback) refuses the call.
 
 "Ask" is resolved by ``on_ask`` when you give one (an interactive prompt, a
 Slack button). Without it the run pauses: ``agent.run`` returns with
-``status == "paused"`` and you continue later with ``agent.resume``.
+``status == "paused"`` and you continue later with ``agent.resume``. A child
+run (an agent used as a tool) whose permissions have no ``on_ask`` uses the
+parent run's.
+
+Signed pauses: with ``Permissions(approval_secret=...)`` every paused call
+(`PendingApproval` and `PendingInput`) carries a ``token``, an HMAC-SHA256 of
+the run id, the call id, the tool name and the arguments. ``agent.resume``
+accepts an approval or a result for such a call only with that token, and
+only while the call recorded in the journal still matches it; otherwise it
+raises `ApprovalTokenError` before anything runs. A stored pause can then not
+be forged or altered by someone who can write to the session store but does
+not know the secret:
+
+    permissions = Permissions(approval_secret=os.environ["APPROVAL_SECRET"])
+    paused = await agent.run("Refund order A-1001", session=session)
+    pending = paused.pending_approvals[0]  # show it, token included, to a reviewer
+    await agent.resume(session, approvals={pending.tool_call_id: Approval.for_call(pending)})
+
+The token protects integrity, not confidentiality: it is stored in the journal
+next to the call it signs, and it does not say who approved. Authenticate the
+people who answer approvals in your own application.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import inspect
+import json
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from fnmatch import fnmatchcase
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from pydantic_core import to_jsonable_python
 
+from .errors import ConfigurationError
 from .messages import ToolCallPart
+from .session import PendingApproval, PendingInput
 from .tools import RunContext, Tool
 
 logger = logging.getLogger("qagents.permissions")
@@ -45,8 +71,56 @@ class Approval(BaseModel):
 
     approved: bool
     reason: str | None = None
+    """Why the call was declined; the model reads it as the call's result."""
     arguments: dict[str, Any] | None = None
     """Run the tool with these arguments instead of the model's."""
+    token: str | None = None
+    """The ``token`` of the `PendingApproval` this answers. Required when the
+    agent's permissions have an ``approval_secret``; ignored otherwise."""
+
+    @classmethod
+    def for_call(
+        cls,
+        pending: PendingApproval,
+        approved: bool = True,
+        *,
+        reason: str | None = None,
+        arguments: dict[str, Any] | None = None,
+    ) -> Approval:
+        """Answer ``pending``, carrying its token.
+
+        Args:
+            pending: The call from ``result.pending_approvals``.
+            approved: Whether the call may run.
+            reason: Why it was declined, for the model.
+            arguments: Arguments to run the tool with instead of the model's.
+        """
+        return cls(approved=approved, reason=reason, arguments=arguments, token=pending.token)
+
+
+class InputResult(BaseModel):
+    """The result of a call that waits for input, with the token of its signed pause.
+
+    Pass it in ``agent.resume(session, results={tool_call_id: InputResult(...)})``.
+    It is needed only when the agent's permissions have an ``approval_secret``;
+    without one, give the value directly (an `InputResult` is unwrapped all
+    the same). When pauses are signed, a mapping of exactly the form
+    ``{"token": ..., "value": ...}`` is read the same way, for answers that
+    arrive as JSON.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    value: Any
+    """The result: a value rendered like a tool's return value, an exception
+    instance for an error result, or a `ToolResultPart` used as it is."""
+    token: str | None = None
+    """The ``token`` of the `PendingInput` this answers."""
+
+    @classmethod
+    def for_call(cls, pending: PendingInput, value: Any) -> InputResult:
+        """Answer ``pending`` with ``value``, carrying its token."""
+        return cls(value=value, token=pending.token)
 
 
 CanUseTool = Callable[[RunContext[Any], Tool, ToolCallPart], Any]
@@ -76,13 +150,69 @@ class Permissions:
         deny: Iterable[str] = (),
         can_use_tool: CanUseTool | None = None,
         on_ask: OnAsk | None = None,
+        approval_secret: str | bytes | None = None,
     ) -> None:
+        """Set up the rules.
+
+        Args:
+            mode: The default for tools no rule matches; see the class docstring.
+            allow: Patterns of tools that run without asking.
+            ask: Patterns of tools that always ask.
+            deny: Patterns of tools that never run.
+            can_use_tool: Your decision function, consulted after ``deny``.
+            on_ask: Answers "ask" decisions in-process. Without it the run pauses.
+            approval_secret: Signs every pause, so that ``agent.resume`` accepts
+                only answers that carry the pause's token, for calls the journal
+                still records unchanged. Use at least 16 random bytes, for
+                example ``secrets.token_hex(32)``, and keep it out of the code.
+
+        Raises:
+            ConfigurationError: ``approval_secret`` is not text or bytes, or is
+                shorter than 16 bytes.
+        """
         self.mode: Mode = mode
         self.allow = tuple(allow)
         self.ask = tuple(ask)
         self.deny = tuple(deny)
         self.can_use_tool = can_use_tool
         self.on_ask = on_ask
+        self._approval_key = _approval_key(approval_secret)
+
+    @property
+    def signs_pauses(self) -> bool:
+        """True when an ``approval_secret`` was given."""
+        return self._approval_key is not None
+
+    def sign(
+        self, *, run_id: str, tool_call_id: str, name: str, arguments: Mapping[str, Any]
+    ) -> str | None:
+        """The token of a paused call, or ``None`` without an ``approval_secret``."""
+        if self._approval_key is None:
+            return None
+        return approval_token(
+            self._approval_key,
+            run_id=run_id,
+            tool_call_id=tool_call_id,
+            name=name,
+            arguments=arguments,
+        )
+
+    def verify(
+        self,
+        token: str | None,
+        *,
+        run_id: str,
+        tool_call_id: str,
+        name: str,
+        arguments: Mapping[str, Any],
+    ) -> bool:
+        """Whether ``token`` signs this call. Always true without an ``approval_secret``."""
+        expected = self.sign(
+            run_id=run_id, tool_call_id=tool_call_id, name=name, arguments=arguments
+        )
+        if expected is None:
+            return True
+        return isinstance(token, str) and hmac.compare_digest(token, expected)
 
     async def decide(self, ctx: RunContext[Any], tool: Tool, call: ToolCallPart) -> Decision:
         name = tool.name
@@ -130,6 +260,51 @@ class Permissions:
         if isinstance(answer, Approval):
             return answer
         return Approval(approved=answer is True)
+
+
+def approval_token(
+    secret: str | bytes,
+    *,
+    run_id: str,
+    tool_call_id: str,
+    name: str,
+    arguments: Mapping[str, Any],
+) -> str:
+    """HMAC-SHA256, as hex, of the canonical JSON of one paused call.
+
+    The JSON object has the keys ``arguments``, ``name``, ``run_id`` and
+    ``tool_call_id``, sorted, without spaces, with non-ASCII characters kept
+    as UTF-8. Another service that holds the secret can compute the same token.
+    """
+    key = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
+    payload = json.dumps(
+        {
+            "arguments": to_jsonable_python(dict(arguments), fallback=str),
+            "name": name,
+            "run_id": run_id,
+            "tool_call_id": tool_call_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _approval_key(secret: str | bytes | None) -> bytes | None:
+    if secret is None:
+        return None
+    if not isinstance(secret, str | bytes):
+        raise ConfigurationError(
+            f"approval_secret must be str or bytes, not {type(secret).__name__}."
+        )
+    key = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
+    if len(key) < 16:
+        raise ConfigurationError(
+            "approval_secret is too short to sign pauses safely: use at least 16 random bytes, "
+            "for example secrets.token_hex(32), and load it from your secret store."
+        )
+    return key
 
 
 def _matches(name: str, patterns: tuple[str, ...]) -> bool:

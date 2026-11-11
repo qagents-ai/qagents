@@ -4,11 +4,21 @@ build-backend = "hatchling.build"
 
 [project]
 name = "qagents"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small, explicit agent framework: one loop, typed tools, durable sessions, provider-neutral with first-class QCloud support."
 readme = "README.md"
 requires-python = ">=3.11"
-keywords = ["agents", "llm", "tools", "qcloud", "openai-compatible"]
+keywords = [
+    "agents",
+    "llm",
+    "tools",
+    "multi-agent",
+    "qcloud",
+    "anthropic",
+    "openai-compatible",
+    "mcp",
+    "mlflow",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -26,20 +36,38 @@ dependencies = [
 
 [project.optional-dependencies]
 # qcloud-ai is not on PyPI yet. Until it is, install the SDK from source first
-# (see README), then this extra resolves against the installed package.
+# (see README), then this extra resolves against the installed package. It is
+# left out of "all" and "dev" for that reason.
 qcloud = ["qcloud-ai>=0.4.0"]
+# Claude through the Messages API (qagents.models.anthropic).
+anthropic = ["anthropic>=2.8,<3"]
+# MLflow tracing (qagents.integrations.mlflow) and qagents.evals.log_to_mlflow.
+mlflow = ["mlflow>=3.5,<4"]
+# Tools of MCP servers (qagents.toolkits.mcp).
+mcp = ["mcp>=2.3,<3"]
+# PostgresStore (qagents.stores.postgres), for AgentRuntime workers on several hosts.
+postgres = ["psycopg[binary]>=3.2,<4", "psycopg-pool>=3.2,<4"]
+# OpenTelemetry spans (qagents.tracing.OTelHooks).
 otel = ["opentelemetry-api>=1.20"]
+# JSONSchemaValid in qagents.evals.
+evals = ["jsonschema>=4.18"]
+all = ["qagents[anthropic,mlflow,mcp,postgres,otel,evals]"]
 dev = [
+    "qagents[all]",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "ruff>=0.9",
     "opentelemetry-sdk>=1.20",
     "fastapi>=0.110",  # for examples/serve_fastapi.py and its test
+    "uvicorn>=0.30",  # the MCP streamable HTTP test serves the fixture server locally
 ]
 docs = [
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.26",
 ]
+
+[project.scripts]
+qagents = "qagents.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qagents"]
