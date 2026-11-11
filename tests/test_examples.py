@@ -73,11 +73,13 @@ async def test_fastapi_example_streams_and_resumes_after_approval():
         ]  # fmt: skip
         assert events[-1]["result"]["status"] == "paused"
 
-        (waiting,) = (await client.get("/sessions/s1/pending")).json()
+        pending = (await client.get("/sessions/s1/pending")).json()
+        assert pending["inputs"] == []
+        (waiting,) = pending["approvals"]
         assert waiting["name"] == "send_email" and waiting["arguments"]["to"] == "maria@example.com"
 
         approved = await client.post(
-            "/approve", json={"session_id": "s1", "approvals": {waiting["tool_call_id"]: True}}
+            "/resume", json={"session_id": "s1", "approvals": {waiting["tool_call_id"]: True}}
         )
         events = sse_events(approved.text)
         finished = events[-1]["result"]
@@ -85,7 +87,49 @@ async def test_fastapi_example_streams_and_resumes_after_approval():
             finished["status"] == "completed" and finished["output"] == "The email is on its way."
         )
         assert "tool_call_finished" in [e["type"] for e in events]
-        assert (await client.get("/sessions/s1/pending")).json() == []
+        assert (await client.get("/sessions/s1/pending")).json() == {"approvals": [], "inputs": []}
+
+
+async def test_fastapi_example_asks_the_user_and_resumes_with_the_answer():
+    pytest.importorskip("fastapi")
+    sys.path.insert(0, str(ROOT))
+    try:
+        from examples.serve_fastapi import ask_user, build_app, send_email
+    finally:
+        sys.path.remove(str(ROOT))
+
+    model = ScriptedModel(
+        [
+            call("ask_user", question="What is Maria's email address?"),
+            call("send_email", to="maria@example.com", subject="Hello"),
+            "Sent.",
+        ]
+    )
+    app = build_app(Agent(model, tools=[send_email, ask_user]), InMemoryStore())
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        chat = await client.post("/chat", json={"session_id": "s2", "message": "Email Maria"})
+        events = sse_events(chat.text)
+        assert "input_required" in [e["type"] for e in events]
+        assert events[-1]["result"]["status"] == "paused"
+
+        pending = (await client.get("/sessions/s2/pending")).json()
+        (question,) = pending["inputs"]
+        assert pending["approvals"] == [] and question["name"] == "ask_user"
+
+        answered = await client.post(
+            "/resume",
+            json={"session_id": "s2", "results": {question["tool_call_id"]: "maria@example.com"}},
+        )
+        events = sse_events(answered.text)
+        assert events[-1]["result"]["status"] == "paused"  # now send_email waits for approval
+        assert model.requests[1].messages[-1].tool_results[0].content == "maria@example.com"
+
+        (waiting,) = (await client.get("/sessions/s2/pending")).json()["approvals"]
+        done = await client.post(
+            "/resume", json={"session_id": "s2", "approvals": {waiting["tool_call_id"]: True}}
+        )
+        assert sse_events(done.text)[-1]["result"]["output"] == "Sent."
 
 
 async def test_a_limited_run_continues_on_its_session_without_a_new_prompt():
