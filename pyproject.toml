@@ -43,8 +43,14 @@ qcloud = ["qcloud-ai>=0.4.0"]
 anthropic = ["anthropic>=2.8,<3"]
 # MLflow tracing (qagents.integrations.mlflow) and qagents.evals.log_to_mlflow.
 mlflow = ["mlflow>=3.5,<4"]
-# Tools of MCP servers (qagents.toolkits.mcp).
+# Tools of MCP servers (qagents.toolkits.mcp), serving qagents tools over MCP
+# (qagents.integrations.mcp_server), and the docs server (python -m qagents.docs_mcp).
 mcp = ["mcp>=2.3,<3"]
+# The generic ACP client (qagents.integrations.acp): no extra dependency.
+acp = []
+# Devvi as a coding worker (qagents.integrations.devvi): no extra dependency.
+# expose_tools (qagents tools for Devvi's model) needs the mcp extra too.
+devvi = []
 # PostgresStore (qagents.stores.postgres), for AgentRuntime workers on several hosts.
 postgres = ["psycopg[binary]>=3.2,<4", "psycopg-pool>=3.2,<4"]
 # OpenTelemetry spans (qagents.tracing.OTelHooks).
@@ -71,6 +77,16 @@ qagents = "qagents.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qagents"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# The docs MCP server (python -m qagents.docs_mcp) reads these from the installed package,
+# so a wheel install answers from the docs of its own version.
+"docs" = "qagents/docs_mcp/_bundled/docs"
+"examples" = "qagents/docs_mcp/_bundled/examples"
+"README.md" = "qagents/docs_mcp/_bundled/README.md"
+"AGENTS.md" = "qagents/docs_mcp/_bundled/AGENTS.md"
+"skills/qagents/SKILL.md" = "qagents/docs_mcp/_bundled/skills/qagents/SKILL.md"
+"mkdocs.yml" = "qagents/docs_mcp/_bundled/mkdocs.yml"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

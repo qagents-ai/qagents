@@ -1,0 +1,7 @@
+/* The journal-q mark is drawn in indigo and teal for light backgrounds. The header is
+   indigo, so the mark sits on a white tile there. */
+.md-header__button.md-logo img {
+  background: #ffffff;
+  border-radius: 6px;
+  padding: 2px;
+}

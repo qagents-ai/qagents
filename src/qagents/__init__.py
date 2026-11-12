@@ -25,6 +25,11 @@ an ``AttributeError`` that says which extra to install (so ``hasattr``,
 it out. The submodules
 ``qagents.evals``, ``qagents.tracing``, ``qagents.integrations`` and
 ``qagents.cli`` are imported only when you import them.
+
+The external-agent names (``ExternalAgent``, ``ExternalApproval``,
+``ExternalCapabilities``, ``ExternalResult``, ``ScriptedExternalAgent``) need no
+extra; they are resolved on first access too, so ``import qagents`` does not
+import ``qagents.external``.
 """
 
 from __future__ import annotations
@@ -91,6 +96,11 @@ from .workflow import Workflow, WorkflowStatus
 
 if TYPE_CHECKING:
     # Re-exports for type checkers; at run time __getattr__ resolves them.
+    from .external import ExternalAgent as ExternalAgent
+    from .external import ExternalApproval as ExternalApproval
+    from .external import ExternalCapabilities as ExternalCapabilities
+    from .external import ExternalResult as ExternalResult
+    from .external import ScriptedExternalAgent as ScriptedExternalAgent
     from .integrations.mlflow import MLflowHooks as MLflowHooks
     from .models.anthropic import AnthropicModel as AnthropicModel
     from .stores.postgres import PostgresStore as PostgresStore
@@ -100,11 +110,16 @@ __version__ = "0.2.0"
 
 _LAZY = {
     "AnthropicModel": "qagents.models.anthropic",
+    "ExternalAgent": "qagents.external",
+    "ExternalApproval": "qagents.external",
+    "ExternalCapabilities": "qagents.external",
+    "ExternalResult": "qagents.external",
+    "ScriptedExternalAgent": "qagents.external",
     "MCPToolkit": "qagents.toolkits.mcp",
     "MLflowHooks": "qagents.integrations.mlflow",
     "PostgresStore": "qagents.stores.postgres",
 }
-"""Names from optional extras, resolved on first access."""
+"""Names from optional extras, and the external-agent API, resolved on first access."""
 
 _NEEDS = {"MCPToolkit": ("mcp", "mcp_types")}
 """Lazy names whose module cannot be imported without these packages."""

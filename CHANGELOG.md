@@ -5,6 +5,99 @@ All notable changes to qagents. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor version may change behaviour;
 every such change is listed under "Changed").
 
+## [Unreleased]
+
+### Added
+
+#### External agents
+
+- `qagents.external`: `ExternalAgent`, the contract for another agent program that runs its
+  own loop and is driven over a control protocol. Use one as a tool (`as_tool()`, a child of
+  the calling run: depth, budgets, cancel, `SubagentEvent`s, a footer the model reads), as a
+  workflow step, or directly (`stream()`, `run()`). Every permission request it sends is
+  decided by your `Permissions` on `"<tool>.<agent tool>"` and never answered "allow always";
+  a `can_use_tool` or `on_ask` that raises answers "reject" (that one action is refused, the
+  turn goes on), and a decision that times out answers "cancelled". Postures `rules`, `pause`
+  (pauses the calling run, answered with `ExternalApproval`) and `live`. One turn at a time
+  per workspace and per session, git change tracking (`changed_files`, `diff()`), and crash
+  re-attach for resumable agents. Through `as_tool()` the model can continue only a session
+  that this tool opened in this qagents session (any other id is a tool error that says so);
+  your own code may pass any session. The footer of a turn that never began names no session.
+  `ExternalResult`, `ExternalCapabilities`, `ScriptedExternalAgent` for offline tests, and
+  the `external_event` (`ExternalAgentEvent`) kinds. The external-agent names are also
+  importable from `qagents` (resolved on first access).
+- `qagents.integrations.acp.ACPAgent`: a generic Agent Client Protocol v1 client (stdio,
+  `session/new`/`resume`/`load`/`close`, `set_config_option`, permission requests, cancel with
+  a process-tree kill), with `MCPServerStdio` and `MCPServerHTTP` for the agent's sessions. It
+  authenticates only with the `auth_method` you choose, never by itself.
+- `qagents.integrations.devvi.DevviAgent`: Devvi (devvi.sh) as a coding worker over ACP (the
+  default) or Devvi's SDK protocol (token usage and cost with `TokenPricing`, client-chosen
+  session ids, re-attach from Devvi's session log). Its own home, an explicit environment,
+  the session-log upload and telemetry off, `expose_tools` (qagents tools for Devvi's model
+  over MCP; needs the `mcp` extra), and `python -m qagents.integrations.devvi doctor`.
+- `qagents.integrations.mcp_server`: serve qagents tools over MCP, bound to a run (Streamable
+  HTTP on 127.0.0.1 with a bearer token; the run's rules, journal, hooks and limits apply) or
+  over stdio from a JSON spec.
+- `RunContext.checkpoint()` and `checkpoints`: a tool call journals a fact (`checkpoint(key,
+  value)`, written as a `tool_checkpoint` entry before it returns, so before the tool acts on
+  it) and reads, on a later attempt of the same call, what earlier attempts recorded
+  (`checkpoints`, a deep copy, kept per operation id across a resume). A call with a recorded
+  result still never runs again, whatever it checkpointed. The entry can carry usage.
+- `RunContext.call_tool(tool, arguments, *, source, approval_timeout_s=None, tags=None,
+  metadata=None)`: a call from outside the model (the MCP tool server uses it) made as an
+  ordinary tool call of the run, with the loop's own validation, `Permissions` and `on_ask`
+  ("ask" without an `on_ask` is refused), journal entries, hooks, events, `Limits` and
+  usage. It writes nothing and is refused once the run is cancelled or stopped, its journal is
+  closed, or the calling tool call has ended; `tags` cannot set `usage`.
+- `RunContext.permissions`, `save_state()` and `counted()`.
+- The external-agent errors (`ExternalAgentError` and its subclasses, `ExternalToolError`)
+  live in `qagents.errors`; `qagents.external` re-exports them.
+- `ExternalAgentEvent` is part of the `qagents.events.Event` union.
+- The AG-UI projection opens tool calls that arrive without a model response (an external
+  agent's, a served MCP call's) and ends a direct external turn at its `turn_finished` event.
+
+#### Docs for coding agents
+
+- `python -m qagents.docs_mcp`: an MCP server (stdio, `qagents[mcp]`) with the docs of the
+  installed qagents for coding agents: `search_docs`, `read_page`, `list_pages`, `get_api`,
+  `list_examples`, `read_example`, `check_code`, resources and two prompts. The same answers
+  on the command line (`search`, `read`, `pages`, `api`, `examples`, `example`, `check`,
+  `llms`, `skill`), also as `qagents docs ...`. Wheels bundle the docs, so the server answers
+  from the docs of the installed version.
+- `AGENTS.md`, a Claude Code skill (`skills/qagents/SKILL.md`), `docs/coding-agents.md`, and
+  `scripts/build_llms_txt.py` for `docs/llms.txt` and `docs/llms-full.txt`.
+
+#### Docs and package
+
+- Docs: `concepts/external-agents.md`, `integrations/devvi.md`, `integrations/acp.md`,
+  `integrations/mcp-server.md`, `reference/external.md`; `examples/devvi_coder.py`. The logo
+  (`assets/logo/`) in the README and on the docs site.
+- Extras `acp` and `devvi` (no dependencies).
+
+### Changed
+
+- A tool may return a `ToolResultPart` to set `is_error` and `metadata`; `ToolError.metadata`
+  is copied into the result.
+- **Behaviour change:** an idempotent tool that is running when the run is cancelled or times
+  out is now reported as interrupted (outcome unknown, `TOOL_INTERRUPTED`), not cancelled
+  (`TOOL_CANCELLED`), so the model is told to check before calling it again. Only a read-only
+  call is harmless when it is cut short. This applies to the model's calls and to served
+  calls. After a crash nothing changes: an idempotent call that had started is still run
+  again on resume.
+- Result metadata that is not JSON is logged and replaced by `{"metadata_error": ...}`; the
+  tool's content and `is_error` stay as the tool gave them.
+- A sync tool's thread that is abandoned when its call is cancelled (not only on a timeout) is
+  remembered by the run, or by a standalone tool server, so a later call there that must run
+  alone waits for it.
+- Every model-facing string of the new modules is in `qagents.prompts` (`EXTERNAL_*`,
+  `TOOL_SERVER_*`, `ACP_*`, `DEVVI_*`).
+
+### Not in this version
+
+- ACP's unstable `usage` field is not read, so ACP agents are unmetered.
+- Headless model authentication for Devvi, the devvi.sh platform as a `Model`, and qagents as
+  an ACP agent server.
+
 ## [0.2.0] - 2026-11-11
 
 0.2 is about agents that run for a long time, agents that work together, and seeing what they

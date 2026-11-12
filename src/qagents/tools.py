@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import contextvars
+import copy
 import functools
 import inspect
 import json
@@ -27,7 +29,7 @@ import os
 import re
 import threading
 import typing
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
@@ -36,11 +38,12 @@ from pydantic_core import to_jsonable_python
 
 from . import prompts
 from .errors import ConfigurationError, ToolArgumentError, ToolError
-from .messages import Message, Usage
+from .messages import Message, ToolResultPart, Usage
 from .models.base import ToolSpec
 
 if TYPE_CHECKING:
     from .agent import Limits
+    from .permissions import Permissions
 
 DepsT = TypeVar("DepsT")
 
@@ -129,13 +132,198 @@ class RunContext(Generic[DepsT]):
     def add_usage(self, usage: Usage) -> None:
         """Count model usage a tool caused (an embedding call, a model request) in the run total.
 
-        The usage of a child run (``parent=ctx``, as an agent used as a tool
-        starts) is added for you when the child ends; passing its
-        ``result.usage`` here again is recognised and not counted twice.
-        Safe to call from the worker thread of a sync tool.
+        The usage of a child run (``parent=ctx``: an agent used as a tool, an
+        external agent's turn) is added for you, when the child ends or as it
+        is reported; passing its ``result.usage`` here again is recognised and
+        not counted twice (see `counted`). Safe to call from the worker thread
+        of a sync tool.
         """
         if self._add_usage is not None:
             self._add_usage(usage)
+
+    def counted(self, usage: Usage) -> None:
+        """Say that ``usage`` (a child's result total) was already added to this run piece by
+        piece, so a later ``add_usage`` of this same object adds nothing.
+
+        Integrations that report a child's usage as it arrives (external
+        agents) call it when the child ends, as the agent loop does for an
+        agent used as a tool. The object is matched by identity, once. Does
+        nothing outside a run.
+        """
+        run = self._run
+        lock = getattr(run, "_usage_lock", None)
+        absorbed = getattr(run, "_absorbed", None)
+        if lock is None or not isinstance(absorbed, list):
+            return
+        with lock:
+            absorbed.append(usage)
+
+    async def checkpoint(self, key: str, value: Any) -> None:
+        """Journal a fact about this tool call now, before the call ends.
+
+        Written at once as a ``tool_checkpoint`` entry ``{tool_call_id,
+        operation_id, key, value}``, so the fact is recorded before the tool
+        acts on it (record first, act second). When the same call is repeated
+        after a crash and a resume (only read-only and idempotent tools are
+        repeated), `checkpoints` holds the values of the earlier attempts. Use
+        it for ids of work started elsewhere: a job, an upload, a session. A
+        call that has a recorded result is never repeated, whatever it
+        checkpointed. A later value for the same key replaces the earlier one.
+
+        Args:
+            key: Names the fact.
+            value: A JSON value (dicts with string keys, lists, strings,
+                numbers, booleans, ``None``); tuples come back as lists.
+
+        Raises:
+            RuntimeError: Called outside a running tool call of a run (also
+                once the call has its result, the run's journal is closed, or
+                the run stopped: a context kept after its run ended writes nothing).
+            SessionError: ``value`` is not JSON. Nothing was journaled.
+        """
+        run = self._run
+        write = getattr(run, "_checkpoint", None)
+        if write is None or self.tool_call_id is None or self.operation_id is None:
+            raise RuntimeError("RunContext.checkpoint() works only inside a tool call of a run.")
+        await write(self.tool_call_id, self.operation_id, key, value)
+
+    @property
+    def checkpoints(self) -> Mapping[str, Any]:
+        """What earlier attempts of this tool call journaled with `checkpoint`, and what this
+        attempt journaled so far, by key: empty on a first attempt, and outside a tool call.
+
+        A deep copy: changing it, nested values included, changes nothing in the journal
+        or in what the next read returns."""
+        if self.operation_id is None:
+            return {}
+        stored = getattr(self._run, "checkpoints", None)
+        if not isinstance(stored, Mapping):
+            return {}
+        return copy.deepcopy(dict(stored.get(self.operation_id, {})))
+
+    @property
+    def journaled_usage(self) -> Usage:
+        """What this tool call added with `add_usage` that the journal already holds: in
+        earlier attempts, when the call is repeated after a crash and a resume, and in
+        this attempt so far. ``Usage()`` on a first attempt and outside a tool call.
+
+        Usage that rode on a journal entry before a crash is restored with the run;
+        usage that no entry carried yet is lost. A call that reports again, on a
+        repeat, usage an earlier attempt already reported (work it re-reads from
+        another system's log instead of doing it again) adds only what goes beyond
+        this, or the run counts it twice.
+        """
+        stored = getattr(self._run, "journaled_usage", None)
+        if self.operation_id is None or not isinstance(stored, Mapping):
+            return Usage()
+        held = stored.get(self.operation_id)
+        return held.model_copy() if isinstance(held, Usage) else Usage()
+
+    async def save_state(self) -> None:
+        """Journal ``state`` now, instead of when the run next saves it.
+
+        For a tool that must record a change before it acts on it (record
+        first, act second): a one-shot grant it is about to use, for example.
+        Emits ``state_updated`` when the values changed. Does nothing outside a
+        run, and once the run's journal is closed or the run stopped (however it
+        ended: a context kept after its run ended writes nothing).
+
+        Raises:
+            SessionError: A value in ``state`` is not JSON. Nothing was journaled.
+        """
+        save = getattr(self._run, "_save_state_now", None)
+        if save is None:
+            return
+        updated = await save()
+        if updated is not None:
+            self.emit(updated)
+
+    async def call_tool(
+        self,
+        tool: Tool,
+        arguments: Mapping[str, Any],
+        *,
+        source: str,
+        approval_timeout_s: float | None = None,
+        tags: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> ToolResultPart:
+        """Run a tool call that did not come from this run's model, as an ordinary tool
+        call of the run, while the tool call this context belongs to is running.
+
+        For tools that serve another program: `qagents.integrations.mcp_server`
+        serves qagents tools to an external agent this way. The call gets a new
+        id (``"<source>-<hex>"``) and is decided, run and recorded as the loop
+        does it:
+
+        * its arguments are validated before anyone is asked about it;
+        * it counts toward ``Limits.max_tool_calls``: its slot is taken before
+          it is decided (calls that arrive together never pass the limit), and
+          given back when it is refused;
+        * the run's `Permissions` decide it, with the run's ``on_ask`` (bounded
+          by ``approval_timeout_s``); "ask" without an ``on_ask`` is refused,
+          because nothing can pause the run for it;
+        * ``approval_decided``, ``tool_started`` and ``tool_result`` are
+          journaled with ``source``, ``caller_tool_call_id`` and ``tags``, the
+          start before the tool runs and the result after; the result is not
+          part of any assistant message;
+        * the ``before_tool`` and ``after_tool`` hooks run, and a hook (or the
+          journal) that raises fails the run, as for the model's calls;
+        * ``tool_call_started`` and ``tool_call_finished`` reach the run's
+          stream, and ``ctx.state`` changes are journaled;
+        * ``Limits.parallel_tools`` keeps the calls served through this tool
+          call apart from each other (calls served through different calling
+          calls, and the model's own calls, are not kept apart from them), and
+          a call that runs alone waits for the thread of an earlier sync call
+          (of the run or another served one) that timed out or was cancelled
+          and still runs.
+
+        The call runs at ``self.depth + 1``: it comes from the agent this tool
+        call runs, so an agent or external agent among the served tools starts
+        at ``self.depth + 2`` and ``Limits.max_depth`` counts the hop. Once the
+        run is cancelled (``cancel()``, or from outside: a deadline around
+        ``agent.run``, a task cancel, the cancel of a parent run) or stopped (its
+        stream closed early, a failure, its end), its journal closed, or once this
+        tool call has ended or is being cancelled (its timeout), a call is refused
+        and nothing is journaled for it; a call already started then records
+        `TOOL_SERVER_RUN_ENDED` and does not run.
+        A call cancelled while it runs records ``TOOL_CANCELLED`` (read-only
+        tools) or ``TOOL_INTERRUPTED`` before the cancellation goes on.
+
+        Args:
+            tool: The tool to run (not ``deferred``: nothing can wait for its result).
+            arguments: Its arguments, as a model would give them.
+            source: Where the call came from, a short name (letters, digits,
+                ``_`` or ``-``) such as ``"mcp"``; it starts the call id.
+            approval_timeout_s: Seconds ``on_ask`` may take before the call is
+                refused; ``None``: no limit.
+            tags: JSON values added to each journal entry of the call (the
+                server it came through, for example).
+            metadata: JSON values added to the result's ``metadata``.
+
+        Returns:
+            The call's result. A failure of the tool, a refusal or a timeout is
+            a result with ``is_error`` set: it never raises for those.
+
+        Raises:
+            RuntimeError: Called outside a running tool call of a run.
+            ValueError: ``source`` is not a short name, a ``tags`` key is one
+                the entries already have (or ``usage``, which a resume would
+                count as model usage), or ``tags`` or ``metadata`` is not JSON.
+        """
+        run = self._run
+        outside = getattr(run, "_outside_call", None)
+        if outside is None or self.tool_call_id is None:
+            raise RuntimeError("RunContext.call_tool() works only inside a tool call of a run.")
+        return await outside(
+            self,
+            tool,
+            dict(arguments),
+            source=source,
+            approval_timeout_s=approval_timeout_s,
+            tags=dict(tags or {}),
+            metadata=dict(metadata or {}),
+        )
 
     @property
     def limits(self) -> Limits | None:
@@ -146,6 +334,16 @@ class RunContext(Generic[DepsT]):
         chain of parent runs.
         """
         return getattr(self._run, "limits", None)
+
+    @property
+    def permissions(self) -> Permissions | None:
+        """The permission rules of this run, with the parent run's ``on_ask`` when its own
+        have none; ``None`` for a context that belongs to no run.
+
+        Tools that relay another system's permission requests (an external
+        agent) decide them with these rules.
+        """
+        return getattr(self._run, "permissions", None)
 
     def remaining_budget(self) -> dict[str, Any]:
         """What is left right now of the run's ``max_total_tokens``, ``max_cost_usd``
@@ -236,6 +434,11 @@ class Tool:
         including an awaitable that a sync function returns. When it expires,
         `ToolTimeout` is raised; a ``TimeoutError`` raised by the function
         itself passes through unchanged.
+
+        A thread cannot be stopped: when the call times out or is cancelled
+        while a sync function runs, its thread is abandoned and goes on. The
+        agent loop (and the MCP tool server) then keeps later calls that run
+        one at a time (``Limits.parallel_tools``) apart from it.
         """
         kwargs = self.validate(arguments)
         args = (ctx,) if self.takes_context else ()
@@ -328,6 +531,27 @@ def _run_in_thread(
         return _EXECUTOR.submit(context.run, functools.partial(function, *args, **kwargs))
 
 
+_ON_ABANDONED: contextvars.ContextVar[Callable[[concurrent.futures.Future[Any]], None] | None] = (
+    contextvars.ContextVar("qagents_on_abandoned", default=None)
+)
+"""Who keeps later calls apart from the thread of a sync call that was given up (timed out
+or cancelled) while it still runs: set around `Tool.run` by the agent loop and the MCP tool
+server (`_abandoned_threads_to`), called before `Tool.run` raises. A context variable, so
+that `Tool` subclasses that override ``run`` keep its signature."""
+
+
+@contextlib.contextmanager
+def _abandoned_threads_to(
+    hook: Callable[[concurrent.futures.Future[Any]], None],
+) -> Iterator[None]:
+    """Hand the threads that `Tool.run` abandons inside the block to ``hook``."""
+    token = _ON_ABANDONED.set(hook)
+    try:
+        yield
+    finally:
+        _ON_ABANDONED.reset(token)
+
+
 def _abandon(name: str, thread: concurrent.futures.Future[Any], why: str) -> None:
     with _LOCK:
         _ABANDONED.add(thread)
@@ -340,6 +564,12 @@ def _abandon(name: str, thread: concurrent.futures.Future[Any], why: str) -> Non
         stuck,
         _EXECUTOR_SIZE,
     )
+    hook = _ON_ABANDONED.get()
+    if hook is not None:
+        try:
+            hook(thread)
+        except Exception:  # the call's own outcome must still be raised
+            logger.exception("Keeping the abandoned thread of sync tool %s failed", name)
 
 
 def _release(thread: concurrent.futures.Future[Any]) -> None:
@@ -377,6 +607,11 @@ def tool(
 
     A first parameter annotated ``RunContext`` (or named ``ctx``) receives the
     run context and is hidden from the model.
+
+    The model reads the return value as text (`render_tool_output`). Return a
+    `ToolResultPart` to set ``is_error`` and ``metadata`` yourself (the loop
+    fills in the call id and name); raise `ToolError` for an error result, and
+    give it a ``metadata`` dict to have that copied into the result's metadata.
 
     Args:
         function: The function to wrap. Leave it out to use ``@tool(...)`` with options.

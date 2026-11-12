@@ -16,6 +16,7 @@ Entry kinds:
 | `tool_started` | a tool call began executing (`tool_call_id`, `name`) |
 | `tool_result` | a tool call finished (`result`; see below) |
 | `tool_deferred` | a tool call waits for a result from outside the run (`input`) |
+| `tool_checkpoint` | a running call noted a fact (`tool_call_id`, `operation_id`, `key`, `value`) |
 | `approval_decided` | an approval was applied to a call, before it ran (see below) |
 | `state_updated` | the session state changed; the full new values (`values`) |
 | `agent_switched` | a handoff changed the active agent (`agent`) |
@@ -36,9 +37,18 @@ Details:
   approval lets it run (its `tool_started`).
 * Usage added through ``ctx.add_usage`` (a sub-agent, a compactor's summary
   request) is written as `added_usage` on the run's next `message`,
-  `tool_result`, `run_paused`, `run_failed` or `run_finished` entry.
+  `tool_result`, `tool_checkpoint`, `run_paused`, `run_failed` or
+  `run_finished` entry.
 * `approval_decided` has `tool_call_id`, `name`, `approved`, `reason`,
   `arguments_changed`, and `arguments` when the approver changed them.
+* A `tool_checkpoint` is written by ``RunContext.checkpoint`` while its call
+  runs. A resume gives the values of the open turn's calls back to a
+  repeated call (``RunContext.checkpoints``), by `operation_id`.
+* `approval_decided`, `tool_started` and `tool_result` entries with a
+  `source` (and `caller_tool_call_id`) are tool calls that did not come from
+  the model (``RunContext.call_tool``: a tool served over MCP, for example).
+  No assistant message has them; they count toward ``Limits.max_tool_calls``,
+  and readers may show them apart.
 * `run_failed` has `error_type`, `message` (the exception's text, shortened),
   `retryable`, `ambiguous`, and `error` (type and message joined).
 
@@ -150,6 +160,13 @@ class SessionState(BaseModel):
     """Model requests of the latest run that produced a journaled response."""
     run_tool_call_ids: list[str] = Field(default_factory=list)
     """Tool calls of the latest run that count toward ``Limits.max_tool_calls``."""
+    checkpoints: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    """Values journaled with ``RunContext.checkpoint`` by the tool calls of the open run's
+    last turn, by operation id, then key (the latest value of a key wins)."""
+    operation_usage: dict[str, Usage] = Field(default_factory=dict)
+    """Usage that tool calls of the latest run added with ``ctx.add_usage`` and that the
+    journal holds, by operation id (part of `run_usage`). A call repeated after a crash
+    reads its own as ``RunContext.journaled_usage``."""
 
     @property
     def run_tool_calls(self) -> int:
@@ -179,6 +196,7 @@ def derive_state(entries: list[Entry]) -> SessionState:
     inputs: dict[str, PendingInput] = {}
     values: dict[str, Any] = {}
     counted: dict[str, None] = {}
+    checkpoints: dict[str, dict[str, Any]] = {}
     finished: set[str] = set()
     """Runs closed by ``run_finished``. What such a run writes later (it was
     abandoned while it still ran) is ignored, so the conversation stays valid."""
@@ -193,6 +211,7 @@ def derive_state(entries: list[Entry]) -> SessionState:
             state.pending_approvals = []
             started = {}
             inputs = {}
+            checkpoints = {}  # a new message closes the turn whose calls recorded them
             if entry.run_id is not None and entry.run_id == state.open_run_id:
                 _count_usage(state, data)
                 state.run_turns = max(state.run_turns, int(data.get("turn") or 0))
@@ -216,6 +235,12 @@ def derive_state(entries: list[Entry]) -> SessionState:
             started.pop(waiting.tool_call_id, None)
             inputs[waiting.tool_call_id] = waiting
             counted[waiting.tool_call_id] = None
+        elif kind == "tool_checkpoint":
+            if entry.run_id is not None and entry.run_id == state.open_run_id:
+                operation, key = data.get("operation_id"), data.get("key")
+                if isinstance(operation, str) and isinstance(key, str):
+                    checkpoints.setdefault(operation, {})[key] = data.get("value")
+                _count_usage(state, data)  # usage from ctx.add_usage may ride on it
         elif kind == "state_updated":
             values = data.get("values", {})
         elif kind == "run_started":
@@ -223,8 +248,10 @@ def derive_state(entries: list[Entry]) -> SessionState:
             state.agent = data.get("agent")
             state.run_messages = 0
             state.run_usage = Usage()
+            state.operation_usage = {}
             state.run_turns = 0
             counted = {}
+            checkpoints = {}
         elif kind == "agent_switched":
             state.agent = data.get("agent")
         elif kind == "run_paused":
@@ -255,6 +282,8 @@ def derive_state(entries: list[Entry]) -> SessionState:
     state.pending_inputs = list(inputs.values())
     state.run_tool_call_ids = list(counted)
     state.values = copy.deepcopy(values)
+    if state.open_run_id is not None:  # only the open run's last turn can repeat a call
+        state.checkpoints = copy.deepcopy(checkpoints)
     return state
 
 
@@ -269,10 +298,31 @@ def _mark_blocked(messages: list[Message]) -> None:
 
 def _count_usage(state: SessionState, data: dict[str, Any]) -> None:
     """Add an entry's usage: a model response's ``usage``, and ``added_usage``
-    (from ``ctx.add_usage``: a compactor's summary request, a sub-agent)."""
+    (from ``ctx.add_usage``: a compactor's summary request, a sub-agent), with the
+    tool calls that added it (``added_usage_by_operation``)."""
     for key in ("usage", "added_usage"):
         if usage := data.get(key):
             state.run_usage = state.run_usage.add(Usage.model_validate(usage))
+    for operation_id, usage in _usage_loads(data).items():
+        held = state.operation_usage.get(operation_id, Usage())
+        state.operation_usage[operation_id] = held.add(usage)
+
+
+def _usage_loads(data: dict[str, Any]) -> dict[str, Usage]:
+    """An entry's ``added_usage_by_operation``: ``{operation id: Usage}``, the part of its
+    ``added_usage`` that each tool call added. Empty when the entry has none (or a value
+    this version cannot read: it is ignored, as unknown entry kinds are)."""
+    raw = data.get("added_usage_by_operation")
+    if not isinstance(raw, dict):
+        return {}
+    usage: dict[str, Usage] = {}
+    for operation_id, item in raw.items():
+        if isinstance(operation_id, str) and isinstance(item, dict):
+            try:
+                usage[operation_id] = Usage.model_validate(item)
+            except ValueError:
+                continue
+    return usage
 
 
 SessionRunStatus = Literal["idle", "running", "paused", "failed"]

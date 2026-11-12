@@ -20,6 +20,7 @@ from qagents.errors import (
     SessionError,
     ToolError,
 )
+from qagents.external import EndStep, ScriptedExternalAgent, ToolStep
 from qagents.integrations.agui import (
     APPROVAL_RESPONSE_SCHEMA,
     CUSTOM_EVENTS,
@@ -81,14 +82,18 @@ def done(message: Message) -> ResponseDone:
     return ResponseDone(response=ModelResponse(message=message, finish_reason=finish))
 
 
-async def collect(stream, **options) -> list[dict]:
+async def collect(stream, earlier: list[dict] = (), **options) -> list[dict]:
     events = [event async for event in to_agui_events(stream, **options)]
-    check_protocol(events)
+    check_protocol(events, earlier=earlier)
     return events
 
 
-def check_protocol(events: list[dict]) -> None:
-    """The ordering rules strict AG-UI clients enforce, per subagent run."""
+def check_protocol(events: list[dict], *, earlier: list[dict] = ()) -> None:
+    """The ordering rules strict AG-UI clients enforce, per subagent run.
+
+    Every tool call result has a start: in ``events``, or in ``earlier``, the events
+    of the run that paused, for the calls a resumed run goes on with.
+    """
     assert events, "no events"
     assert events[0]["type"] in ("RUN_STARTED", "RUN_ERROR")
     assert events[-1]["type"] in ("RUN_FINISHED", "RUN_ERROR")
@@ -98,6 +103,8 @@ def check_protocol(events: list[dict]) -> None:
     open_call: dict[str | None, str] = {}
     steps: dict[str | None, list[str]] = {}
     started_calls: set[str] = set()
+    known_calls = {e["toolCallId"] for e in earlier if e["type"] == "TOOL_CALL_START"}
+    ended_calls: set[str] = set()
     message_ids: set[str] = set()
     for position, event in enumerate(events):
         kind, scope = event["type"], event.get("subagentRunId")
@@ -125,14 +132,18 @@ def check_protocol(events: list[dict]) -> None:
         elif kind == "TOOL_CALL_START":
             assert not busy, f"interleaved at {position}: {event}"
             assert event["toolCallId"] not in started_calls, "tool call started twice"
+            assert event["toolCallId"] not in known_calls, "the paused run started it"
             started_calls.add(event["toolCallId"])
             open_call[scope] = event["toolCallId"]
         elif kind == "TOOL_CALL_ARGS":
             assert open_call.get(scope) == event["toolCallId"]
         elif kind == "TOOL_CALL_END":
             assert open_call.pop(scope) == event["toolCallId"]
+            ended_calls.add(event["toolCallId"])
         elif kind == "TOOL_CALL_RESULT":
             assert not busy
+            call_id = event["toolCallId"]
+            assert call_id in ended_calls or call_id in known_calls, f"no start for {call_id}"
             assert event["messageId"] not in message_ids, "message id reused"
             message_ids.add(event["messageId"])
         elif kind == "STEP_STARTED":
@@ -590,11 +601,15 @@ async def test_a_paused_run_ends_with_interrupts_and_resumes_from_the_client_ans
             "payload": {"approved": True},
         }
     ]
-    resumed = await collect(agent.resume_stream(session, **agui_resume(answer)), run_id="r2")
+    resumed = await collect(
+        agent.resume_stream(session, **agui_resume(answer)), earlier=events, run_id="r2"
+    )
 
     assert resumed[0] == {"type": "RUN_STARTED", "threadId": session.id, "runId": "r2"}
     result = next(e for e in resumed if e["type"] == "TOOL_CALL_RESULT")
     assert result["toolCallId"] == refund_call.id and result["content"] == "Refunded A-1"
+    # The paused run announced the call; the resumed run sends only its result.
+    assert [e for e in resumed if e["type"].startswith("TOOL_CALL_")] == [result]
     assert resumed[-1]["result"]["status"] == "completed" and "outcome" not in resumed[-1]
 
 
@@ -603,7 +618,9 @@ async def test_a_resumed_run_without_a_client_run_id_gets_a_new_one():
     agent = Agent(ScriptedModel([refund_call, "Done."]), tools=[refund])
     session = Session()
     first = await collect(agent.stream("Refund A-2", session=session))
-    second = await collect(agent.resume_stream(session, approvals={refund_call.id: False}))
+    second = await collect(
+        agent.resume_stream(session, approvals={refund_call.id: False}), earlier=first
+    )
 
     assert second[0]["runId"] != first[0]["runId"]
     assert second[0]["runId"].startswith(f"{first[0]['runId']}-")
@@ -631,7 +648,7 @@ async def test_deferred_tool_calls_become_input_interrupts():
     assert interrupt["metadata"] == {"name": "pick_city", "arguments": {"question": "Which city?"}}
 
     answer = [{"interruptId": interrupt["id"], "status": "resolved", "payload": "Athens"}]
-    resumed = await collect(agent.resume_stream(session, **agui_resume(answer)))
+    resumed = await collect(agent.resume_stream(session, **agui_resume(answer)), earlier=events)
 
     result = next(e for e in resumed if e["type"] == "TOOL_CALL_RESULT")
     assert result["toolCallId"] == question.id and result["content"] == "Athens"
@@ -847,7 +864,7 @@ async def test_a_handoff_call_recorded_after_a_pause_gets_its_result():
     interrupts = first[-1]["outcome"]["interrupts"]
     answers = [{"interruptId": i["id"], "status": "resolved", "payload": True} for i in interrupts]
 
-    second = await collect(triage.resume_stream(session, **agui_resume(answers)))
+    second = await collect(triage.resume_stream(session, **agui_resume(answers)), earlier=first)
 
     results = [e for e in second if e["type"] == "TOOL_CALL_RESULT"]
     assert [e["toolCallId"] for e in results].count(transfer) == 1
@@ -1205,3 +1222,233 @@ async def test_hold_final_answer_sends_the_answer_of_a_native_sub_agent_that_pas
             if e["type"] == "TEXT_MESSAGE_CONTENT" and e.get("subagentRunId")
         )
         assert text == "Athens has 3 million people.", kind
+
+
+# --- external agents ----------------------------------------------------------------------
+
+
+def coder(*steps) -> ScriptedExternalAgent:
+    return ScriptedExternalAgent([list(steps)], name="coder")
+
+
+async def test_a_direct_external_turn_is_a_finished_run():
+    for hold in (False, True):
+        agent = coder("Reading.", ToolStep("read", {"path": "a.py"}, result="print(1)"), "Done.")
+        async with agent.stream("Fix it") as turn:
+            events = await collect(turn, thread_id="t", run_id="r", hold_final_answer=hold)
+        assert turn.result is not None
+        call_id = turn.result.tool_calls[0].id
+
+        assert events == [
+            {"type": "RUN_STARTED", "threadId": "t", "runId": "r"},
+            {"type": "TEXT_MESSAGE_START", "messageId": "r-msg-1", "role": "assistant"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "r-msg-1", "delta": "Reading."},
+            {"type": "TEXT_MESSAGE_END", "messageId": "r-msg-1"},
+            {
+                "type": "TOOL_CALL_START",
+                "toolCallId": call_id,
+                "toolCallName": "coder.read",
+                "parentMessageId": "r-msg-1",
+            },
+            {"type": "TOOL_CALL_ARGS", "toolCallId": call_id, "delta": '{"path": "a.py"}'},
+            {"type": "TOOL_CALL_END", "toolCallId": call_id},
+            {
+                "type": "TOOL_CALL_RESULT",
+                "messageId": "r-result-2",
+                "toolCallId": call_id,
+                "content": "print(1)",
+                "role": "tool",
+            },
+            {"type": "TEXT_MESSAGE_START", "messageId": "r-msg-3", "role": "assistant"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "r-msg-3", "delta": "Done."},
+            {"type": "TEXT_MESSAGE_END", "messageId": "r-msg-3"},
+            {
+                "type": "RUN_FINISHED",
+                "threadId": "t",
+                "runId": "r",
+                "result": {"status": "completed", "stop_reason": "end_turn", "output": None},
+            },
+        ], hold
+
+
+async def test_a_direct_external_turn_ends_as_its_status_says():
+    ends = {
+        "completed": "RUN_FINISHED",
+        "cancelled": "RUN_FINISHED",
+        "limit_reached": "RUN_FINISHED",
+        "error": "RUN_ERROR",
+        "interrupted": "RUN_ERROR",
+    }
+    for status, end in ends.items():
+        async with coder("Working.", EndStep(status=status, stop_reason="why")).stream("t") as turn:
+            events = await collect(turn)
+        assert [e["type"] for e in events].count(end) == 1, status
+        if end == "RUN_FINISHED":
+            assert events[-1]["result"] == {"status": status, "stop_reason": "why", "output": None}
+        else:
+            assert events[-1] == {
+                "type": "RUN_ERROR",
+                "message": RUN_ERROR_MESSAGE,
+                "code": f"external_{status}",
+            }
+
+    async with coder(EndStep(status="error", stop_reason="the agent crashed")).stream("t") as turn:
+        shown = await collect(turn, expose_errors=True)
+    assert shown[-1]["message"] == "the agent crashed"
+
+
+async def test_the_tool_calls_of_an_external_sub_agent_are_started_before_their_results():
+    for hold in (False, True):
+        external = coder("Looking. ", ToolStep("bash", {"command": "ls"}, result="a.py"), "Done.")
+        lead = Agent(
+            ScriptedModel([call("coder", task="t"), "ok"]),
+            tools=[external.as_tool()],
+            permissions=Permissions(allow=["coder.*"]),
+        )
+        events = await collect(lead.stream("go"), subagents="native", hold_final_answer=hold)
+
+        child = next(e for e in events if e["type"] == "SUBAGENT_STARTED")["subagentRunId"]
+        inner = [e for e in events if e.get("subagentRunId") == child]
+        start = next(e for e in inner if e["type"] == "TOOL_CALL_START")
+        assert start["toolCallName"] == "coder.bash"
+        calls = [e["type"] for e in inner if e.get("toolCallId") == start["toolCallId"]]
+        assert calls == ["TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT"]
+        assert events[-1]["type"] == "RUN_FINISHED"
+
+
+def test_a_call_that_only_finished_is_started_before_its_result():
+    # A bound tool server reports a call it refused with tool_call_finished alone.
+    projector = AGUIProjector(thread_id="t", run_id="r", steps=False)
+    projector.feed({"type": "run_started", "run_id": "r", "session_id": "t"})
+    served = ToolCallPart(id="mcp-1", name="lookup", arguments={"q": "x"})
+    refused = {
+        "type": "tool_call_finished",
+        "call": served.model_dump(),
+        "result": {"tool_call_id": "mcp-1", "name": "lookup", "content": "No.", "is_error": True},
+    }
+
+    assert projector.feed(refused) == [
+        {
+            "type": "TOOL_CALL_START",
+            "toolCallId": "mcp-1",
+            "toolCallName": "lookup",
+            "parentMessageId": "r-msg-1",
+        },
+        {"type": "TOOL_CALL_ARGS", "toolCallId": "mcp-1", "delta": '{"q": "x"}'},
+        {"type": "TOOL_CALL_END", "toolCallId": "mcp-1"},
+        {
+            "type": "TOOL_CALL_RESULT",
+            "messageId": "r-result-2",
+            "toolCallId": "mcp-1",
+            "content": "No.",
+            "role": "tool",
+        },
+    ]
+    started = {"type": "tool_call_started", "call": served.model_dump()}
+    assert projector.feed(started) == []  # announced once
+
+
+def test_a_resumed_run_does_not_start_the_calls_of_the_paused_response_again():
+    started = {"type": "tool_call_started", "call": {"id": "c1", "name": "refund"}}
+    finished = {
+        "type": "tool_call_finished",
+        "call": {"id": "c1", "name": "refund"},
+        "result": {"tool_call_id": "c1", "name": "refund", "content": "Refunded."},
+    }
+    resumed = AGUIProjector(thread_id="t", run_id="r2", steps=False)
+    resumed.feed({"type": "run_started", "run_id": "r", "session_id": "t", "resumed": True})
+    assert resumed.feed(started) == []
+    assert [e["type"] for e in resumed.feed(finished)] == ["TOOL_CALL_RESULT"]
+
+    # An external turn that continues a session is not a resumed run: its calls are new.
+    continued = AGUIProjector(thread_id="t", run_id="r3", steps=False)
+    continued.feed(
+        {
+            "type": "run_started",
+            "run_id": "ext:s1:0123456789ab",
+            "session_id": "s1",
+            "resumed": True,
+        }
+    )
+    assert [e["type"] for e in continued.feed(started)] == [
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+    ]
+
+
+async def test_a_resumed_run_starts_the_calls_that_its_approved_call_serves():
+    # An approved call that serves calls (ctx.call_tool, as a bound tool server does for an
+    # external agent) runs before the resumed run's first model request: its calls are new.
+    @tool(read_only=True)
+    def lookup(q: str) -> str:
+        """Look up q."""
+        return f"found {q}"
+
+    @tool
+    async def delegate(ctx: RunContext, task: str) -> str:
+        """Delegate a task; the worker uses lookup."""
+        refused = await ctx.call_tool(refund, {"order_id": "A-1"}, source="mcp")
+        found = await ctx.call_tool(lookup, {"q": task}, source="mcp")
+        return f"{refused.is_error} {found.content}"
+
+    delegated = call("delegate", task="x")
+    agent = Agent(
+        ScriptedModel([delegated, "done"]),
+        tools=[delegate, lookup, refund],
+        permissions=Permissions(ask=["delegate"]),
+    )
+    session = Session()
+    first = await collect(agent.stream("go", session=session))
+    assert first[-1]["result"]["status"] == "paused"
+
+    second = await collect(
+        agent.resume_stream(session, approvals={delegated.id: True}), earlier=first
+    )
+
+    results = [e["toolCallId"] for e in second if e["type"] == "TOOL_CALL_RESULT"]
+    served = [call_id for call_id in results if call_id.startswith("mcp-")]
+    assert len(served) == 2  # the refused call (no tool_call_started) and the one that ran
+    for call_id in served:
+        kinds = [e["type"] for e in second if e.get("toolCallId") == call_id]
+        assert kinds == ["TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT"]
+    # The approved call itself was started by the paused run, not again.
+    assert [e["type"] for e in second if e.get("toolCallId") == delegated.id] == [
+        "TOOL_CALL_RESULT"
+    ]
+    assert second[-1]["result"]["status"] == "completed"
+
+
+def test_a_resumed_run_starts_only_calls_made_while_a_call_of_this_run_runs():
+    def started(call_id: str, **extra) -> dict:
+        return {"type": "tool_call_started", "call": {"id": call_id, "name": "t"}, **extra}
+
+    def finished(call_id: str) -> dict:
+        result = {"tool_call_id": call_id, "name": "t", "content": "ok"}
+        return {
+            "type": "tool_call_finished",
+            "call": {"id": call_id, "name": "t"},
+            "result": result,
+        }
+
+    served_id = "mcp-" + "0" * 32
+    resumed = AGUIProjector(thread_id="t", run_id="r2", steps=False)
+    resumed.feed({"type": "run_started", "run_id": "r", "session_id": "t", "resumed": True})
+    # A provider id of the served form, first of the run: no call runs, so it is not served.
+    assert resumed.feed(started("chatcmpl-tool-" + "1" * 32)) == []
+    # Calls of the paused response run in parallel: a model's id is never served.
+    assert resumed.feed(started("call_2")) == []
+    # A served id while calls of this run run: a new call.
+    assert [e["type"] for e in resumed.feed(started(served_id))] == [
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+    ]
+    assert [e["type"] for e in resumed.feed(finished(served_id))] == ["TOOL_CALL_RESULT"]
+    # An event that names its caller is served, whatever its id.
+    named = resumed.feed(started("x-1", caller_tool_call_id="call_2"))
+    assert [e["type"] for e in named][0] == "TOOL_CALL_START"
+    assert [e["type"] for e in resumed.feed(finished("call_2"))] == ["TOOL_CALL_RESULT"]
+    assert [e["type"] for e in resumed.feed(finished("chatcmpl-tool-" + "1" * 32))] == [
+        "TOOL_CALL_RESULT"
+    ]

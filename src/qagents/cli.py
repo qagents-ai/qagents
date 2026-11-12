@@ -1,8 +1,9 @@
-"""The ``qagents`` command line: chat with an agent, run one prompt, list models.
+"""The ``qagents`` command line: chat with an agent, run one prompt, list models, read docs.
 
     python -m qagents chat --model qcloud:<model-id> --tools files,time
     python -m qagents run "Summarise README.md" --model qcloud:<model-id> --tools files
     python -m qagents models qcloud
+    python -m qagents docs search "pause a tool for approval"
 
 ``--model`` takes a ``provider:model-id`` string and goes through the provider
 registry, so every provider registered with `register_provider` works. The
@@ -28,8 +29,16 @@ escaped, as in ``\\x1b``, so it cannot restyle the terminal or forge a prompt.
 is not counted, since its usage is unknown. It needs a model whose prices are
 known (QCloud catalog models), and the command refuses to start otherwise.
 
+``docs`` is ``python -m qagents.docs_mcp`` under a shorter name: every argument
+after it goes to that command line unchanged (see `qagents.docs_mcp.cli`):
+search, read, pages, api, examples, example, check, llms, skill, and serve,
+which is also what it does with no command. Only serving needs the MCP SDK
+(``qagents[mcp]``); without it ``serve`` says so and exits with 1.
+
 Exit codes: 0 when the agent answered, 1 when the run failed or stopped
 without an answer, 2 for a mistake in the command line, 130 after Ctrl-C.
+``docs`` exits as the docs command line does: 1 when something was not found
+or ``check`` found problems.
 """
 
 from __future__ import annotations
@@ -98,11 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
     """The argument parser of the ``qagents`` command.
 
     Returns:
-        A parser with the ``chat``, ``run`` and ``models`` subcommands.
+        A parser with the ``chat``, ``run``, ``models`` and ``docs`` subcommands.
     """
     parser = argparse.ArgumentParser(
         prog="qagents",
-        description="Chat with an agent, run one prompt, or list the models of a provider.",
+        description=(
+            "Chat with an agent, run one prompt, list the models of a provider, or read the docs."
+        ),
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
@@ -191,6 +202,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"QCloud API base URL (default: $QCLOUD_BASE_URL or {QCLOUD_BASE_URL})",
     )
     models.set_defaults(handler=_models)
+
+    docs = commands.add_parser(
+        "docs",
+        add_help=False,
+        help="the qagents docs for coding agents: search, read, api, check; no command serves MCP",
+        description="The qagents docs for coding agents. See: qagents docs --help.",
+    )
+    # Here so that qagents --help lists it. `main` hands everything after "docs" to the docs
+    # command line before this parser runs, since REMAINDER rejects an option that comes
+    # first, such as --help or --docs-dir.
+    docs.add_argument("docs_args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+    docs.set_defaults(handler=None)
     return parser
 
 
@@ -211,17 +234,21 @@ def main(
 
     Returns:
         The exit code: 0 on success, 1 when the run failed or stopped without
-        an answer, 2 for a command-line mistake, 130 after Ctrl-C.
+        an answer, 2 for a command-line mistake, 130 after Ctrl-C. ``docs``
+        returns what the docs command line returns.
     """
     console = _Console(
         stdin if stdin is not None else sys.stdin,
         stdout if stdout is not None else _tolerant(sys.stdout),
         stderr if stderr is not None else _tolerant(sys.stderr),
     )
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["docs"]:
+        return _docs(arguments[1:], console)
     parser = build_parser()
     try:
         with contextlib.redirect_stdout(console.out), contextlib.redirect_stderr(console.err):
-            args = parser.parse_args(argv)
+            args = parser.parse_args(arguments)
     except SystemExit as exit_:
         if exit_.code is None:
             return 0
@@ -232,6 +259,26 @@ def main(
         console.error(f"qagents {args.command}: error: {error}")
         return 2
     except QAgentsError as error:
+        console.error(f"error: {error}")
+        return 1
+    except KeyboardInterrupt:
+        console.error("\ninterrupted")
+        return 130
+
+
+def _docs(argv: list[str], console: _Console) -> int:
+    """``qagents docs``: the docs command line, `qagents.docs_mcp.cli`, with these arguments.
+
+    Not inside ``asyncio.run``: with no command it serves MCP over stdio on its own
+    loop. Its help and command-line errors go to the console's streams, as those of
+    the other commands do.
+    """
+    from .docs_mcp.cli import main as docs_main
+
+    try:
+        with contextlib.redirect_stdout(console.out), contextlib.redirect_stderr(console.err):
+            return docs_main(argv, stdin=console.stdin, stdout=console.out, stderr=console.err)
+    except ImportError as error:  # serving needs the MCP SDK; its message names the extra
         console.error(f"error: {error}")
         return 1
     except KeyboardInterrupt:

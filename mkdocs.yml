@@ -6,6 +6,9 @@ edit_uri: ""
 
 theme:
   name: material
+  # The journal-q mark (assets/logo/ at the repository root; copies in docs/assets/).
+  logo: assets/qagents-icon.svg
+  favicon: assets/qagents-icon-32.png
   features:
     - navigation.sections
     - navigation.top
@@ -26,6 +29,9 @@ theme:
       toggle:
         icon: material/weather-sunny
         name: Switch to light mode
+
+extra_css:
+  - stylesheets/extra.css
 
 plugins:
   - search
@@ -72,12 +78,17 @@ nav:
       - Streaming and cancel: concepts/streaming.md
       - Structured output: concepts/structured-output.md
       - Several agents and workflows: concepts/multi-agent.md
+      - External agents: concepts/external-agents.md
       - Hooks, context and tracing: concepts/hooks.md
   - Guides:
       - Model providers: providers.md
       - Ready-made tools: toolkits.md
       - Testing agents: testing.md
       - Serving over HTTP: serving.md
+      - Devvi as a coding worker: integrations/devvi.md
+      - Any ACP agent: integrations/acp.md
+      - Serving tools over MCP: integrations/mcp-server.md
+      - Docs for coding agents: coding-agents.md
   - Design:
       - Principles and guarantees: design.md
       - Research report (Greek): research.md
@@ -94,5 +105,6 @@ nav:
       - Context: reference/context.md
       - Tracing: reference/tracing.md
       - Toolkits: reference/toolkits.md
+      - External agents: reference/external.md
       - Errors: reference/errors.md
       - Prompts: reference/prompts.md

@@ -25,12 +25,29 @@ The mapping:
 | `reasoning_delta` | `REASONING_START` and `REASONING_MESSAGE_*` events, `REASONING_END` |
 | `tool_call_delta`, `model_responded` | `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END` |
 | `tool_call_finished` | `TOOL_CALL_RESULT` |
+| `tool_call_started` of an external call (see below) | `TOOL_CALL_START`, `_ARGS`, `_END` |
 | `state_updated` | `STATE_SNAPSHOT` and a `CUSTOM` event |
 | `approval_required`, `input_required` | `CUSTOM`, named after the event |
 | `agent_switched`, `guardrail_tripped` | `CUSTOM`, named after the event |
 | `subagent_event` | `CUSTOM` named `subagent_event`, or the `SUBAGENT_*` events |
 | `run_finished` | `RUN_FINISHED`, with an interrupt outcome when the run paused |
+| `external_event` `turn_finished` of a direct external turn | `RUN_FINISHED` or `RUN_ERROR` |
 | an exception | `RUN_ERROR` |
+
+An external agent (`qagents.external.ExternalAgent`) reports its tool calls, and a
+tool server bound to a run its served calls, with ``tool_call_started`` and
+``tool_call_finished`` only: no model response carries them. Such a call is
+announced with ``TOOL_CALL_START``, ``TOOL_CALL_ARGS`` and ``TOOL_CALL_END`` on
+the first of its events, so every result has a start. A resumed qagents run is
+the exception: the calls it runs or closes before its first model request are
+those of the response the paused run showed, which the client already has. The
+calls those serve (`RunContext.call_tool`) are new, and are announced.
+
+A direct external turn (``ExternalAgent.stream(...)``) has no ``run_finished``: its
+last event, the ``external_event`` of kind ``turn_finished``, ends the run, with
+``RUN_FINISHED`` when the turn's status is ``completed``, ``cancelled`` or
+``limit_reached``, and with ``RUN_ERROR`` (code ``external_error`` or
+``external_interrupted``) when it is ``error`` or ``interrupted``.
 
 Events of other types are skipped, so a qagents release that adds event types
 never breaks a client. The ``value`` of a `CUSTOM` event is the qagents event
@@ -70,6 +87,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, Collection, Iterable, Mapping
 from dataclasses import dataclass
@@ -173,6 +191,17 @@ _GOES_ON = frozenset(
 )
 """With ``hold_final_answer``: events after which what waits is sent, unless the run
 was blocked: the response was not the final answer, or the answer passed."""
+
+_EXTERNAL_TURN_END = "turn_finished"
+"""``kind`` of the ``external_event`` that ends a direct external turn
+(``ExternalAgent.stream``), which has no ``run_finished``."""
+
+_EXTERNAL_RUN_PREFIX = "ext:"
+"""Start of the ``run_id`` of an external turn (``ext:<session>:<token>``). Its
+``resumed`` says that a session was continued, not that a paused run goes on."""
+
+_SERVED_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}-[0-9a-f]{32}$")
+"""The id `RunContext.call_tool` gives a call: its ``source``, ``-`` and 32 hex digits."""
 
 
 @dataclass
@@ -311,6 +340,15 @@ class AGUIProjector:
         """Tool calls of the last response without a result: id -> name."""
         self._resulted: set[str] = set()
         """Tool calls this projector sent a result for."""
+        self._announced: set[str] = set()
+        """Tool calls this projector sent ``TOOL_CALL_START`` for."""
+        self._replaying = False
+        """A resumed qagents run before its first model request: the calls it runs or
+        closes then belong to the response the paused run showed the client, except the
+        calls they serve (`_served`)."""
+        self._running: dict[str, bool] = {}
+        """Calls with a ``tool_call_started`` and no ``tool_call_finished`` yet: id ->
+        whether it is served (`_served`, decided when it started)."""
         self._unseen_handoffs: list[str] = []
         """Agents handed off to by a call this projector never saw (a resumed run)."""
         self._children: dict[tuple[str, str], AGUIProjector] = {}
@@ -323,10 +361,12 @@ class AGUIProjector:
             "reasoning_delta": self._on_reasoning_delta,
             "tool_call_delta": self._on_tool_call_delta,
             "model_responded": self._on_model_responded,
+            "tool_call_started": self._on_tool_call_started,
             "tool_call_finished": self._on_tool_call_finished,
             "state_updated": self._on_state_updated,
             "agent_switched": self._on_agent_switched,
             "subagent_event": self._on_subagent_event,
+            "external_event": self._on_external_event,
             "run_finished": self._on_run_finished,
         }
 
@@ -404,6 +444,7 @@ class AGUIProjector:
         if self._started:
             return
         self._started = True
+        self._replaying = _replays(event)
         if self._subagent_run_id is not None:
             return  # the parent announced this run with SUBAGENT_STARTED
         if self.thread_id is None:
@@ -452,7 +493,41 @@ class AGUIProjector:
             )
         )
 
+    def _on_external_event(self, event: Any, out: list[dict[str, Any]]) -> None:
+        """A direct external turn has no ``run_finished``: its ``turn_finished`` event ends
+        the run. ``completed``, ``cancelled`` and ``limit_reached`` end with ``RUN_FINISHED``
+        (as a qagents run with that status does); ``error`` and ``interrupted`` with
+        ``RUN_ERROR``. Inside a sub-agent the parent's tool result ends it, as before."""
+        if _field(event, "kind") != _EXTERNAL_TURN_END or self._subagent_run_id is not None:
+            return
+        if not self._started:
+            return
+        if self._held is not None:  # hold_final_answer: a finished turn was not blocked
+            out.extend(self._held)
+            self._held = None
+        data = _field(event, "data") or {}
+        status = data.get("status")
+        self._close_all(out)
+        self._finished = True
+        if status in ("error", "interrupted"):
+            message = RUN_ERROR_MESSAGE
+            if self.expose_errors:
+                message = str(data.get("stop_reason") or status)
+            out.append(self._event("RUN_ERROR", message=message, code=f"external_{status}"))
+            return
+        summary = {"status": status, "stop_reason": data.get("stop_reason"), "output": None}
+        out.append(
+            self._event(
+                "RUN_FINISHED",
+                threadId=self.thread_id,
+                runId=self.run_id,
+                result=summary,
+                outcome=None,
+            )
+        )
+
     def _on_turn_started(self, event: Any, out: list[dict[str, Any]]) -> None:
+        self._replaying = False
         self._close_segments(out)
         self._end_response()
         if not self.steps:
@@ -528,6 +603,7 @@ class AGUIProjector:
         self._open_call = call
 
     def _on_model_responded(self, event: Any, out: list[dict[str, Any]]) -> None:
+        self._replaying = False
         self._close_segments(out)
         message = _field(_field(event, "response"), "message")
         if isinstance(message, Mapping):
@@ -562,10 +638,69 @@ class AGUIProjector:
 
     # -- tools, state, agents -----------------------------------------------------------
 
+    def _on_tool_call_started(self, event: Any, out: list[dict[str, Any]]) -> None:
+        call = _field(event, "call")
+        call_id = _field(call, "id")
+        if call_id is not None:
+            call_id = str(call_id)
+            served = self._running.get(call_id)
+            if served is None:
+                served = self._running[call_id] = self._served(event, call_id)
+            self._announce(out, call_id, _field(call, "name"), call, served)
+
+    def _served(self, event: Any, call_id: str) -> bool:
+        """Whether a call is one that a running call serves (`RunContext.call_tool`), not a
+        call of a model response. Such a call is new even in a resumed run that goes on
+        with the paused response: the paused run never showed it.
+
+        The event may name the calling call (``caller_tool_call_id``). Without that, a
+        served call is one with an id of the form ``call_tool`` gives (``"<source>-"`` and
+        32 hex digits) that came while another call of this run runs: the serving call
+        must be running, and a provider's id of that form is then not taken for one unless
+        calls of the paused response also run in parallel.
+        """
+        if _field(event, "caller_tool_call_id"):
+            return True
+        others = any(running != call_id for running in self._running)
+        return others and _SERVED_ID.match(call_id) is not None
+
+    def _announce(
+        self, out: list[dict[str, Any]], call_id: str, name: Any, call: Any, served: bool
+    ) -> None:
+        """``TOOL_CALL_START``, ``TOOL_CALL_ARGS`` and ``TOOL_CALL_END`` for a call that no
+        model response announced: an external agent's, or one a bound tool server ran.
+        Nothing for a call already announced or resulted, or one a resumed run goes on
+        with (the paused run announced it) unless it is ``served`` (`_served`)."""
+        if self._replaying and not served:
+            return
+        if call_id in self._announced or call_id in self._resulted:
+            return
+        self._close_segments(out)
+        name = str(name or "tool")
+        self._start_call(out, call_id, name)
+        arguments = _field(call, "raw_arguments")
+        if arguments is None:
+            arguments = json.dumps(
+                to_jsonable_python(_field(call, "arguments") or {}, fallback=str),
+                ensure_ascii=False,
+            )
+        if arguments:
+            out.append(self._event("TOOL_CALL_ARGS", toolCallId=call_id, delta=arguments))
+        out.append(self._event("TOOL_CALL_END", toolCallId=call_id))
+        self._unresulted[call_id] = name
+
     def _on_tool_call_finished(self, event: Any, out: list[dict[str, Any]]) -> None:
         self._close_segments(out)
         result = _field(event, "result")
         call_id = _field(_field(event, "call"), "id") or _field(result, "tool_call_id")
+        if call_id is not None:  # a refused served call has no tool_call_started
+            call_id = str(call_id)
+            served = self._running.pop(call_id, None)
+            if served is None:  # finished only: decided now
+                served = self._served(event, call_id)
+            call = _field(event, "call")
+            name = _field(call, "name") or _field(result, "name")
+            self._announce(out, call_id, name, call, served)
         content = _field(result, "content") or ""
         if not self.expose_errors and _raised(result):
             content = TOOL_ERROR_MESSAGE.format(name=_field(result, "name") or "tool")
@@ -675,6 +810,7 @@ class AGUIProjector:
             )
             child._subagent_run_id = child_id
             child._started = True
+            child._replaying = _event_type(inner) == "run_started" and _replays(inner)
             self._children[key] = child
             out.append(
                 self._event(
@@ -782,6 +918,7 @@ class AGUIProjector:
         return f"{self.run_id or 'run'}-{kind}-{self._counter}"
 
     def _start_call(self, out: list[dict[str, Any]], call_id: str, name: str) -> None:
+        self._announced.add(str(call_id))
         if self._parent_id is None:
             self._parent_id = self._new_id("msg")
         out.append(
@@ -860,8 +997,9 @@ def to_agui_events(
     which stops the run.
 
     Args:
-        stream: ``agent.stream(...)`` or ``agent.resume_stream(...)``, or any
-            async iterable of qagents events.
+        stream: ``agent.stream(...)`` or ``agent.resume_stream(...)``, a direct
+            external turn (``ExternalAgent.stream(...)``), or any async iterable of
+            qagents events.
         thread_id: AG-UI ``threadId``; defaults to the session id.
         run_id: AG-UI ``runId``; pass the one from the client's ``RunAgentInput``.
         **options: The other options of `AGUIProjector`.
@@ -1199,6 +1337,14 @@ def _is_json(text: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _replays(run_started: Any) -> bool:
+    """Whether a ``run_started`` event begins a resumed qagents run, whose first tool calls
+    are those of the response the paused run showed. An external turn's ``resumed`` says
+    that its session was continued: its tool calls are all new."""
+    run_id = str(_field(run_started, "run_id") or "")
+    return bool(_field(run_started, "resumed")) and not run_id.startswith(_EXTERNAL_RUN_PREFIX)
 
 
 def _blocks_the_answer(kind: str | None, event: Any) -> bool:

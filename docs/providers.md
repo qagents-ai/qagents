@@ -1,12 +1,23 @@
 # Model providers
 
-A provider is a subclass of `Model`. Two ship with qagents, and a third is for tests.
+A provider is a subclass of `Model`. Three ship with qagents, and two more are for tests.
 
 | Class | Talks to | Transport |
 |---|---|---|
 | `QCloudModel` | QCloud | the `qcloud_ai` SDK |
 | `OpenAIChatModel` | any server that speaks OpenAI Chat Completions | `httpx`, no vendor SDK |
+| `AnthropicModel` (`"anthropic:<model-id>"`, extra `anthropic`) | Claude through the Messages API | the `anthropic` SDK |
 | `ScriptedModel`, `FunctionModel` | nothing | see [testing](testing.md) |
+
+`FallbackModel` and `RateLimitedModel` wrap other models (the next model when one refuses at
+admission; staying under a provider's limits).
+
+!!! note "Coding agents are not providers"
+    Devvi and other coding agents run their own loop, tools and sandbox, so they are not a
+    `Model`: wrapping one as a model would hide its tool calls from the journal and its
+    permission requests from your rules. Use them as [external agents](concepts/external-agents.md)
+    (`DevviAgent`, `ACPAgent`). A provider for the devvi.sh platform's model endpoint is not
+    part of this release.
 
 ## QCloud
 

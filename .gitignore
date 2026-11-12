@@ -11,3 +11,5 @@ build/
 *.db-shm
 .env
 site/
+# The docs bundle a wheel build places in the package (pyproject force-include).
+src/qagents/docs_mcp/_bundled/

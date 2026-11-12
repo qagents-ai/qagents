@@ -1,12 +1,14 @@
 # Several agents and workflows
 
-There are three ways to combine agents. Pick by who should control the flow.
+There are three ways to combine qagents agents, and a fourth for another agent program. Pick by
+who should control the flow.
 
 | Pattern | Who decides what happens next | Context |
 |---|---|---|
 | [Sub-agent](#sub-agents) | the calling agent's model | the sub-agent starts fresh and returns one answer |
 | [Handoff](#handoffs) | the current agent's model, once | the next agent continues the same conversation |
 | [Workflow](#workflows) | your code | each agent step has its own session |
+| [External agent](external-agents.md) | the calling agent's model | another agent program with its own context, tools and model; returns its final message and a footer |
 
 There are no role-play crews or group chats. The published evidence favours one orchestrator with
 isolated workers and a single writer; see the [research report](../research.md).

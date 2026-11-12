@@ -18,7 +18,7 @@ result = agent.run_sync("What is the weather in Athens?")
 print(result.output)
 ```
 
-!!! warning "Status: 0.1.0, alpha"
+!!! warning "Status: 0.2.0, alpha"
     The offline test suite passes, including the QCloud provider driven through the real
     `qcloud_ai` SDK. No request has been made against the live QCloud API yet. See
     [what is verified](design.md#what-is-verified).
@@ -36,9 +36,13 @@ print(result.output)
 | Hard stops | `Limits(max_turns=..., max_cost_usd=..., timeout_s=...)` | [The loop](concepts/loop.md#limits) |
 | Your code inside the loop | subclass `Hooks` | [Hooks](concepts/hooks.md) |
 | Several agents | `tools=[other_agent]` or `handoffs=[other_agent]` | [Several agents](concepts/multi-agent.md) |
+| Another coding agent as a worker | `tools=[DevviAgent(workspace=repo).as_tool(timeout=1800)]` | [External agents](concepts/external-agents.md), [Devvi](integrations/devvi.md) |
+| Any ACP agent | `ACPAgent(["node", ".../bin.js", "--acp"], workspace=...)` | [Any ACP agent](integrations/acp.md) |
+| Your tools inside a coding agent | `tool_server(tools, ctx=ctx)`, `expose_tools=[...]` | [Serving tools over MCP](integrations/mcp-server.md) |
 | A multi-step job that resumes | `Workflow(store, id=...)` | [Workflows](concepts/multi-agent.md#workflows) |
 | Traces | `hooks=[OTelHooks()]` | [Tracing](concepts/hooks.md#tracing) |
 | Tests without a model | `ScriptedModel([...])` | [Testing](testing.md) |
+| Docs your coding agent can query | `python -m qagents.docs_mcp` (MCP) or `qagents docs search "..."` | [Docs for coding agents](coding-agents.md) |
 
 ## Why another framework
 
@@ -57,10 +61,14 @@ built around the gaps that matter for a private, OpenAI-compatible model platfor
   sent again unless you opt in.
 - **Control by code, outside the model.** Permissions are deterministic rules; a failing check
   refuses the call.
+- **Coding agents under your rules.** A coding agent such as Devvi is driven over ACP as an
+  external agent: its permission requests go through your `Permissions`, your limits stop it,
+  and your journal records the call. MCP is used only to give it tools.
+  See [External agents](concepts/external-agents.md).
 
 ## Layout
 
-```
+```text
 agent.py        the Agent, the loop, RunStream
 messages.py     provider-neutral messages
 tools.py        @tool, Tool, Toolkit, RunContext
@@ -68,9 +76,17 @@ permissions.py  allow / ask / deny rules and approvals
 hooks.py        hook points around the run, the model request and each tool call
 session.py      the journal: Session, InMemoryStore, SQLiteStore
 workflow.py     durable steps for multi-step and multi-agent jobs
+multi.py        fan_out and route
+runtime.py      AgentRuntime: background runs with leases and recovery
 context.py      compaction of long conversations
 tracing.py      OpenTelemetry spans
+evals.py        datasets, evaluators and reports
 prompts.py      every string the framework itself sends to a model
-models/         QCloudModel, OpenAIChatModel, ScriptedModel
-toolkits/       file, shell, web, notes and clock tools
+models/         QCloudModel, OpenAIChatModel, AnthropicModel, FallbackModel, test models
+stores/         PostgresStore
+toolkits/       file, shell, web, notes, clock, planning, ask_user and MCP tools
+external/       external agents: other agent programs driven over a control protocol
+integrations/   the ACP client, Devvi, the MCP tool server, AG-UI events, MLflow tracing
+docs_mcp/       the docs MCP server and command line for coding agents
+cli.py          the qagents command: chat, run, models, docs
 ```

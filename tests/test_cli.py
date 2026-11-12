@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
 
 from qagents.cli import main
+from qagents.docs_mcp import cli as docs_cli
 from qagents.errors import ModelServerError
 from qagents.messages import Usage
 from qagents.models import base as model_base
@@ -636,3 +639,134 @@ def test_models_search_filters_by_id_and_name(catalog):
 
     code, out, _ = cli("models", "qcloud", "--search", "plain", "--all", "--json")
     assert [row["id"] for row in json.loads(out)] == ["text-only"]
+
+
+# --- docs -----------------------------------------------------------------------------
+
+
+ROOT = Path(__file__).resolve().parents[1]
+"""The qagents checkout these tests run in: its docs folder is what ``--docs-dir`` reads."""
+
+
+def test_docs_subcommand_delegates_to_the_docs_cli():
+    code, out, err = cli("docs", "api", "Agent.resume")
+    assert code == 0 and err == ""
+    assert out.startswith("# qagents.Agent.resume (method)")
+
+
+def test_docs_hands_every_argument_to_the_docs_cli_outside_an_event_loop(monkeypatch):
+    seen = []
+
+    def docs_main(argv, *, stdin, stdout, stderr):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            in_a_loop = False
+        else:
+            in_a_loop = True
+        seen.append((list(argv), stdin, stdout, stderr, in_a_loop))
+        return 7
+
+    monkeypatch.setattr(docs_cli, "main", docs_main)
+    stdin, out, err = io.StringIO(), io.StringIO(), io.StringIO()
+    argv = ["--docs-dir", "x", "search", "--limit", "3", "two", "words"]
+
+    assert main(["docs", *argv], stdin=stdin, stdout=out, stderr=err) == 7
+    assert main(["docs"], stdin=stdin, stdout=out, stderr=err) == 7
+
+    assert seen == [(argv, stdin, out, err, False), ([], stdin, out, err, False)]
+
+
+def test_docs_options_before_the_command_reach_the_docs_cli():
+    code, out, err = cli("docs", "--help")
+    assert code == 0 and err == ""
+    assert "--docs-dir DIR" in out and "check" in out and "serve" in out
+
+    code, out, _ = cli("docs", "--docs-dir", str(ROOT), "pages")
+    assert code == 0 and "Source: the --docs-dir option:" in out
+
+    code, out, _ = cli("docs", "search", "--kind", "api", "--limit", "1", "Agent.resume")
+    assert code == 0 and out.startswith("# Search: 'Agent.resume' (1 of ")
+
+
+def test_docs_check_reads_the_code_from_stdin():
+    code, out, _ = cli(
+        "docs", "check", "-", stdin="from qagents import Agent\nAgent('x', system_prompt='hi')\n"
+    )
+    assert code == 1 and out.startswith("# check_code: 1 problem(s)")
+
+    code, out, _ = cli("docs", "check", "-", stdin="from qagents import Agent\n")
+    assert code == 0
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected", "message"),
+    [
+        (["docs", "api", "NoSuchName"], 1, ""),
+        (["docs", "fly"], 2, "invalid choice: 'fly'"),
+        (["docs", "read"], 2, "the following arguments are required: path"),
+    ],
+)
+def test_docs_exit_codes_and_errors_on_the_given_stream(argv, expected, message):
+    code, out, err = cli(*argv)
+    assert code == expected and message in err
+    if expected == 1:
+        assert "has no public name 'NoSuchName'" in out
+
+
+def test_docs_is_listed_in_the_help():
+    code, out, _ = cli("--help")
+    listed = " ".join(out.split())  # argparse wraps the help lines
+    assert code == 0 and "docs the qagents docs for coding agents:" in listed
+    assert "no command serves MCP" in listed
+
+
+def test_docs_loads_the_mcp_sdk_only_to_serve():
+    script = (
+        "import io, sys\n"
+        "from qagents.cli import main\n"
+        "for argv in (['api', 'Agent.resume'], ['search', 'approval'], ['pages'], ['check', '-']):\n"
+        "    code = main(['docs', *argv], stdin=io.StringIO('import qagents\\n'),\n"
+        "                stdout=io.StringIO(), stderr=io.StringIO())\n"
+        "    assert code == 0, argv\n"
+        "print(sorted(m for m in sys.modules if m.split('.')[0] in ('mcp', 'mcp_types')))\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "[]"
+
+
+def test_docs_serve_without_the_mcp_sdk_names_the_extra(monkeypatch):
+    monkeypatch.delitem(sys.modules, "qagents.docs_mcp.server", raising=False)
+    monkeypatch.setitem(sys.modules, "mcp.server.mcpserver", None)  # an import of it fails
+
+    code, out, err = cli("docs", "serve")
+
+    assert code == 1 and out == ""
+    assert err.startswith("error: The qagents docs MCP server needs the MCP Python SDK")
+    assert "qagents[mcp]" in err and "Traceback" not in err
+
+
+def test_docs_exits_with_130_after_ctrl_c(monkeypatch):
+    def interrupted(argv, **streams):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(docs_cli, "main", interrupted)
+    code, _, err = cli("docs")
+    assert code == 130 and err == "\ninterrupted\n"
+
+
+async def test_docs_with_no_command_serves_mcp_over_stdio():
+    pytest.importorskip("mcp")
+    from mcp import Client, StdioServerParameters
+
+    parameters = StdioServerParameters(
+        command=sys.executable, args=["-m", "qagents", "docs", "--docs-dir", str(ROOT)]
+    )
+    async with Client(parameters, read_timeout_seconds=60) as client:
+        assert client.server_info.name == "qagents-docs"
+        result = await client.call_tool("get_api", {"symbol": "Agent.resume"})
+        assert not result.is_error
+        assert result.content[0].text.startswith("# qagents.Agent.resume (method)")

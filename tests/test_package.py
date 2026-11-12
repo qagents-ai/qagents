@@ -319,3 +319,209 @@ async def test_agui_native_mode_keeps_parallel_children_of_one_call_apart():
             child = event["subagentRunId"]
             texts[child] = texts.get(child, "") + event["delta"]
     assert sorted(texts.values()) == ["facts about Greece", "facts about Spain"]
+
+
+# --- external agents, ACP, Devvi and the MCP tool server ----------------------
+
+NEW_MODULES = (
+    "qagents.external",
+    "qagents.integrations.acp",
+    "qagents.integrations.devvi",
+    "qagents.integrations.mcp_server",
+    "qagents.docs_mcp",
+    "mcp",
+    "mcp_types",
+)
+EXTERNAL_NAMES = (
+    "ExternalAgent",
+    "ExternalApproval",
+    "ExternalCapabilities",
+    "ExternalResult",
+    "ScriptedExternalAgent",
+)
+INTEGRATION_NAMES = {
+    "ACPAgent": "qagents.integrations.acp",
+    "MCPServerHTTP": "qagents.integrations.acp",
+    "MCPServerStdio": "qagents.integrations.acp",
+    "DevviAgent": "qagents.integrations.devvi",
+    "TokenPricing": "qagents.integrations.devvi",
+    "ToolServer": "qagents.integrations.mcp_server",
+    "ToolServerSpec": "qagents.integrations.mcp_server",
+    "tool_server": "qagents.integrations.mcp_server",
+}
+
+
+def test_import_qagents_loads_no_external_agent_module():
+    done = run_python(
+        f"""
+        import sys
+        import qagents, qagents.integrations
+        from qagents import *
+        from qagents.integrations import *
+        names = {NEW_MODULES!r}
+        print(sorted(m for m in sys.modules if m in names or m.startswith(tuple(n + "." for n in names))))
+        """
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "[]"
+
+
+def test_the_external_agent_names_resolve_lazily():
+    import importlib
+
+    import qagents.integrations
+
+    external = importlib.import_module("qagents.external")
+    for name in EXTERNAL_NAMES:
+        assert getattr(qagents, name) is getattr(external, name)
+        assert name in dir(qagents) and name not in qagents.__all__
+    for name, module in INTEGRATION_NAMES.items():
+        assert getattr(qagents.integrations, name) is getattr(importlib.import_module(module), name)
+        assert name in dir(qagents.integrations)
+
+
+def test_the_tool_server_names_say_which_extra_is_missing():
+    done = run_python(
+        """
+        import sys
+        for name in ("mcp", "mcp_types"):
+            sys.modules[name] = None  # every import of it now fails
+        import inspect, pydoc
+        import qagents.integrations as integrations
+        try:
+            from qagents.integrations import tool_server
+        except ImportError:
+            print("from-import refused")
+        try:
+            integrations.ToolServer
+        except AttributeError as error:
+            print("mcp:", "qagents[mcp]" in str(error), type(error.__cause__).__name__)
+        print(hasattr(integrations, "tool_server"), "tool_server" in dir(integrations))
+        pydoc.render_doc(integrations)
+        inspect.getmembers(integrations)
+        print(integrations.DevviAgent.__name__, integrations.ACPAgent.__name__)
+        """
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split("\n")[:4] == [
+        "from-import refused",
+        "mcp: True ImportError",
+        "False False",
+        "DevviAgent ACPAgent",
+    ]
+
+
+def test_external_agent_event_is_one_of_the_run_events():
+    import typing
+
+    from qagents import events, external
+
+    assert events.ExternalAgentEvent in typing.get_args(events.Event)
+    assert external.ExternalAgentEvent is events.ExternalAgentEvent
+    assert "ExternalAgentEvent" in events.__all__ and "ExternalAgentEvent" in external.__all__
+    event = events.ExternalAgentEvent(agent="coder", kind="turn_finished")
+    assert event.model_dump() == {
+        "type": "external_event",
+        "agent": "coder",
+        "kind": "turn_finished",
+        "session_id": None,
+        "data": {},
+    }
+
+
+def test_external_agent_strings_live_in_prompts():
+    import ast
+    import importlib
+    import importlib.util
+    import inspect
+    import types
+
+    for gone in (
+        "qagents.integrations._external_prompts",
+        "qagents.integrations.acp._prompts",
+        "qagents.integrations.devvi._prompts",
+    ):
+        assert importlib.util.find_spec(gone) is None, gone
+    body = ast.parse(inspect.getsource(prompts)).body
+    documented = {
+        node.targets[0].id
+        for node, after in zip(body, body[1:], strict=False)
+        if isinstance(node, ast.Assign)
+        and isinstance(after, ast.Expr)
+        and isinstance(after.value, ast.Constant)
+        and isinstance(after.value.value, str)
+    }
+    prefixes = ("EXTERNAL_", "TOOL_SERVER_", "ACP_", "DEVVI_")
+    names = [name for name in vars(prompts) if name.startswith(prefixes)]
+    assert len(names) == 79
+    assert all(isinstance(getattr(prompts, name), str) for name in names)
+    assert set(names) <= documented
+    readers = (
+        "qagents.external",
+        "qagents.integrations._jsonrpc",
+        "qagents.integrations._process",
+        "qagents.integrations.mcp_server",
+        "qagents.integrations.acp.client",
+        "qagents.integrations.acp.mapping",
+        "qagents.integrations.devvi",
+        "qagents.integrations.devvi.sdk",
+        "qagents.integrations.devvi.acp",
+    )
+    for reader in readers:
+        module = importlib.import_module(reader)
+        used = [
+            value
+            for value in vars(module).values()
+            if isinstance(value, types.ModuleType) and value.__name__.endswith("prompts")
+        ]
+        assert used and all(value is prompts for value in used), reader
+
+
+async def test_a_new_prompt_value_reaches_the_external_agent_tool(monkeypatch):
+    from qagents.external import ScriptedExternalAgent
+
+    monkeypatch.setattr(prompts, "EXTERNAL_AGENT_DESCRIPTION", "Ask {name}.")
+    built = ScriptedExternalAgent([["done"]], name="coder").as_tool()
+    assert built.description.startswith("Ask coder.")
+
+
+def test_pyproject_has_the_external_agent_extras_and_bundles_the_docs():
+    import tomllib
+    from pathlib import Path
+
+    from qagents.docs_mcp import sources
+
+    root = Path(__file__).resolve().parents[1]
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = project["project"]["optional-dependencies"]
+    assert extras["acp"] == [] and extras["devvi"] == []
+    bundled = project["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
+    package = Path(sources.__file__).resolve().parents[2]  # the folder that holds qagents/
+    for source, target in bundled.items():
+        assert (root / source).exists(), source
+        assert (package / target).is_relative_to(sources.BUNDLE_DIR), target
+    for needed in ("docs", "examples", "README.md", "AGENTS.md", sources.SKILL_PATH, "mkdocs.yml"):
+        assert bundled[needed] == f"qagents/docs_mcp/_bundled/{needed}"
+
+
+def test_the_agents_md_layout_names_only_paths_that_exist_and_every_cli_command():
+    """The docs server hands AGENTS.md to coding agents: its layout must not send them to a
+    file the external/ split removed, and it must list every subcommand of ``qagents``."""
+    import re
+    from pathlib import Path
+
+    from qagents.cli import build_parser
+
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "AGENTS.md").read_text(encoding="utf-8")
+    layout = re.search(r"### Layout\s+```text\n(.*?)^```", text, re.DOTALL | re.MULTILINE)
+    assert layout, "AGENTS.md Part 2 needs a ### Layout block"
+    named = re.findall(r"^(src/qagents/\S+)", layout.group(1), re.MULTILINE)
+    assert "src/qagents/external/" in named
+    for path in named:
+        assert (root / path).exists(), f"AGENTS.md's layout names {path}, which does not exist"
+    listed = re.search(r"cli\.py \(the qagents command: ([^)]*)\)", layout.group(1))
+    assert listed, "the layout must list the qagents subcommands"
+    parser = build_parser()
+    commands = next(a for a in parser._actions if a.dest == "command").choices
+    assert listed.group(1).split(", ") == list(commands)

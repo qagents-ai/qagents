@@ -19,9 +19,10 @@ A typical run:
 
 A run that pauses ends with ``approval_required`` and ``input_required``
 events before ``run_finished``. ``state_updated`` follows every change of
-``ctx.state``. A run that a guardrail blocks emits ``guardrail_tripped`` before
-``run_finished``: right after ``run_started`` for an input guardrail, after the
-last ``model_responded`` for an output guardrail.
+``ctx.state``. Turns of an external agent (`qagents.external`) also emit
+``external_event`` (`ExternalAgentEvent`). A run that a guardrail blocks emits
+``guardrail_tripped`` before ``run_finished``: right after ``run_started`` for
+an input guardrail, after the last ``model_responded`` for an output guardrail.
 
 A final answer the run does not accept (it does not match ``output_type``, an
 output validator rejects it, or in ``output_mode="tool"`` it was not given
@@ -43,7 +44,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .messages import ToolCallPart, ToolResultPart
 from .models.base import ModelResponse, ReasoningDelta, TextDelta, ToolCallDelta
@@ -185,6 +186,33 @@ class SubagentEvent(BaseModel):
     event: Any
 
 
+class ExternalAgentEvent(BaseModel):
+    """An event of an external agent with no qagents counterpart.
+
+    ``kind`` says what it is: ``permission_requested`` and ``permission_decided``
+    (every request and its answer), ``tool_arguments`` (a tool call already
+    started got new input: ``{tool_call_id, name, arguments}``), ``context``
+    (ACP context pressure: ``{used, size}``, not token usage), ``config``,
+    ``plan`` (ACP), ``image`` and ``audio`` (``{mimeType}``; the bytes are not
+    forwarded), ``resource_link`` and ``resource`` (ACP; never the content),
+    and, from Devvi's SDK transport, ``approval_asked``, ``approval_decided``
+    (Devvi's own audit records), ``approval_refused`` (a request about a call
+    its session never started), ``retry``, ``compaction``, ``web_search``,
+    ``job``, ``attempt``, ``subagent_started``, ``subagent_finished`` and
+    ``subagent_event``; ``unknown`` or ``raw`` (with raw events switched on),
+    and ``turn_finished``, the last event of every turn, with the result's
+    status, session, backend and footer data (``changed_files``: the first 100
+    paths, ``changed_files_count``: all of them; `ExternalResult.changed_files`
+    has every path).
+    """
+
+    type: Literal["external_event"] = "external_event"
+    agent: str
+    kind: str
+    session_id: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class RunFinished(BaseModel):
     """Always the last event of a run that did not raise."""
 
@@ -208,6 +236,7 @@ Event = (
     | GuardrailTriggered
     | AgentSwitched
     | SubagentEvent
+    | ExternalAgentEvent
     | RunFinished
 )
 
@@ -215,6 +244,7 @@ __all__ = [
     "AgentSwitched",
     "ApprovalRequired",
     "Event",
+    "ExternalAgentEvent",
     "GuardrailTriggered",
     "InputRequired",
     "ModelResponded",

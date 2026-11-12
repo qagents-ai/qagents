@@ -4,6 +4,9 @@ There are no hidden prompts anywhere else in the package. The agent loop sends
 your instructions, your messages and your tool descriptions; the strings below
 are the only words it adds, and each one is a plain module attribute you can
 read, log or replace (``qagents.prompts.TOOL_FAILED = "..."``).
+
+The docs server for coding agents (``python -m qagents.docs_mcp``) is not part of agent
+runs; its own strings are in `qagents.docs_mcp.prompts`.
 """
 
 from __future__ import annotations
@@ -166,15 +169,17 @@ TOOL_INTERRUPTED = (
     "{name!r} had started when the run stopped, and it never reported a result. "
     "Its outcome is unknown: check what happened before calling it again."
 )
-"""A tool that is neither read-only nor idempotent had started when the run stopped (the
-process died, or the run was cancelled or timed out while the tool ran)."""
+"""A tool that is not read-only had started when the run stopped. When the run was cancelled
+or timed out while the tool ran, that includes an idempotent tool: it may be repeated after a
+crash, but it may have changed things before it stopped. When the process died, it is a tool
+that is neither read-only nor idempotent (the others are run again on resume)."""
 
 TOOL_NOT_EXECUTED = "{name!r} was not run because the run was interrupted before it started."
 """A tool call was still waiting when the run was cancelled, timed out or refused by the
 provider, or when a new run started on the same session."""
 
 TOOL_CANCELLED = "{name!r} was cancelled before it finished."
-"""A read-only or idempotent tool was running when the run was cancelled or timed out."""
+"""A read-only tool was running when the run was cancelled or timed out."""
 
 TOOL_CALL_LIMIT = "{name!r} was not run: the run reached its limit of {limit} tool calls."
 """Result of the calls a run did not start because ``Limits.max_tool_calls`` was reached."""
@@ -411,3 +416,412 @@ JUDGE_REFERENCE = "<reference>\n{reference}\n</reference>\n\n"
 
 JUDGE_MESSAGE = "{role}: {text}"
 """One message of a case prompt that is a list of messages, as the judge sees it."""
+
+# --- external agents (qagents.external) ---------------------------------------
+# Two readers see these. The calling model reads the tool descriptions and the tool results
+# of an external agent used as a tool (``ExternalAgent.as_tool()``), and the external agent
+# reads `EXTERNAL_AGENT_CONTINUE` and `EXTERNAL_AGENT_RESUME` as prompts. The
+# ``EXTERNAL_PERMISSION_*`` reasons are recorded with every permission decision and shown in
+# the result footer.
+#
+# The ``EXTERNAL_REASON_*`` phrases say why a connection broke
+# (``ExternalAgentConnectionError.reason``); the calling model reads them as the stop reason
+# of an interrupted turn.
+
+# --- the tool the calling model sees -------------------------------------------
+
+EXTERNAL_AGENT_DESCRIPTION = (
+    "Delegate a task to {name}, an agent that works on its own with its own tools and returns "
+    "its final answer. It sees only the task text you write, so include everything it needs."
+)
+"""Default description of ``ExternalAgent.as_tool()`` when the agent has no description."""
+
+EXTERNAL_AGENT_CONTINUE_HINT = (
+    "Pass `session` from an earlier result to continue the same conversation."
+)
+"""Appended to the tool description when the tool is continuable (it takes ``session``)."""
+
+EXTERNAL_AGENT_TASK_DESCRIPTION = "The complete task, self-contained."
+"""Description of the ``task`` parameter."""
+
+EXTERNAL_AGENT_SESSION_DESCRIPTION = (
+    "The session id from an earlier result of this tool, to continue that conversation. "
+    "Leave it out to start a new one."
+)
+"""Description of the ``session`` parameter of a continuable tool."""
+
+# --- the tool result the calling model reads ----------------------------------
+
+EXTERNAL_AGENT_RESULT = "{text}\n\n[{footer}]"
+"""A finished turn: the external agent's final text, then the footer in brackets."""
+
+EXTERNAL_AGENT_NO_TEXT = "({name} wrote no final message.)"
+"""Stands for the final text when the turn ended without one."""
+
+EXTERNAL_AGENT_FOOTER = "{name}: session {session}; {status}"
+"""Start of the footer. ``status`` is `EXTERNAL_AGENT_STATUS` or the bare status."""
+
+EXTERNAL_AGENT_FOOTER_NO_SESSION = "{name}: no session; {status}"
+"""Start of the footer when the turn ended before the agent opened a session."""
+
+EXTERNAL_AGENT_STATUS = "{status} ({reason})"
+"""The status in the footer when the turn did not simply complete."""
+
+EXTERNAL_AGENT_FOOTER_TOOLS = "{count} tool calls ({summary})"
+"""Footer part: how many tools the external agent called, by name, most used first."""
+
+EXTERNAL_AGENT_FOOTER_ONE_TOOL = "1 tool call ({summary})"
+"""Footer part for exactly one tool call."""
+
+EXTERNAL_AGENT_FOOTER_NO_TOOLS = "no tool calls"
+"""Footer part when the external agent called no tool."""
+
+EXTERNAL_AGENT_FOOTER_REFUSED = "{count} permissions refused ({items})"
+"""Footer part: permission requests that qagents refused or cancelled."""
+
+EXTERNAL_AGENT_FOOTER_ONE_REFUSED = "1 permission refused ({items})"
+"""Footer part for exactly one refused permission request."""
+
+EXTERNAL_AGENT_FOOTER_REFUSED_ITEM = "{tool}: {detail}"
+"""One refused request in the footer. ``detail`` is the command or the shortened arguments."""
+
+EXTERNAL_AGENT_FOOTER_CHANGED = "changed: {files}"
+"""Footer part: files the turn changed in the workspace (when changes are tracked)."""
+
+EXTERNAL_AGENT_FOOTER_MORE = "{count} more"
+"""Ends a footer list that was cut short (refused requests after 5, changed files after 20)."""
+
+EXTERNAL_AGENT_FOOTER_SEPARATOR = "; "
+"""Joins the parts of the footer."""
+
+# --- errors the calling model reads -------------------------------------------
+
+EXTERNAL_AGENT_FAILED = "{name} failed: {error}"
+"""The external turn ended with an error (the agent's own message is ``error``)."""
+
+EXTERNAL_AGENT_STOPPED = "{name} stopped before finishing ({reason})."
+"""The external turn was cancelled or stopped at a limit (``reason``: ``timeout``,
+``max_total_tokens``, ``max_cost_usd``, ``max_external_turns``, ``cancelled``, ...)."""
+
+EXTERNAL_AGENT_INTERRUPTED = (
+    "{name} stopped unexpectedly ({reason}) while it worked in session {session}. "
+    "Its outcome is unknown: check what it changed before calling it again. "
+    "To continue, call it with session={session}."
+)
+"""The connection to the external agent broke during the turn (the process exited, EOF,
+a broken pipe). ``reason`` is short and never contains the process's stderr."""
+
+EXTERNAL_AGENT_INTERRUPTED_NO_SESSION = (
+    "{name} stopped unexpectedly ({reason}) before it had a session it can continue. "
+    "Its outcome is unknown: check the workspace before calling it again. "
+    "To try again, call it without a session."
+)
+"""`EXTERNAL_AGENT_INTERRUPTED` when the turn ended without a session to continue: the
+connection broke before a session was opened (a setup request timed out, the process died
+while it started), or a repeated call found that its earlier session is gone."""
+
+EXTERNAL_AGENT_INTERRUPTED_NOT_CONTINUABLE = (
+    "{name} stopped unexpectedly ({reason}). Its outcome is unknown: check what it changed "
+    "before calling it again."
+)
+"""`EXTERNAL_AGENT_INTERRUPTED` for a tool built with ``as_tool(continuable=False)``: it has
+no ``session`` parameter, so the text does not offer one."""
+
+EXTERNAL_AGENT_BUSY = (
+    "{name} did not start: another turn was still running in its workspace (or its session) "
+    "when the time ran out. Nothing was sent to {name}, so calling it again is safe once "
+    "that turn has ended."
+)
+"""The call's timeout expired while the turn waited for the workspace (or session) lock: one
+turn at a time runs per workspace, and another one held it. The stop reason is ``busy``."""
+
+EXTERNAL_AGENT_UNAVAILABLE = (
+    "{name} is unavailable: {error}. This will not change during this run, so do not call "
+    "{name} again; do the task another way or report the problem."
+)
+"""A failure that will repeat (authentication, billing, a missing credential, a setup error).
+Further calls in the same run fail at once with this text."""
+
+EXTERNAL_AGENT_TOO_DEEP = (
+    "{name} was not started: runs may nest at most {limit} levels deep, and this one would be "
+    "at depth {depth}. Do the task yourself or with the tools you have."
+)
+"""The external agent's turn would nest deeper than ``Limits.max_depth``."""
+
+EXTERNAL_AGENT_UNMETERED = (
+    "{name} was not started: this run has a token or cost budget, and {name} does not report "
+    "its token usage, so the budget could not be enforced."
+)
+"""The parent run has ``max_total_tokens`` or ``max_cost_usd`` and the external agent reports
+no token usage (ACP agents). The developer can pass ``allow_unmetered=True``."""
+
+# --- two-phase approval across a pause (on_permission="pause") ------------------
+
+EXTERNAL_AGENT_APPROVED = (
+    "Approved: {name} may run {tool} {detail} once. Call {name} again with session={session} "
+    "to continue."
+)
+"""Result of the paused call when the human approved the external agent's request
+(``ExternalApproval.for_input(pending, approved=True)``)."""
+
+EXTERNAL_AGENT_DECLINED = (
+    "Declined: {name} may not run {tool} {detail}{reason}. Call {name} again with "
+    "session={session} and say what to do instead, or do the task another way."
+)
+"""Result of the paused call when the human declined. ``reason`` is empty or `` (why)``."""
+
+EXTERNAL_AGENT_APPROVED_NO_SESSION = (
+    "Approved: {name} may run {tool} {detail} once. Call {name} again to continue."
+)
+"""`EXTERNAL_AGENT_APPROVED` for a pause whose pending input names no external session, or
+whose tool has no ``session`` parameter (``as_tool(continuable=False)``: the next call
+continues the paused session by itself)."""
+
+EXTERNAL_AGENT_DECLINED_NO_SESSION = (
+    "Declined: {name} may not run {tool} {detail}{reason}. Call {name} again and say what to "
+    "do instead, or do the task another way."
+)
+"""`EXTERNAL_AGENT_DECLINED` for a pause whose pending input names no external session, or
+whose tool has no ``session`` parameter."""
+
+EXTERNAL_AGENT_UNNAMED_TOOL = "the tool"
+"""Stands for the tool name in `EXTERNAL_AGENT_APPROVED` and `EXTERNAL_AGENT_DECLINED` when
+the pending input does not name it."""
+
+EXTERNAL_AGENT_UNKNOWN_ERROR = "unknown error"
+"""Stands for the error in `EXTERNAL_AGENT_FAILED` when the agent reported a failed turn
+without a message."""
+
+EXTERNAL_AGENT_APPROVED_GENERIC = (
+    "Approved once. Call the agent again with the same session to continue."
+)
+"""Result of ``ExternalApproval(approved=True)`` built without the pending input."""
+
+EXTERNAL_AGENT_DECLINED_GENERIC = (
+    "Declined{reason}. Call the agent again with the same session and say what to do instead."
+)
+"""Result of ``ExternalApproval(approved=False)`` built without the pending input."""
+
+# --- prompts the external agent reads ------------------------------------------
+
+EXTERNAL_AGENT_CONTINUE = (
+    "The action you asked permission for has been decided; if it was approved, you may do it "
+    "once. Continue the task.\n\n{task}"
+)
+"""Sent to the external agent when the calling model continues a session after an approval
+was answered (posture ``"pause"``). ``task`` is what the calling model wrote."""
+
+EXTERNAL_AGENT_RESUME = (
+    "The previous attempt was interrupted. Check the workspace state and finish the task."
+)
+"""Sent to the external agent when a repeated call (after a crash and a resume) re-attaches
+to a turn that had not finished. Adapters that re-attach use it."""
+
+# --- reasons recorded with each permission decision ----------------------------
+
+EXTERNAL_PERMISSION_NO_APPROVER = "it needs approval, and nobody can approve it during the turn"
+"""An ask decision with no ``on_ask`` under the ``"rules"`` and ``"live"`` postures."""
+
+EXTERNAL_PERMISSION_TIMEOUT = "the decision did not arrive within {seconds:g} seconds"
+"""``on_ask`` (or the whole decision) took longer than ``approval_timeout_s``."""
+
+EXTERNAL_PERMISSION_FAILED = "the permission check failed"
+"""The decision raised. The request is answered as cancelled."""
+
+EXTERNAL_PERMISSION_EDITED = (
+    "the approver changed the arguments, which cannot be passed on to an external agent"
+)
+"""``on_ask`` returned an `Approval` with edited ``arguments``: refused, because qagents
+cannot change what the external agent runs."""
+
+EXTERNAL_PERMISSION_CANCELLING = "the turn was being cancelled"
+"""A request that arrived while the turn was being cancelled."""
+
+EXTERNAL_PERMISSION_DEFERRED = "it waits for a human answer outside the turn"
+"""Posture ``"pause"``: the request ended the turn and paused the calling run."""
+
+EXTERNAL_PERMISSION_DECLINED = "the human declined it"
+"""Posture ``"pause"``: a request whose earlier pause was answered with a refusal."""
+
+EXTERNAL_PERMISSION_NO_OPTION = "the agent offered no option to allow it once"
+"""The agent offered only ``allow_always`` (never chosen) or no allow option at all."""
+
+EXTERNAL_PERMISSION_UNREADABLE = "the agent's input for the tool could not be read"
+"""The request is about a tool call whose latest input is not a JSON object, so the rules
+cannot check what would run. It is answered as cancelled (fail closed)."""
+
+# --- why a connection broke (ExternalAgentConnectionError.reason) ---------------
+# Short phrases, never with the process's stderr. They become the ``stop_reason`` of an
+# interrupted turn, so the calling model reads them in `EXTERNAL_AGENT_INTERRUPTED`, in the
+# footer's status and, for a setup failure, in `EXTERNAL_AGENT_UNAVAILABLE`.
+
+EXTERNAL_REASON_CONNECTION_LOST = "the connection to the agent was lost"
+"""The default reason: the connection broke and nothing more is known."""
+
+EXTERNAL_REASON_CLOSED = "the connection was closed"
+"""qagents closed the connection, or the agent ended its output without a process to ask."""
+
+EXTERNAL_REASON_LOST = "the connection was lost"
+"""Reading from or writing to the agent failed (a broken pipe, a closed transport)."""
+
+EXTERNAL_REASON_FAILED = "the connection failed"
+"""Handling the agent's messages failed unexpectedly (a bug in a handler)."""
+
+EXTERNAL_REASON_PROCESS_EXITED = "the process exited with code {code}"
+"""The agent's process ended. ``code`` is its exit code."""
+
+EXTERNAL_REASON_PROCESS_LOST = "the connection to the process was lost"
+"""The process closed its output, but its exit code is not known (yet)."""
+
+EXTERNAL_REASON_TOO_LARGE = "the agent sent a message that is too large"
+"""A line over the size limit closed the connection."""
+
+EXTERNAL_REASON_MALFORMED = "the agent sent malformed messages"
+"""Malformed lines in a row closed the connection."""
+
+EXTERNAL_REASON_NO_ANSWER = "the agent did not answer in time"
+"""A setup request (a handshake, opening a session) got no answer within its timeout."""
+
+EXTERNAL_REASON_BAD_ANSWER = "the agent sent an answer that does not follow its protocol"
+"""The agent answered a request with something the protocol does not allow."""
+
+# --- the qagents MCP tool server (qagents.integrations.mcp_server) ------------
+# The agent that calls qagents tools over MCP (Devvi, any MCP client) reads these as the
+# text of an error result. Results of tools that ran use the core wording above
+# (TOOL_FAILED, INVALID_ARGUMENTS, TOOL_TIMEOUT, ...), as for the model's own calls.
+
+TOOL_SERVER_REFUSED = "{name!r} was not run: {reason}"
+"""A call over MCP that the qagents permission rules refused: a deny rule, ``can_use_tool``,
+a declined approval, or an "ask" that nobody can answer. ``reason`` is the rule's reason or
+one of the ``TOOL_SERVER_*`` reasons below."""
+
+TOOL_SERVER_NO_APPROVER = (
+    "it needs approval, and nobody can approve it while the calling agent waits."
+)
+"""Reason: the rules say "ask" and the permissions have no ``on_ask``. A call over MCP
+cannot pause the qagents run, so it is refused (fail closed)."""
+
+TOOL_SERVER_APPROVAL_TIMEOUT = "the approval did not arrive within {seconds:g} seconds."
+"""Reason: ``on_ask`` took longer than the server's ``approval_timeout_s``."""
+
+TOOL_SERVER_RUN_ENDED = "the qagents run that serves this tool is no longer running."
+"""Reason: the run (or the tool call) the server is bound to ended or is being cancelled."""
+
+TOOL_SERVER_CLOSING = "the qagents tool server is shutting down."
+"""Reason: the call arrived while the server was closing."""
+
+TOOL_SERVER_CANNOT_DEFER = (
+    "{name!r} waits for input from outside the run, which a call over MCP cannot do."
+)
+"""A served tool raised `DeferToolCall`: its result would come from ``agent.resume``,
+which an MCP caller cannot wait for. Deferred tools (``deferred=True``) are refused when
+the server is built."""
+
+# --- ACP agents (qagents.integrations.acp) ------------------------------------
+# The calling model reads the reasons below inside the tool result of an external agent
+# used as a tool (``ExternalAgent.as_tool()``), for example
+# ``"coder failed: cannot continue session 5f0c: ..."``. The external agent reads
+# `ACP_RESUME_TASK` as its prompt when a call is repeated after a crash.
+
+ACP_CANNOT_CONTINUE = "cannot continue session {session}: {reason}"
+"""A turn's ``stop_reason`` when the agent refused to resume or load the session the
+calling model passed. ``reason`` is the agent's own error message."""
+
+ACP_NO_SESSION_RESUME = (
+    "the agent cannot reopen earlier sessions (it supports neither session/resume nor "
+    "session/load); call it without a session to start a new one"
+)
+"""``reason`` of `ACP_CANNOT_CONTINUE` when the agent offers no way to continue a session
+that this connection did not open."""
+
+ACP_NOT_REATTACHED = (
+    "the earlier attempt of this call ran in session {session}, which the agent cannot reopen, "
+    "so its outcome is unknown"
+)
+"""A repeated call (after a crash) whose earlier session cannot be resumed: the turn ends as
+``interrupted`` with this reason, and the call is not started over."""
+
+ACP_STILL_CLOSING = (
+    "the agent is still closing it after the previous turn; call it again in a moment"
+)
+"""``reason`` of `ACP_CANNOT_CONTINUE` when qagents' ``session/close`` of that session (sent
+once an earlier turn ended) got no answer within ``request_timeout_s``: an agent refuses to
+resume a session it is still closing."""
+
+ACP_NO_ANSWER = "the agent did not answer {method} within {seconds:g} seconds"
+"""``reason`` of a failed turn when a setup request (``session/new``, ``session/resume``,
+``session/load``, ``session/set_config_option``) got no answer in time. The task was not
+sent, so the turn ends as ``error`` (``interrupted`` for a call repeated after a crash)."""
+
+ACP_BAD_ANSWER = "the agent sent an answer that does not follow ACP"
+"""``reason`` of a turn that ends because an answer has the wrong shape: ``error`` when it
+was the answer to a setup request, ``interrupted`` when it was the prompt's."""
+
+ACP_RESUME_TASK = "{resume}\n\n{task}"
+"""Prompt of a repeated call whose earlier attempt had already sent the task: ``resume`` is
+``EXTERNAL_AGENT_RESUME``, ``task`` the task as the calling model wrote it."""
+
+# --- Devvi (qagents.integrations.devvi) ---------------------------------------
+# The calling model reads the reasons below inside the tool result of
+# `DevviAgent.as_tool()` (for example ``"coder failed: session qa-5f0c does not exist ..."``),
+# and the tool description. Devvi's model reads `DEVVI_RESUME_UNKNOWN` as its prompt when a
+# call is repeated after a crash and the earlier attempt cannot be found in Devvi's log.
+
+DEVVI_DESCRIPTION = (
+    "Delegate a coding task to {name}, a coding agent that reads and edits files in the "
+    "workspace and runs commands with its own tools. It sees only the task text you write, "
+    "so include everything it needs."
+)
+"""Default description of ``DevviAgent.as_tool()`` when the agent has no description."""
+
+DEVVI_NEEDS_PRICING = "it has no token prices, so the cost budget of this run cannot be enforced"
+"""Why a Devvi agent on the SDK transport without ``pricing=`` refuses to start under
+``Limits.max_cost_usd``. The calling model reads it inside `EXTERNAL_AGENT_UNAVAILABLE`."""
+
+DEVVI_UNKNOWN_SESSION = "session {session} does not exist; leave session out to start a new one"
+"""A turn's ``stop_reason`` when the calling model asked to continue a session that Devvi
+does not have. The calling model reads it inside `EXTERNAL_AGENT_FAILED`."""
+
+DEVVI_RESUME_FAILED = "cannot reopen session {session}: {reason}"
+"""A turn's ``stop_reason`` when Devvi refused ``session/resume`` for another reason than a
+missing session. ``reason`` is Devvi's own error message."""
+
+DEVVI_NO_TURN_END = "the agent went idle without ending its turn"
+"""A turn's ``stop_reason`` when Devvi reported the session idle but no ``turn/end`` arrived."""
+
+DEVVI_IMAGE_URL = (
+    "images must be inline data (PNG, JPEG, WebP or GIF); image URLs are not supported"
+)
+"""A turn's ``stop_reason`` when the task holds an image that Devvi cannot take."""
+
+DEVVI_RESUME_UNKNOWN = (
+    "A previous attempt at this task was interrupted, and it is not known how far it got. "
+    "Check the workspace state before you change anything, then finish the task.\n\n{task}"
+)
+"""Sent to Devvi when a call is repeated after a crash and Devvi's session log cannot show
+whether the earlier attempt's prompt arrived (the log is compressed or missing). ``task``
+is the original task, so nothing is lost if it never arrived."""
+
+DEVVI_NOT_REATTACHED = (
+    "the earlier attempt of this call used session {session}, which Devvi no longer has, "
+    "so its outcome is unknown"
+)
+"""A repeated call (after a crash) whose journaled session Devvi cannot find, for example
+because its log was removed or Devvi now uses another home. The earlier attempt may have
+sent its prompt, so the task is not sent again: the turn ends ``interrupted`` with this
+reason, which the calling model reads inside `EXTERNAL_AGENT_INTERRUPTED`."""
+
+DEVVI_OTHER_WORKSPACE = (
+    "session {session} works in another workspace, so it was not continued here; continue "
+    "it with the agent of that workspace, or leave session out to start a new one"
+)
+"""A turn's ``stop_reason`` when the calling model asked to continue a Devvi session whose
+stored directory is another workspace (Devvi's ``session/resume`` keeps the session's own
+directory). The calling model reads it inside `EXTERNAL_AGENT_FAILED`."""
+
+DEVVI_WORKSPACE_UNKNOWN = (
+    "it is not known which workspace session {session} works in, so it was not continued "
+    "here; leave session out to start a new one"
+)
+"""A turn's ``stop_reason`` when Devvi resumed a session whose log qagents cannot read and
+Devvi did not say where the session works (``session/working-directory/get``)."""

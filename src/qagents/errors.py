@@ -17,8 +17,9 @@ Four exceptions are signals rather than failures:
   later.
 
 Errors of optional integrations (`MCPConnectionError`, `MCPToolChangedError`,
-`CassetteMissError`) are defined here too, so you can catch them without
-importing the integration.
+`CassetteMissError`) and of external agents (`ExternalAgentError` and its
+subclasses, `ExternalToolError`; `qagents.external` re-exports them) are
+defined here too, so you can catch them without importing the integration.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from . import prompts
 
 
 class QAgentsError(Exception):
@@ -70,7 +73,9 @@ class ToolError(QAgentsError):
     """Raise this inside a tool to report a failure to the model.
 
     The message is sent back as the tool result (marked as an error), so write
-    it for the model: say what went wrong and what it can do instead.
+    it for the model: say what went wrong and what it can do instead. A
+    ``metadata`` attribute (a dict of JSON values), when set, is copied into
+    the result's metadata, which the model does not see.
     """
 
 
@@ -365,3 +370,110 @@ class MCPToolChangedError(ConfigurationError):
         super().__init__(message)
         self.changed = dict(changed)
         """Server tool name -> (expected hash, actual hash)."""
+
+
+# --- external agents (qagents.external and its adapters) ------------------------------
+
+
+class ExternalAgentError(QAgentsError):
+    """Base class for every error of an external agent and its transport."""
+
+
+class ExternalAgentConfigurationError(ExternalAgentError, ConfigurationError):
+    """The external agent could not be set up: the program is missing or failed to start,
+    the handshake failed, a protocol version or a capability does not match.
+
+    It is a `ConfigurationError`: it will not go away by retrying. Through
+    ``as_tool()`` the calling model is told the agent is unavailable, and
+    further calls in that run fail at once.
+
+    Args:
+        message: What is wrong and what to do, for the developer.
+        stderr_tail: The end of the process's stderr, when it ran.
+    """
+
+    def __init__(self, message: str, *, stderr_tail: str | None = None) -> None:
+        super().__init__(message)
+        self.stderr_tail = stderr_tail
+
+
+class ExternalAgentConnectionError(ExternalAgentError):
+    """The connection broke: the process exited, the stream ended, a pipe broke.
+
+    During a turn this ends the turn as ``interrupted``: what the agent did is
+    unknown. ``str()`` has the details for developers (exit code, stderr
+    tail); ``reason`` is a short phrase that is safe to show a model (the
+    ``EXTERNAL_REASON_*`` texts of the prompts module).
+
+    An adapter that finds the connection gone before it sent anything for the
+    turn passes ``ambiguous=False``: nothing happened, so the turn ends as a
+    plain ``error`` instead of ``interrupted``.
+
+    Args:
+        message: The full description.
+        reason: Short and model-safe, for example ``"the process exited with code 1"``;
+            ``None``: `EXTERNAL_REASON_CONNECTION_LOST`.
+        returncode: The process's exit code, when known.
+        stderr_tail: The end of the process's stderr, when known.
+        ambiguous: Whether the agent may have received the turn's request.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str | None = None,
+        returncode: int | None = None,
+        stderr_tail: str | None = None,
+        ambiguous: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason if reason is not None else prompts.EXTERNAL_REASON_CONNECTION_LOST
+        self.returncode = returncode
+        self.stderr_tail = stderr_tail
+        self.ambiguous = ambiguous
+
+    def for_request(self, method: str, request_id: Any = None) -> ExternalAgentConnectionError:
+        """A copy that names the request left without an answer."""
+        which = f" (request {request_id})" if request_id is not None else ""
+        copy = type(self).__new__(type(self))
+        ExternalAgentConnectionError.__init__(
+            copy,
+            f"{self} No answer arrived for {method!r}{which}.",
+            reason=self.reason,
+            returncode=self.returncode,
+            stderr_tail=self.stderr_tail,
+            ambiguous=self.ambiguous,
+        )
+        return copy
+
+
+class ExternalAgentProtocolError(ExternalAgentConnectionError):
+    """The agent broke the protocol: a line over the size limit, malformed lines in a row,
+    an answer that is not what the protocol says. The connection is closed."""
+
+
+class ExternalAgentTimeoutError(ExternalAgentError, TimeoutError):
+    """A request to the agent got no answer in time."""
+
+
+class ExternalAgentUnavailableError(ExternalAgentError):
+    """A failure that will repeat: authentication, billing, a missing credential.
+
+    Adapters raise it (or `is_permanent_failure` recognises the agent's error
+    text). Through ``as_tool()`` the calling model is told not to call the
+    agent again, and further calls in the same run fail at once.
+    """
+
+
+class ExternalToolError(ToolError):
+    """The error result of an external agent used as a tool, with its metadata.
+
+    ``metadata`` holds the session, status and the rest of the footer as data,
+    and ``ambiguous`` for an interrupted turn; the agent loop copies it into the
+    result's metadata.
+    """
+
+    def __init__(self, message: str, *, metadata: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.metadata: dict[str, Any] = dict(metadata or {})

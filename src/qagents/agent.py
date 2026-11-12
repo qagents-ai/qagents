@@ -25,6 +25,7 @@ import concurrent.futures
 import contextlib
 import copy as copying
 import dataclasses
+import functools
 import inspect
 import json
 import logging
@@ -33,6 +34,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from typing import Any, Literal, TypeVar
 
@@ -86,12 +88,20 @@ from .models.base import (
 )
 from .permissions import Approval, InputResult, Permissions
 from .results import GuardrailStage, RunResult, RunStatus, TrippedGuardrail
-from .session import Entry, PendingApproval, PendingInput, Session, SessionState
+from .session import (
+    Entry,
+    PendingApproval,
+    PendingInput,
+    Session,
+    SessionState,
+    _usage_loads,
+)
 from .tools import (
     RunContext,
     Tool,
     Toolkit,
     ToolTimeout,
+    _abandoned_threads_to,
     _clean_schema,
     _describe_validation_error,
     render_tool_output,
@@ -122,8 +132,34 @@ whose process died keeps its session for at most this long."""
 _LIVE_RUNS: dict[tuple[int, str], tuple[Any, _Run]] = {}
 """Runs executing in this process, by (store, session id): one run per session at a time."""
 
-_USAGE_KINDS = frozenset({"message", "tool_result", "run_paused", "run_failed", "run_finished"})
+_USAGE_KINDS = frozenset(
+    {"message", "tool_result", "tool_checkpoint", "run_paused", "run_failed", "run_finished"}
+)
 """Entry kinds that carry ``added_usage``: usage from ``ctx.add_usage`` since the last one."""
+
+_SOURCE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+"""What ``RunContext.call_tool(source=...)`` accepts: it starts the call ids."""
+
+_OUTSIDE_FIELDS = frozenset(
+    {
+        "source",
+        "caller_tool_call_id",
+        "tool_call_id",
+        "name",
+        "result",
+        "counted",
+        "usage",
+        "added_usage",
+        "added_usage_by_operation",
+        "approved",
+        "reason",
+        "arguments_changed",
+        "arguments",
+    }
+)
+"""Fields the journal entries of a call from outside the model already have, or that
+`derive_state` reads from them (``usage`` counts as model usage on resume), so
+``RunContext.call_tool(tags=...)`` cannot set them."""
 
 
 class Limits(BaseModel):
@@ -943,6 +979,13 @@ class _Run:
         counted once."""
         self._usage_to_journal = Usage()
         """Usage added through ``ctx.add_usage`` that no journal entry carries yet."""
+        self._usage_by_operation: dict[str, Usage] = {}
+        """The part of `_usage_to_journal` that tool calls added, by operation id: the
+        entry that carries it records it as ``added_usage_by_operation``."""
+        self.journaled_usage: dict[str, Usage] = {}
+        """What each tool call of the run added through ``ctx.add_usage`` that the journal
+        holds, by operation id: restored on resume, and kept as entries are written
+        (``RunContext.journaled_usage``)."""
         self._edited: set[str] = set()
         """Calls that run with arguments an approver changed."""
         self._tool_limit_hit = False
@@ -954,6 +997,23 @@ class _Run:
         self._journal_open = False
         self._closed = False
         """``run_finished`` or ``run_paused`` is journaled, so an error writes no ``run_failed``."""
+        self._finishing = False
+        """The run is writing its ``run_finished`` or ``run_paused``: calls from outside the
+        model (``RunContext.call_tool``) journal nothing more from here on."""
+        self._stopped = False
+        """The run has stopped executing, however it ended: its stream was closed, it was
+        cancelled from outside, it failed or it finished. From then on nothing more may be
+        journaled for it by a context that outlived it (calls from outside the model,
+        ``ctx.checkpoint``, ``ctx.save_state``): its session claim is released, and a
+        resume elsewhere may own the journal."""
+        self._driver: tuple[asyncio.Task[Any], int] | None = None
+        """The task that drives the run now (it iterates the run's events), with its
+        ``cancelling()`` count when it took the step: a higher count means the run is being
+        cancelled from outside (``asyncio.timeout``, a task cancel) and is unwinding."""
+        self._call_tasks: dict[str, tuple[asyncio.Task[Any], int]] = {}
+        """The task each running call runs in (one of the model's calls, or one from outside
+        the model), marked as `_driver` is: a call whose task is being cancelled (its timeout,
+        its group's cancel) is ending, and serves no more calls from outside the model."""
         self._hooks_started = False
         """``on_run_start`` was called, so ``on_run_end`` is owed exactly once."""
         self._ended = False
@@ -975,6 +1035,22 @@ class _Run:
         """``cancel()`` cancelled ``_interruptible``; the CancelledError it gets is ours."""
         self._running: set[str] = set()
         """Calls whose ``tool_started`` this run journaled and that have no result yet."""
+        self._call_emit: dict[str, Callable[[Any], None]] = {}
+        """Where the events of each call in ``_running`` go (its group's queue): calls from
+        outside the model that come through it report there too (`_outside_call`)."""
+        self._outside_running: dict[str, Callable[[Any], None]] = {}
+        """Calls from outside the model (``RunContext.call_tool``) that started and have no
+        result yet, with where their events go."""
+        self._outside_gates: weakref.WeakValueDictionary[str, _OutsideGate] = (
+            weakref.WeakValueDictionary()
+        )
+        """``Limits.parallel_tools`` for the calls from outside the model, per calling call."""
+        self._outside_failure: Exception | None = None
+        """What a hook or the journal raised during a call from outside the model: the run
+        fails with it (see `_fail_from_outside`)."""
+        self.checkpoints: dict[str, dict[str, Any]] = {}
+        """Values tool calls journaled with ``ctx.checkpoint``, by operation id, then key;
+        restored from the journal for the open turn, so a repeated call finds them."""
         self._children: list[_Run] = []
         """Child runs that are working: their usage counts against this run's budget."""
         self._absorbed: list[Usage] = []
@@ -983,8 +1059,8 @@ class _Run:
         self._usage_lock = threading.Lock()
         """``ctx.add_usage`` may be called from a sync tool's worker thread."""
         self._stuck_threads: list[concurrent.futures.Future[Any]] = []
-        """Threads of sync calls that run one at a time, timed out and still run:
-        the next such call waits for them (`_invoke`)."""
+        """Threads of sync calls that run one at a time, timed out or were cancelled, and
+        still run: the next such call waits for them (`_invoke`)."""
 
     def cancel(self, reason: str = "cancelled") -> None:
         if not self._cancel.is_set():
@@ -1003,14 +1079,27 @@ class _Run:
 
     async def execute(self) -> AsyncIterator[Event]:
         async with contextlib.aclosing(self._execute()) as events:
-            async for event in events:
+            while True:
+                self._driver = _cancel_mark(asyncio.current_task())  # who drives this step
+                try:
+                    event = await anext(events)
+                except StopAsyncIteration:
+                    break
                 try:
                     await self.hooks.on_event(self._ctx(), event)
                 except Exception as error:
                     # Closing _execute below reports this error as the run's failure.
                     self._hook_error = error
+                    self._stopped = True  # the run fails: it takes nothing more from outside
                     raise
-                yield event
+                try:
+                    yield event
+                except GeneratorExit:
+                    # The stream is closed early (aclose, or the generator is collected):
+                    # the run stops here. Set before _execute unwinds, so a call from
+                    # outside the model that arrives while its tools wind down is refused.
+                    self._stopped = True
+                    raise
 
     async def _execute(self) -> AsyncIterator[Event]:
         timer: asyncio.TimerHandle | None = None
@@ -1055,6 +1144,7 @@ class _Run:
                 if (updated := await self._save_state()) is None:
                     break
                 yield updated  # changed by on_event, on_run_start or a guardrail
+            self._finishing = True  # from here on the journal belongs to the run's last entry
             result = self._result()
             if self.status == "paused":
                 await self._journal(
@@ -1070,12 +1160,14 @@ class _Run:
             self._ended = True  # set first: an on_run_end that raises is not reported twice
             await self.hooks.on_run_end(self._ctx(), result, None)
         except Exception as error:
+            self._stopped = True  # before any await: nothing outlives the run's last entry
             if self._ended:
                 raise
             # The run stays open in the journal, so agent.resume() can pick it up.
             await self._fail(error)
             raise
         except BaseException as error:
+            self._stopped = True  # before any await: a call from outside is refused from here
             if self._ended:
                 raise
             if isinstance(error, GeneratorExit) and self._hook_error is not None:
@@ -1086,6 +1178,7 @@ class _Run:
                 await self._report_end(error)
             raise
         finally:
+            self._stopped = True  # the claim goes next: from here the journal is not the run's
             if timer is not None:
                 timer.cancel()
             self._hand_usage_to_parent()
@@ -1197,6 +1290,8 @@ class _Run:
         when the run answered.
         """
         while True:
+            if self._outside_failure is not None:  # a hook or the journal failed in call_tool
+                raise self._outside_failure
             if self._answered:  # a final-answer call was accepted, now or before a resume
                 return
             if self._cancel.is_set():
@@ -1329,12 +1424,16 @@ class _Run:
         self.results = dict(state.tool_results)
         self.started = set(state.started_tools)
         self.waiting = {item.tool_call_id: item for item in state.pending_inputs}
+        self.checkpoints = {key: dict(value) for key, value in state.checkpoints.items()}
+        self.journaled_usage = dict(state.operation_usage)
         self._saved_state = _state_json(state.values)
         self.state.update(state.values)
         self.state.update(self._state_seed)  # journaled with the start of the run
         if self.resume:
             await self._prepare_resume(state)
             return
+        self.checkpoints = {}  # a new run repeats no call of the run it closes
+        self.journaled_usage = {}
 
         if self.seed and self.history:
             raise ConfigurationError(
@@ -2175,7 +2274,17 @@ class _Run:
             await self._load_agent()
             yield switched
 
-    async def _authorize(self, tool: Tool, call: ToolCallPart) -> tuple[str, Any]:
+    async def _authorize(
+        self,
+        tool: Tool,
+        call: ToolCallPart,
+        *,
+        ctx: RunContext[Any] | None = None,
+        can_pause: bool = True,
+        approval_timeout_s: float | None = None,
+        tags: Mapping[str, Any] | None = None,
+        still_wanted: Callable[[], bool] | None = None,
+    ) -> tuple[str, Any]:
         """Decide one call.
 
         The permission rules are always checked first: a deny refuses the call
@@ -2184,9 +2293,17 @@ class _Run:
         them checked again, and is journaled (``approval_decided``) before
         the call runs.
 
-        Returns ``("run", call)``, ``("pending", PendingApproval)`` or ``("deny", reason)``.
+        A call from outside the model (`_outside_call`) passes its ``ctx``,
+        ``can_pause=False`` (an "ask" without ``on_ask`` is refused with
+        `TOOL_SERVER_NO_APPROVER`, because nothing can pause the run for it),
+        ``approval_timeout_s`` for ``on_ask`` (`TOOL_SERVER_APPROVAL_TIMEOUT`),
+        the ``tags`` its journal entries carry, and ``still_wanted``: when that
+        is false once ``on_ask`` answered, nothing is journaled.
+
+        Returns ``("run", call)``, ``("pending", PendingApproval)``, ``("deny", reason)``
+        or ``("ended", None)``.
         """
-        ctx = self._ctx(tool_call_id=call.id)
+        ctx = ctx or self._ctx(tool_call_id=call.id)
         decision = await self.permissions.decide(ctx, tool, call)
         approval = self.approvals.pop(call.id, None)
         if decision.behavior == "deny":
@@ -2195,6 +2312,8 @@ class _Run:
             if decision.behavior == "allow":
                 return "run", call
             if self.permissions.on_ask is None:
+                if not can_pause:
+                    return "deny", prompts.TOOL_SERVER_NO_APPROVER
                 pending = PendingApproval(
                     tool_call_id=call.id,
                     name=call.name,
@@ -2206,7 +2325,16 @@ class _Run:
                 except ValueError:  # NaN, an infinity or a lone surrogate in the arguments
                     return "deny", prompts.UNSIGNABLE_CALL
                 return "pending", pending
-            approval = await self.permissions.request_approval(ctx, tool, call, decision.reason)
+            try:
+                async with asyncio.timeout(approval_timeout_s):
+                    approval = await self.permissions.request_approval(
+                        ctx, tool, call, decision.reason
+                    )
+            except TimeoutError:  # request_approval turns the approver's own errors into a no
+                seconds = approval_timeout_s or 0
+                return "deny", prompts.TOOL_SERVER_APPROVAL_TIMEOUT.format(seconds=seconds)
+            if still_wanted is not None and not still_wanted():
+                return "ended", None
         edited = approval.approved and approval.arguments not in (None, call.arguments)
         record: dict[str, Any] = {
             "tool_call_id": call.id,
@@ -2217,7 +2345,7 @@ class _Run:
         }
         if edited:
             record["arguments"] = approval.arguments
-        await self._journal("approval_decided", record)  # before the call runs
+        await self._journal("approval_decided", {**record, **(tags or {})})  # before the call runs
         if not approval.approved:
             return "deny", approval.reason or prompts.APPROVAL_DECLINED
         if edited:
@@ -2324,6 +2452,9 @@ class _Run:
         if self._cancel.is_set():
             return  # stopped while the start was written: nothing ran
         self._running.add(call.id)
+        assert ctx._emit is not None
+        self._call_emit[call.id] = ctx._emit  # calls from outside the model that it makes
+        self._call_tasks[call.id] = _cancel_mark(asyncio.current_task())  # the tool runs here
         queue.put_nowait(ToolCallStarted(call=call, agent=agent))
         began = time.perf_counter()
         hooked = await self.hooks.before_tool(ctx, call)
@@ -2375,17 +2506,21 @@ class _Run:
         self, tool: Tool, call: ToolCallPart
     ) -> ToolResultPart | None:
         """Keep calls that run one at a time apart from a sync call of this run that timed
-        out and still runs in its thread: wait for it, within this call's timeout.
+        out (or was cancelled, as a served call can be on its own) and still runs in its
+        thread: wait for it, within this call's timeout.
 
         Returns ``None`` when the call may start, else its error result (it never started).
+        Calls from outside the model wait here too (`_outside_call`), possibly several at
+        once, so the list is never swapped out: each waits on a copy, and the threads that
+        returned are removed from the shared list in place.
         """
         if not self._stuck_threads or not self._runs_alone(tool):
             return None
         limit = tool.timeout if tool.timeout is not None else self.limits.tool_timeout_s
-        earlier, self._stuck_threads = self._stuck_threads, []
-        if await _threads_finished(earlier, limit or None):
+        finished = await _threads_finished(list(self._stuck_threads), limit or None)
+        self._stuck_threads[:] = [thread for thread in self._stuck_threads if not thread.done()]
+        if finished:
             return None
-        self._stuck_threads = [thread for thread in earlier if not thread.done()]
         content = prompts.TOOL_WAITED_FOR_EARLIER.format(name=call.name, seconds=limit)
         result = _error_result(call, content)
         result.metadata["timeout"] = limit
@@ -2394,29 +2529,52 @@ class _Run:
     async def _invoke(self, ctx: RunContext[Any], tool: Tool, call: ToolCallPart) -> ToolResultPart:
         """Run a tool and turn whatever happens into a result the model can read.
 
+        A tool that returns a `ToolResultPart` keeps its content, ``is_error`` and
+        ``metadata`` (the call id and name are set by the loop), and a `ToolError`'s
+        ``metadata`` is copied into the result's. Metadata that is not JSON cannot be
+        journaled: it is logged and replaced by ``{"metadata_error": <why>}``, and the
+        content and ``is_error`` stay as the tool gave them. The tool did run, so the
+        model must not read that it failed (it might call it again).
+
         `DeferToolCall` is the one exception that passes through: the call then has no result.
         A real cancellation of the tool's task passes through too.
         """
         metadata: dict[str, Any] = {}
         is_error = True
+
+        def abandoned(thread: concurrent.futures.Future[Any]) -> None:
+            # A sync call that timed out or was cancelled still runs in its thread: the
+            # next call that runs alone waits for it (`_wait_for_stuck_threads`). Registered
+            # before the error leaves the tool, so before a served call's gate is let go.
+            if self._runs_alone(tool):
+                self._stuck_threads.append(thread)
+
         try:
-            value = await tool.run(ctx, call.arguments, timeout=self.limits.tool_timeout_s)
-            content = render_tool_output(value)
-            is_error = False
+            with _abandoned_threads_to(abandoned):
+                value = await tool.run(ctx, call.arguments, timeout=self.limits.tool_timeout_s)
+            if isinstance(value, ToolResultPart):
+                # A tool that builds its own result keeps its error flag and metadata;
+                # the loop still sets the call id and name (as for resume(results=...)).
+                content, is_error = value.content, value.is_error
+                metadata.update(value.metadata)
+            else:
+                content = render_tool_output(value)
+                is_error = False
         except DeferToolCall:
             raise
         except ToolArgumentError as error:
             content = prompts.INVALID_ARGUMENTS.format(name=call.name, error=error)
         except ToolError as error:
             content = str(error)
+            extra = getattr(error, "metadata", None)
+            if isinstance(extra, Mapping):
+                metadata.update(extra)
         except ToolTimeout as timeout:
             # Only the framework's own timeout: a TimeoutError of the tool's code is a failure.
             if not timeout.started:
                 template = prompts.TOOL_NOT_STARTED
             elif timeout.running:
-                template = prompts.TOOL_TIMEOUT_ABANDONED
-                if timeout.thread is not None and self._runs_alone(tool):
-                    self._stuck_threads.append(timeout.thread)  # see _wait_for_stuck_threads
+                template = prompts.TOOL_TIMEOUT_ABANDONED  # its thread is kept (`abandoned`)
             else:
                 template = prompts.TOOL_TIMEOUT
             content = template.format(name=call.name, seconds=timeout.seconds)
@@ -2432,6 +2590,13 @@ class _Run:
                 name=call.name, error=f"{type(error).__name__}: {error}"
             )
             metadata["exception"] = type(error).__name__
+        if metadata and (problem := _not_json(metadata)) is not None:
+            logger.error(
+                "Tool %s gave result metadata that is not JSON; it was dropped: %s",
+                call.name,
+                problem,
+            )
+            metadata = {"metadata_error": problem[:500]}
         return ToolResultPart(
             tool_call_id=call.id,
             name=call.name,
@@ -2444,6 +2609,8 @@ class _Run:
         self.results[result.tool_call_id] = result
         self.waiting.pop(result.tool_call_id, None)
         self._running.discard(result.tool_call_id)
+        self._call_emit.pop(result.tool_call_id, None)
+        self._call_tasks.pop(result.tool_call_id, None)
         data: dict[str, Any] = {"result": result.model_dump(mode="json")}
         if result.tool_call_id in self._counted:
             data["counted"] = True  # toward Limits.max_tool_calls, restored on resume
@@ -2480,6 +2647,8 @@ class _Run:
         data["token"] = waiting.token
         self.waiting[call.id] = waiting
         self._running.discard(call.id)  # it waits now; it is not running
+        self._call_emit.pop(call.id, None)
+        self._call_tasks.pop(call.id, None)
         await self._journal("tool_deferred", {"input": data})
         return None
 
@@ -2500,7 +2669,10 @@ class _Run:
 
         ``template`` is for calls that never started. A call that started in
         an earlier process, or that this run started and stopped while it ran
-        and that is not safe to repeat, is reported with an unknown outcome.
+        and that is not read-only, is reported with an unknown outcome
+        (`TOOL_INTERRUPTED`): an idempotent tool may be repeated after a crash,
+        but when it is cut short it may already have changed things. Only a
+        read-only call is merely cancelled (`TOOL_CANCELLED`).
         Returns the ``tool_call_finished`` events of the calls it settled.
         """
         if not self.history:
@@ -2513,8 +2685,10 @@ class _Run:
             if call.id in self.results:
                 continue
             tool = self.tools.get(call.name)
-            safe = tool is not None and (tool.read_only or tool.idempotent)
-            if call.id in self.started or (call.id in self._running and not safe):
+            # Only a read-only call is harmless when it is cut short. An idempotent one may
+            # be repeated after a crash, but it may have changed things before it stopped.
+            harmless = tool is not None and tool.read_only
+            if call.id in self.started or (call.id in self._running and not harmless):
                 wording = prompts.TOOL_INTERRUPTED
             elif call.id in self._running:
                 wording = prompts.TOOL_CANCELLED
@@ -2533,8 +2707,11 @@ class _Run:
         self.results = {}
         self.started = set()
         self._running = set()
+        self._call_emit = {}
+        self._call_tasks = {}
         self.waiting = {}
         self.approvals = {}  # an answer applies only to the turn it was given for
+        self.checkpoints = {}  # the turn's calls all have results: none of them repeats
 
     # -- plumbing ---------------------------------------------------------------------
 
@@ -2543,6 +2720,9 @@ class _Run:
     ) -> RunContext[Any]:
         if emit is not None:
             emit = _thread_safe(emit)  # a sync tool calls ctx.emit from its worker thread
+        # run + position of the assistant message in the run + call: the
+        # same after a resume, and unique even if a provider reuses call ids.
+        operation_id = f"{self.run_id}:{self._ordinal}:{tool_call_id}" if tool_call_id else None
         return RunContext(
             deps=self.deps,
             run_id=self.run_id,
@@ -2550,11 +2730,7 @@ class _Run:
             agent_name=self.agent.name,
             turn=self.turn,
             tool_call_id=tool_call_id,
-            # run + position of the assistant message in the run + call: the
-            # same after a resume, and unique even if a provider reuses call ids.
-            operation_id=(
-                f"{self.run_id}:{self._ordinal}:{tool_call_id}" if tool_call_id else None
-            ),
+            operation_id=operation_id,
             usage=self.usage,
             messages=tuple(self.history),
             state=self.state,
@@ -2562,11 +2738,18 @@ class _Run:
             parent_tool_call_id=self.parent.tool_call_id if self.parent is not None else None,
             depth=self.depth,
             _emit=emit,
-            _add_usage=self._add_usage,
+            _add_usage=self._usage_adder(operation_id),
             _run=self,
         )
 
-    def _add_usage(self, usage: Usage) -> None:
+    def _usage_adder(self, operation_id: str | None) -> Callable[[Usage], None]:
+        """``ctx.add_usage`` for a context: a tool call's usage is journaled with its
+        operation id, so a repeat of the call can tell what the journal holds of it."""
+        if operation_id is None:
+            return self._add_usage
+        return functools.partial(self._add_usage, operation_id=operation_id)
+
+    def _add_usage(self, usage: Usage, operation_id: str | None = None) -> None:
         with self._usage_lock:  # ctx.add_usage may come from a sync tool's worker thread
             if any(usage is absorbed for absorbed in self._absorbed):
                 # A child run's result.usage, already added when the child ended.
@@ -2574,6 +2757,9 @@ class _Run:
                 return
             self.usage = self.usage.add(usage)
             self._usage_to_journal = self._usage_to_journal.add(usage)  # with the next entry
+            if operation_id is not None:
+                pending = self._usage_by_operation.get(operation_id, Usage())
+                self._usage_by_operation[operation_id] = pending.add(usage)
 
     async def _save_state(self) -> StateUpdated | None:
         """Journal ``ctx.state`` if it changed since it was last journaled.
@@ -2589,14 +2775,311 @@ class _Run:
             self._saved_state = snapshot
         return StateUpdated(values=json.loads(snapshot), agent=self.agent.name)
 
+    def _journal_closed(self) -> bool:
+        """Tools write nothing more to the journal: it is not open yet, the run is writing
+        (or wrote) its ``run_finished`` or ``run_paused``, or it stopped (`_stopped`)."""
+        return not self._journal_open or self._closed or self._finishing or self._stopped
+
+    async def _save_state_now(self) -> StateUpdated | None:
+        """``RunContext.save_state``: `_save_state`, unless the run's journal is closed."""
+        if self._journal_closed():
+            return None
+        return await self._save_state()
+
+    async def _checkpoint(self, tool_call_id: str, operation_id: str, key: str, value: Any) -> None:
+        """``RunContext.checkpoint``: journal ``key = value`` for a running call, now."""
+        if not isinstance(key, str):
+            raise TypeError(f"A checkpoint key is a string, not a {type(key).__name__}.")
+        if self._journal_closed() or not self._call_running(tool_call_id):
+            raise RuntimeError(
+                f"RunContext.checkpoint() works only while its tool call runs; call "
+                f"{tool_call_id!r} is not running in run {self.run_id}."
+            )
+        try:
+            text = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise SessionError(
+                f"Checkpoint {key!r} is not JSON: {error}. Store strings, numbers, booleans, "
+                "None, lists and dicts with string keys."
+            ) from error
+        stored = json.loads(text)  # what a resumed attempt reads, so both attempts see the same
+        data = {
+            "tool_call_id": tool_call_id,
+            "operation_id": operation_id,
+            "key": key,
+            "value": json.loads(text),  # its own object: the entry never changes with the run's
+        }
+        await self._journal("tool_checkpoint", data)  # before the tool acts on it
+        self.checkpoints.setdefault(operation_id, {})[key] = stored
+
+    # -- calls from outside the model (RunContext.call_tool) ---------------------------
+
+    def _call_running(self, call_id: str | None) -> bool:
+        """``call_id`` started and has no result yet: one of the model's calls, or a call
+        from outside the model (served calls can serve calls in turn)."""
+        return call_id is not None and (
+            call_id in self._running or call_id in self._outside_running
+        )
+
+    def _outside_over(self, caller: str | None) -> bool:
+        """The run takes no more calls from outside its model through ``caller``: it is
+        cancelled, stopping (`_stopping`) or its journal is closed, or the calling tool call
+        has ended or is being cancelled (its timeout, its group's cancel)."""
+        return (
+            self._journal_closed()
+            or self._cancel.is_set()
+            or not self._call_running(caller)
+            or _cancelled_since(self._call_tasks.get(caller or ""))
+            or self._stopping()
+        )
+
+    def _stopping(self) -> bool:
+        """This run, or a run it is a child of, stopped or is stopping: cancelled with
+        ``cancel()``, being cancelled from outside while it unwinds (its driving task), or
+        done. A parent's cancel reaches a child run only as the cancel of the tool call it
+        runs in, a moment later: the child takes no calls from outside its model meanwhile."""
+        run: _Run | None = self
+        while run is not None:
+            if run._stopped or run._cancel.is_set() or _cancelled_since(run._driver):
+                return True
+            run = run.parent_run
+        return False
+
+    def _fail_from_outside(self, caller: str | None, error: Exception) -> None:
+        """A hook or the journal raised during a call from outside the model: fail the run
+        with it, as when that happens during one of the model's calls (`_run_tool`). The
+        calling call's group gets it at once; otherwise the loop raises it at its next step."""
+        if self._closed or self._finishing or self._stopped:
+            return
+        if self._outside_failure is None:
+            self._outside_failure = error
+        emit = self._call_emit.get(caller or "") or self._outside_running.get(caller or "")
+        if emit is not None:
+            emit(_Failure(error))
+
+    async def _outside_call(
+        self,
+        origin: RunContext[Any],
+        tool: Tool,
+        arguments: dict[str, Any],
+        *,
+        source: str,
+        approval_timeout_s: float | None,
+        tags: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> ToolResultPart:
+        """``RunContext.call_tool``: one call that did not come from the model, decided, run
+        and journaled with the loop's own pieces (`_invalid_arguments`, `_authorize`,
+        `_wait_for_stuck_threads`, the hooks, `_invoke`), as a call of this run."""
+        if not isinstance(source, str) or not _SOURCE.match(source):
+            raise ValueError(
+                f"call_tool(source={source!r}): give a short name of 1-32 letters, digits, "
+                "'_' or '-', such as 'mcp'."
+            )
+        if clash := sorted(set(tags) & _OUTSIDE_FIELDS):
+            raise ValueError(f"call_tool(tags=...) cannot set {clash}: the entries have them.")
+        for label, value in (("tags", tags), ("metadata", metadata)):
+            if (problem := _not_json(value)) is not None:
+                raise ValueError(f"call_tool({label}=...) must be JSON: {problem}")
+        caller = origin.tool_call_id
+        call = ToolCallPart(id=f"{source}-{uuid.uuid4().hex}", name=tool.name, arguments=arguments)
+        emit = self._call_emit.get(caller or "") or self._outside_running.get(caller or "")
+        if emit is None or self._outside_over(caller):  # nothing may be journaled for it now
+            return _error_result(call, _outside_refusal(call, prompts.TOOL_SERVER_RUN_ENDED))
+        operation_id = f"{origin.operation_id}:{call.id}"
+        ctx = dataclasses.replace(
+            self._ctx(tool_call_id=call.id),
+            operation_id=operation_id,
+            depth=origin.depth + 1,  # it comes from the agent that the calling call runs
+            _emit=emit,
+            _add_usage=self._usage_adder(operation_id),
+        )
+        journal_tags = {"source": source, "caller_tool_call_id": caller, **tags}
+        try:
+            return await self._outside_steps(
+                ctx, tool, call, emit, journal_tags, metadata, approval_timeout_s
+            )
+        except Exception as error:  # a hook or the journal failed: the run fails
+            self._fail_from_outside(caller, error)
+            raise
+
+    async def _outside_steps(
+        self,
+        ctx: RunContext[Any],
+        tool: Tool,
+        call: ToolCallPart,
+        emit: Callable[[Any], None],
+        tags: dict[str, Any],
+        metadata: dict[str, Any],
+        approval_timeout_s: float | None,
+    ) -> ToolResultPart:
+        caller = tags["caller_tool_call_id"]
+        began = time.perf_counter()
+        ended = _error_result(call, _outside_refusal(call, prompts.TOOL_SERVER_RUN_ENDED))
+        refusal = _invalid_arguments(tool, call)  # before anyone is asked about it
+        if refusal is None and tool.deferred:
+            refusal = prompts.TOOL_SERVER_CANNOT_DEFER.format(name=call.name)
+        budget = self.limits.max_tool_calls
+        if refusal is None and budget is not None and len(self._counted) >= budget:
+            refusal = prompts.TOOL_CALL_LIMIT.format(name=call.name, limit=budget)
+        if refusal is not None:
+            return await self._outside_record(call, _error_result(call, refusal), emit, tags, began)
+        # The slot is taken before the call is decided, with no await in between: calls that
+        # arrive together cannot all pass the check, and nobody is asked to approve a call
+        # that could not run. A refused call gives it back.
+        self._counted[call.id] = None
+        try:
+            verdict, payload = await self._authorize(
+                tool,
+                call,
+                ctx=ctx,
+                can_pause=False,
+                approval_timeout_s=approval_timeout_s,
+                tags=tags,
+                still_wanted=lambda: not self._outside_over(caller),
+            )
+            if verdict == "run" and call.id in self._edited:
+                # An approver's edit is checked like the caller's arguments.
+                if (invalid := _invalid_arguments(tool, payload)) is not None:
+                    verdict, payload = "invalid", invalid
+        except BaseException:
+            self._counted.pop(call.id, None)
+            self._edited.discard(call.id)
+            raise
+        assert verdict != "pending"  # can_pause=False
+        if verdict != "run" or self._outside_over(caller):
+            self._counted.pop(call.id, None)
+            self._edited.discard(call.id)
+            if verdict == "ended" or self._outside_over(caller):
+                return ended  # it ended while the call was decided: nothing more is written
+            text = payload if verdict == "invalid" else _outside_refusal(call, payload)
+            return await self._outside_record(call, _error_result(call, text), emit, tags, began)
+        try:
+            return await self._outside_execute(ctx, tool, payload, emit, tags, metadata, began)
+        finally:
+            self._edited.discard(call.id)
+
+    async def _outside_execute(
+        self,
+        ctx: RunContext[Any],
+        tool: Tool,
+        call: ToolCallPart,
+        emit: Callable[[Any], None],
+        tags: dict[str, Any],
+        metadata: dict[str, Any],
+        began: float,
+    ) -> ToolResultPart:
+        """Run an allowed call from outside the model: kept apart from the other such calls
+        (``Limits.parallel_tools``) and from abandoned sync threads, journaled before and
+        after, through the hooks; checked again right before the tool runs."""
+        caller: str = tags["caller_tool_call_id"]
+        ended = _error_result(call, _outside_refusal(call, prompts.TOOL_SERVER_RUN_ENDED))
+        gate = self._outside_gates.get(caller)
+        if gate is None:  # one per calling call: a served call can serve calls in turn
+            gate = _OutsideGate(self.limits)
+            self._outside_gates[caller] = gate
+        started = False
+        try:
+            async with gate.hold(self._runs_alone(tool)):
+                blocked = await self._wait_for_stuck_threads(tool, call)
+                if self._outside_over(caller):  # it waited, and the run or its caller ended
+                    self._counted.pop(call.id, None)
+                    return ended
+                if blocked is not None:
+                    self._counted.pop(call.id, None)  # it never ran, so it does not count
+                    return await self._outside_record(call, blocked, emit, tags, began)
+                await self._journal(
+                    "tool_started", {"tool_call_id": call.id, "name": call.name, **tags}
+                )
+                started = True
+                self._outside_running[call.id] = emit
+                self._call_tasks[call.id] = _cancel_mark(asyncio.current_task())
+                emit(ToolCallStarted(call=call, agent=self.agent.name))
+                hooked = await self.hooks.before_tool(ctx, call)
+                if (updated := await self._save_state_now()) is not None:
+                    emit(updated)  # a change made in before_tool is journaled before the tool
+                if isinstance(hooked, ToolResultPart):
+                    result = await self.hooks.after_tool(ctx, call, hooked)
+                elif self._outside_over(caller):
+                    # The start, before_tool and the state were awaited since the call was let
+                    # in: the run or its caller ended meanwhile, so the tool does not run.
+                    result = ended
+                else:
+                    try:
+                        result = await self._invoke(ctx, tool, hooked)
+                    except DeferToolCall:
+                        content = prompts.TOOL_SERVER_CANNOT_DEFER.format(name=call.name)
+                        result = _error_result(call, content)
+                    result = await self.hooks.after_tool(ctx, call, result)
+                if result is not ended:
+                    update: dict[str, Any] = {"tool_call_id": call.id, "name": call.name}
+                    if metadata:
+                        update["metadata"] = {**result.metadata, **metadata}
+                    result = result.model_copy(update=update)
+                    if call.id in self._edited:  # tell the caller what actually ran
+                        note = prompts.APPROVAL_ARGUMENTS_CHANGED.format(
+                            arguments=json.dumps(call.arguments, ensure_ascii=False, default=str)
+                        )
+                        result = result.model_copy(update={"content": f"{note}\n{result.content}"})
+                # State before result: after a crash, a recorded result implies its state.
+                if (updated := await self._save_state_now()) is not None:
+                    emit(updated)
+                return await self._outside_record(call, result, emit, tags, began)
+        except asyncio.CancelledError:
+            if started:  # D1: only a read-only call is harmless when it is cut short
+                wording = prompts.TOOL_CANCELLED if tool.read_only else prompts.TOOL_INTERRUPTED
+            else:
+                self._counted.pop(call.id, None)  # it never ran, so it does not count
+                wording = prompts.TOOL_CANCELLED
+            stopped = _error_result(call, wording.format(name=call.name))
+            try:
+                await self._outside_record(call, stopped, emit, tags, began)
+            except Exception as error:
+                self._fail_from_outside(caller, error)
+            raise
+        finally:
+            self._outside_running.pop(call.id, None)
+            self._call_tasks.pop(call.id, None)
+
+    async def _outside_record(
+        self,
+        call: ToolCallPart,
+        result: ToolResultPart,
+        emit: Callable[[Any], None],
+        tags: dict[str, Any],
+        began: float,
+    ) -> ToolResultPart:
+        """Journal the result of a call from outside the model (never into ``self.results``:
+        no assistant message has it) and announce it. Nothing is written once the run's
+        journal is closed: a later resume would count the entry."""
+        if not self._journal_closed():
+            data: dict[str, Any] = {"result": result.model_dump(mode="json"), **tags}
+            if call.id in self._counted:
+                data["counted"] = True  # toward Limits.max_tool_calls, restored on resume
+            await self._journal("tool_result", data)
+        emit(
+            ToolCallFinished(
+                call=call,
+                result=result,
+                duration_ms=(time.perf_counter() - began) * 1000,
+                agent=self.agent.name,
+            )
+        )
+        return result
+
     async def _journal(self, kind: str, data: dict[str, Any], *, run_id: str | None = None) -> None:
         if kind in _USAGE_KINDS and run_id is None:
             with self._usage_lock:
                 added, self._usage_to_journal = self._usage_to_journal, Usage()
+                by_operation, self._usage_by_operation = self._usage_by_operation, {}
             if added != Usage():
                 # Usage from ctx.add_usage (a compactor's summary, a sub-agent) rides on the
                 # next entry of the run, so a resume restores it (derive_state sums it).
                 data = {**data, "added_usage": added.model_dump(mode="json")}
+            if by_operation:
+                # Which tool calls added it: a repeat of such a call learns what the journal
+                # holds of its usage (RunContext.journaled_usage), whatever entry carried it.
+                data = {**data, "added_usage_by_operation": _usage_dumps(by_operation)}
         entry = Entry(kind=kind, data=data, run_id=run_id or self.run_id)
         if self._batch is not None:
             self._batch.append(entry)
@@ -2612,6 +3095,10 @@ class _Run:
         except BaseException:
             self._unwritten(entries)
             raise
+        for entry in entries:  # written: the journal holds this usage of these calls now
+            for operation_id, usage in _usage_loads(entry.data).items():
+                held = self.journaled_usage.get(operation_id, Usage())
+                self.journaled_usage[operation_id] = held.add(usage)
 
     def _unwritten(self, entries: list[Entry]) -> None:
         """Keep the added usage of entries that were not written for the next entry."""
@@ -2620,6 +3107,10 @@ class _Run:
                 added = Usage.model_validate(entry.data["added_usage"])
                 with self._usage_lock:
                     self._usage_to_journal = self._usage_to_journal.add(added)
+            for operation_id, usage in _usage_loads(entry.data).items():
+                with self._usage_lock:
+                    pending = self._usage_by_operation.get(operation_id, Usage())
+                    self._usage_by_operation[operation_id] = pending.add(usage)
 
     @contextlib.asynccontextmanager
     async def _batched(self) -> AsyncIterator[None]:
@@ -2881,6 +3372,23 @@ def _cancelled_from_outside() -> bool:
     return task is not None and task.cancelling() > 0
 
 
+def _usage_dumps(usage: Mapping[str, Usage]) -> dict[str, Any]:
+    """``{operation id: usage}`` as an entry's ``added_usage_by_operation``."""
+    return {operation_id: item.model_dump(mode="json") for operation_id, item in usage.items()}
+
+
+def _cancel_mark(task: asyncio.Task[Any] | None) -> tuple[asyncio.Task[Any], int] | None:
+    """``task`` with its ``cancelling()`` count now, for `_cancelled_since`."""
+    return (task, task.cancelling()) if task is not None else None
+
+
+def _cancelled_since(mark: tuple[asyncio.Task[Any], int] | None) -> bool:
+    """The task of ``mark`` has been asked to cancel since it was marked (and has not taken
+    the request back). Relative to the mark: a task that was already being cancelled when
+    it started a run (cleanup code that runs an agent) does not count as cancelling it."""
+    return mark is not None and mark[0].cancelling() > mark[1]
+
+
 async def _threads_finished(
     threads: list[concurrent.futures.Future[Any]], timeout: float | None
 ) -> bool:
@@ -2923,6 +3431,54 @@ def _invalid_arguments(tool: Tool, call: ToolCallPart) -> str | None:
 
 def _error_result(call: ToolCallPart, content: str) -> ToolResultPart:
     return ToolResultPart(tool_call_id=call.id, name=call.name, content=content, is_error=True)
+
+
+def _outside_refusal(call: ToolCallPart, reason: str) -> str:
+    """The result text of a call from outside the model that was not run (`TOOL_SERVER_REFUSED`)."""
+    return prompts.TOOL_SERVER_REFUSED.format(name=call.name, reason=reason)
+
+
+def _not_json(value: Any) -> str | None:
+    """``"<error type>: <message>"`` when ``value`` cannot be journaled as JSON, else ``None``."""
+    try:
+        json.dumps(to_jsonable_python(value), allow_nan=False)
+    except (PydanticSerializationError, TypeError, ValueError) as error:
+        return f"{type(error).__name__}: {error}"
+    return None
+
+
+class _OutsideGate:
+    """``Limits.parallel_tools`` for the calls from outside the model that come through one
+    calling call: calls that run alone wait for every other such call, the others run
+    together, at most ``max_parallel_tools`` at a time. (They never wait for the calling
+    call itself, which waits for them.)"""
+
+    def __init__(self, limits: Limits) -> None:
+        self._slots = asyncio.Semaphore(max(1, limits.max_parallel_tools))
+        self._readers = 0
+        self._writer = False
+        self._changed = asyncio.Event()
+
+    @contextlib.asynccontextmanager
+    async def hold(self, alone: bool) -> AsyncIterator[None]:
+        async with self._slots:
+            while True:
+                if alone and not self._writer and self._readers == 0:
+                    self._writer = True
+                    break
+                if not alone and not self._writer:
+                    self._readers += 1
+                    break
+                self._changed.clear()
+                await self._changed.wait()
+            try:
+                yield
+            finally:  # no await here: a cancelled call always gives its place back
+                if alone:
+                    self._writer = False
+                else:
+                    self._readers -= 1
+                self._changed.set()
 
 
 def _shorten(text: str, limit: int | None) -> str:

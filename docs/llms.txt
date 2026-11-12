@@ -1,0 +1,84 @@
+# qagents
+
+> A small, explicit agent framework for Python, with QCloud as the first-class model provider.
+
+This index describes qagents 0.2.0. Every page below, in this order, is also in one file: [llms-full.txt](llms-full.txt). Coding agents can query the documentation of the installed version with the docs MCP server, `python -m qagents.docs_mcp` (stdio), or its command line, `python -m qagents.docs_mcp search "<query>"`.
+
+## Start
+
+- [Home](./): A small, explicit agent framework for Python. One loop, typed tools, durable sessions, and QCloud as the first-class model provider, without being tied to it.
+- [Getting started](getting-started/): Sections: Install, See it run without a key, Your first agent on QCloud, Stream the answer, Keep the conversation, Check the live platform, Next.
+
+## Concepts
+
+- [The loop](concepts/loop/): An agent is a model, instructions and tools, run in a loop until the model answers.
+- [Tools](concepts/tools/): A tool is a Python function the model can call. Decorate it with @tool.
+- [Permissions and approvals](concepts/permissions/): Whether a tool call runs is decided by ordinary code, outside the model.
+- [Sessions and recovery](concepts/sessions/): A session is a conversation that outlives a process.
+- [Streaming and cancel](concepts/streaming/): agent.stream() starts a run and returns a RunStream: an async iterator of events, plus control over the run.
+- [Structured output](concepts/structured-output/): Give the agent an output_type and result.output is a validated value instead of text.
+- [Several agents and workflows](concepts/multi-agent/): There are three ways to combine qagents agents, and a fourth for another agent program.
+- [External agents](concepts/external-agents/): A coding agent such as Devvi runs its own loop, with its own model, tools and sandbox. qagents can put one to work: give it a task in a workspace, follow what it does, decide every permission...
+- [Hooks, context and tracing](concepts/hooks/): Sections: Hooks, Long conversations, Tracing.
+
+## Guides
+
+- [Model providers](providers/): A provider is a subclass of Model. Three ship with qagents, and two more are for tests.
+- [Ready-made tools](toolkits/): qagents.toolkits has factories that return ordinary tools. Give them to an agent like your own.
+- [Testing agents](testing/): The loop, your tools, your permissions and your hooks can all run in a unit test, with no network and no model.
+- [Serving over HTTP](serving/): qagents is a library: it runs inside your web service, worker or script.
+- [Devvi as a coding worker](integrations/devvi/): Devvi is a coding agent: a fork of DeepSeek Harness, MIT-licensed.
+- [Any ACP agent](integrations/acp/): The Agent Client Protocol (ACP) is how a program drives a coding agent: open a session in a workspace, send a prompt, follow what the agent does, answer its permission requests, cancel it.
+- [Serving tools over MCP](integrations/mcp-server/): A coding agent runs its own loop with its own tools. To let it use qagents tools as well, a customer lookup or a ticket system, serve them to it over MCP. qagents.integrations.mcp_server does that.
+- [Docs for coding agents](coding-agents/): Coding agents (Claude Code, Codex CLI, Cursor, VS Code, any MCP client) write better qagents code when they read the documentation of the version you have installed instead of guessing from other...
+
+## Design
+
+- [Principles and guarantees](design/): qagents was designed after a survey of the agent frameworks of late 2026 (research report, in Greek).
+
+## API reference
+
+- [Agent](reference/agent/): API reference: Agent, Limits, RunStream.
+- [Tools](reference/tools/): API reference: qagents.tools.
+- [Permissions](reference/permissions/): API reference: qagents.permissions.
+- [Hooks](reference/hooks/): API reference: Hooks.
+- [Sessions](reference/session/): API reference: qagents.session.
+- [Events and results](reference/events/): API reference: qagents.results, qagents.events.
+- [Messages](reference/messages/): API reference: qagents.messages.
+- [Models](reference/models/): API reference: qagents.models.base, QCloudModel, OpenAIChatModel, qagents.models.testing.
+- [Workflows](reference/workflow/): API reference: Workflow.
+- [Context](reference/context/): API reference: qagents.context.
+- [Tracing](reference/tracing/): API reference: OTelHooks.
+- [Toolkits](reference/toolkits/): API reference: file_tools, shell_tool, web_tools, notes_tools.
+- [External agents](reference/external/): Guides: External agents, Devvi, Any ACP agent, Serving tools over MCP.
+- [Errors](reference/errors/): API reference: qagents.errors.
+- [Prompts](reference/prompts/): Every piece of text qagents itself puts in front of a model.
+
+## Examples
+
+- [agentic_rag](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/agentic_rag.py): Search and read tools, a structured cited answer, and a citation validator.
+- [content_flow](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/content_flow.py): A durable content flow: topic, routed writer, guardrail, publish signal, resume.
+- [customer_support](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/customer_support.py): Triage hands off to billing, a signed approval gates the refund, turn 2 stays there.
+- [debate](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/debate.py): Two debaters argue for two rounds, then a judge returns a typed, checked verdict.
+- [deferred_job](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/deferred_job.py): A tool defers to an external render job; the run resumes later with its result.
+- [evals_compare](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/evals_compare.py): Score a tool-using assistant on six cases and compare the reports of two providers.
+- [fallback_router](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/fallback_router.py): route() picks a quick or an expert agent; a FallbackModel survives a busy primary.
+- [hierarchical_crew](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/hierarchical_crew.py): Manager delegates to market, legal and technical specialists via fan_out.
+- [hierarchical_teams](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/hierarchical_teams.py): A manager with a research team (parallel searchers) and a writing team.
+- [human_in_the_loop](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/human_in_the_loop.py): Booking agent that pauses for a question and an approval and is resumed twice.
+- [long_running_research](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/long_running_research.py): A planning research agent whose run is recovered by a second worker after a crash.
+- [map_reduce](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/map_reduce.py): Summarise documents in parallel as durable steps, reduce them to one brief.
+- [mcp_tools](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/mcp_tools.py): Tools of a local MCP server, with destructive calls approved by a policy in code.
+- [mlflow_tracing](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/mlflow_tracing.py): A supervisor with two workers traced in MLflow, read back as a span tree.
+- [plan_and_execute](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/plan_and_execute.py): A planner, an executor with tools and a bounded replanner, as durable workflow steps.
+- [react_assistant](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/react_assistant.py): Tool-calling assistant with a two-turn conversation kept on a SQLite session.
+- [reflection](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/reflection.py): A writer and a critic in a bounded revise loop, with hard rules checked in Python.
+- [research_crew](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/research_crew.py): Researcher, writer and editor as typed, durable workflow steps.
+- [sql_agent](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/sql_agent.py): An agent answers a join-and-aggregate question with list, describe and query tools.
+- [stock_analysis](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/stock_analysis.py): Analyst sub-agents feed an advisor whose structured recommendation is validated.
+- [supervisor](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/supervisor.py): A supervisor delegates to a researcher and an analyst, then writes a short report.
+- [trip_planner](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/trip_planner.py): City selector, then local expert and concierge in parallel, then a budgeted plan.
+
+## Optional
+
+- [Research report (Greek)](research/): Τον Νοέμβριο του 2026 τα agentic frameworks έχουν καταλήξει, από διαφορετικούς δρόμους, στην ίδια αρχιτεκτονική: έναν σταθερό loop μοντέλου και tools με λίγα σημεία επέκτασης, ένα «harness»...

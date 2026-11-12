@@ -64,7 +64,9 @@ print(stream.result.status)  # "cancelled"
 - The text produced so far is kept in the conversation as an assistant message with
   `metadata == {"interrupted": True}`.
 - Tool calls that were running are cancelled and get a result saying so, so the history stays
-  valid.
+  valid. A read-only call is reported as cancelled (`TOOL_CANCELLED`). Any other call, an
+  idempotent one included, may already have changed things, so its outcome is reported as
+  unknown (`TOOL_INTERRUPTED`) and the model is told to check before calling it again.
 - The next `agent.run` on that session continues from the interrupted answer.
 
 `Limits(timeout_s=...)` uses the same mechanism and ends the run as `limit_reached` with

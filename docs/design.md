@@ -32,9 +32,12 @@ Message content stays out of traces unless you ask for it.
 **Fail early and say why.** A setting the provider would reject fails when the agent is built.
 A model without the needed capability fails before the request is sent. Errors name what to do.
 
-**Provider-neutral inside, QCloud first outside.** Conversations are stored as typed parts, not
-as one vendor's JSON, with opaque provider data kept for replay. Adapters translate at the edge.
-There is no universal gateway dependency.
+**Provider- and agent-neutral.** Models and agents sit behind thin adapters. Conversations are
+stored as typed parts, not as one vendor's JSON, with opaque provider data kept for replay;
+QCloud is the first-class provider, not the only one. Another agent program (Devvi, any ACP
+agent) is an external agent behind one contract, `ExternalAgent`: qagents gives it a task,
+decides its permission requests and keeps the journal, whichever agent it is. There is no
+universal gateway dependency.
 
 ## Compared with what exists
 
@@ -48,6 +51,7 @@ There is no universal gateway dependency.
 | Unknown request fields dropped silently, or rejected mid-run with a 400 | Checked against the provider's allow-list when the agent is built |
 | Vendor SDKs tied to one model family or one API | Any provider behind one `stream` method; Chat Completions is first-class |
 | Every pause and resume re-runs side effects | Recorded results are reused; `ctx.operation_id` gives tools a stable idempotency key |
+| Coding agents wrapped as one opaque tool call, or "driven" over a tool protocol | External agents are driven over ACP or the Devvi SDK: every permission request goes through your rules, each step is an event, a cancel stops the turn and keeps the session |
 
 ## Guarantees
 
@@ -62,6 +66,10 @@ What you can rely on, and what you cannot.
 | An ambiguous model request is not repeated | unless `Limits(retry_ambiguous=True)` |
 | A denied or failed permission check never runs the tool | always |
 | The conversation sent to the provider is always well-formed (every tool call has a result) | always |
+| An external agent's permission request is decided by your rules, never answered "allow always", and refused when deciding fails: a `can_use_tool` or `on_ask` that raises answers reject, a decision that times out answers cancelled | always |
+
+The guarantees for calls to external agents, including crash recovery, are listed in
+[External agents](concepts/external-agents.md#guarantees-for-external-calls).
 
 Not guaranteed:
 
@@ -84,6 +92,8 @@ Not guaranteed:
 | Toolkits | unit tests, including path-escape and non-public-address refusals |
 | Tracing | tests with the OpenTelemetry SDK's in-memory exporter |
 | Examples and documentation | examples are executed, documentation code blocks are compiled |
+| External agents: ACP client, Devvi (ACP and SDK transports), MCP tool server | offline tests against Devvi's recorded ACP and SDK transcripts, fake agent processes started as real subprocesses, process-tree kill on Windows, the official MCP client over stdio and Streamable HTTP; opt-in tests (`-m devvi_mock`) against the real Devvi 0.2.1-rc.3 CLI and a local mock model |
+| Docs server for coding agents | tests of search ranking on known questions, sections, live API introspection, the code checker on correct and wrong code, the command line, and the MCP server over stdio with the official client |
 
 Not verified yet:
 
@@ -93,6 +103,9 @@ Not verified yet:
 - Python 3.11 and 3.12, Linux and macOS. The suite ran on Python 3.13 on Windows, where the
   POSIX file-symlink test of `file_tools` is skipped (the junction tests run).
 - Behaviour under load and with long journals.
+- External agents against a paid model route (Devvi tier 2), on Linux or macOS, or on Node 24.9
+  or newer without the compatibility hook the tier-1 tests used on Node 22.17. Other ACP agents
+  than Devvi have no recorded fixture yet.
 
 ## Deliberately left out
 
@@ -104,20 +117,24 @@ Not verified yet:
 | A universal provider gateway | A compromised release of a popular gateway shipped a credential stealer in 2026, and gateways lose reasoning state. Thin adapters are less risk. |
 | An in-process code sandbox | An in-process sandbox is not a security boundary. |
 | Pickled state | Stored state is a trust boundary. |
+| Driving agents over MCP | MCP is a tool protocol: one call, one result. A coding agent's turn has a session, many steps, permission requests back to the caller, and a cancel that keeps the session. Agents are driven over ACP (or the Devvi SDK); MCP only gives them tools. |
 
 ## Roadmap
 
-In this order:
+Shipped in 0.2: `PostgresStore` and `AgentRuntime` with leases and a recovery worker that
+resumes dead runs, the MCP client toolkit (spec revision 2026-07-28, with fallback to
+2025-11-25), signed approvals, the final-answer tool as a third structured-output mode, limits
+inherited by sub-agents, and the Anthropic Messages and AG-UI adapters. Since 0.2: external
+agents (the ACP client, Devvi, the MCP tool server) and the docs server for coding agents.
+
+Next, in this order:
 
 1. **Live acceptance on QCloud**: the paid checks in `examples/live_acceptance.py`, with usage
    and cost reconciled, and a small tool-calling evaluation per model in use.
-2. **`PostgresStore`** with leases and a recovery worker that finds and resumes dead runs, plus
-   journal snapshots and a schema version.
-3. **MCP client toolkit** (spec revision 2026-07-28, with fallback to 2025-11-25) and deferred
-   tool loading for large tool sets.
-4. **Signed approvals**, so a stored pause cannot be forged.
-5. **A final-answer tool** as a third structured-output mode, and limits inherited by sub-agents.
-6. **Adapters**: Anthropic Messages, and an AG-UI projection of the event stream.
+2. **Deferred tool loading** for large tool sets, and journal snapshots.
+3. **External agents**: live Devvi acceptance (one paid task, usage reconciled), recorded
+   fixtures for more ACP agents, the devvi.sh platform as a `Model`, and qagents as an ACP
+   agent server.
 
 ## Stability
 

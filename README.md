@@ -1,4 +1,11 @@
-﻿# qagents
+﻿<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/qagents-logo-dark.svg">
+    <img alt="qagents" src="assets/logo/qagents-logo.svg" width="360">
+  </picture>
+</p>
+
+# qagents
 
 A small, explicit agent framework for Python. One loop, typed tools, durable sessions, and
 QCloud as the first-class model provider, without being tied to it.
@@ -35,6 +42,11 @@ mkdocs serve
 It is built with MkDocs and Material for MkDocs. Material reaches end of life on 5 May 2027; its
 successor, Zensical, is made by the same team and reads the same `mkdocs.yml`.
 
+Coding agents can query the docs of the installed version through an MCP server
+(`python -m qagents.docs_mcp`, with the `mcp` extra) or its command line, and follow the
+rules in [`AGENTS.md`](AGENTS.md). The site also serves `llms.txt` and `llms-full.txt`. See
+[Docs for coding agents](docs/coding-agents.md).
+
 ## Install
 
 Python 3.11 or newer.
@@ -42,6 +54,10 @@ Python 3.11 or newer.
 ```bash
 pip install -e ".[dev]"
 ```
+
+The core needs only `pydantic` and `httpx`. Optional SDKs sit behind extras: `anthropic`, `mcp`,
+`postgres`, `mlflow`, `otel`, `evals`, and `all` for every one of them. The `acp` and `devvi`
+extras install nothing: the ACP client and Devvi need no extra dependency.
 
 The QCloud provider uses the `qcloud-ai` SDK, which is not on PyPI yet. Install it from source:
 
@@ -65,9 +81,12 @@ capability.
 | Hard stops | `Limits(max_turns=..., max_cost_usd=..., timeout_s=...)` |
 | Your code inside the loop | subclass `Hooks` |
 | Several agents | `tools=[other_agent]` (sub-agent) or `handoffs=[other_agent]` |
+| Another coding agent as a worker | `tools=[DevviAgent(workspace=repo).as_tool(name="coder", timeout=1800)]`: Devvi runs its own loop, driven over ACP; every permission request it sends is decided by your `Permissions` on names like `coder.pwsh` |
+| Your tools inside that coding agent | `DevviAgent(..., expose_tools=[...])`, or `tool_server(tools, ctx=ctx)` over MCP |
 | A multi-step job that resumes | `Workflow(store, id=...)` with `step` and `run_agent` |
 | Traces | `hooks=[OTelHooks()]`, with `from qagents.tracing import OTelHooks` |
 | Tests without a model | `ScriptedModel([...])` |
+| Docs your coding agent can query | `python -m qagents.docs_mcp` (MCP), or `python -m qagents.docs_mcp search "..."`; see [Docs for coding agents](docs/coding-agents.md) |
 
 ## How it works
 
@@ -81,19 +100,27 @@ Every message, tool start and tool result is appended to the session journal as 
 plain JSON. Because the next step depends only on the journal, a run can stop anywhere (an
 approval, a crash, a deploy) and a different process can continue it with `agent.resume(session)`.
 
-```
+```text
 agent.py        the Agent, the loop, RunStream
 messages.py     provider-neutral messages: text, image, tool call, tool result, reasoning
 tools.py        @tool, Tool, Toolkit, RunContext
 permissions.py  allow / ask / deny rules and approvals
-hooks.py        six hook points around the run, the model request and each tool call
+hooks.py        seven hook points: the run, the model request, each tool call, each event
 session.py      the journal: Session, InMemoryStore, SQLiteStore
 workflow.py     durable steps for multi-step and multi-agent jobs
+multi.py        fan_out (parallel children) and route (pick a specialist)
+runtime.py      AgentRuntime: background runs with leases, heartbeats and recovery
 context.py      compaction of long conversations
 tracing.py      OpenTelemetry spans
+evals.py        datasets, evaluators and reports
 prompts.py      every string the framework itself sends to a model
-models/         QCloudModel, OpenAIChatModel, ScriptedModel
-toolkits/       file, shell, web, notes and clock tools
+cli.py          the qagents command: chat, run, models, docs
+models/         QCloudModel, OpenAIChatModel, AnthropicModel, FallbackModel, test models
+stores/         PostgresStore
+toolkits/       file, shell, web, notes, clock, planning, ask_user and MCP tools
+external/       external agents: other agent programs driven over a control protocol
+integrations/   the ACP client, Devvi, the MCP tool server, AG-UI events, MLflow tracing
+docs_mcp/       the docs MCP server and command line for coding agents
 ```
 
 ### Nothing hidden
@@ -106,6 +133,11 @@ receives the exact request before it is sent.
 ## Tools
 
 ```python
+from typing import Literal
+
+from qagents import RunContext, tool
+
+
 @tool(read_only=True)
 async def search_orders(
     ctx: RunContext[Deps], customer: str, status: Literal["open", "closed"] = "open"
@@ -124,14 +156,17 @@ async def search_orders(
   types) goes back to it as an error result so it can correct itself.
 - A first parameter annotated `RunContext` receives `deps`, ids and usage, and is hidden from the model.
 - Raise `ToolError("...")` to tell the model what went wrong. Any other exception is also reported
-  to the model and logged.
+  to the model and logged. Return a `ToolResultPart` to set `is_error` and `metadata` yourself
+  (the loop fills in the call id and name).
 - Flags: `read_only` (may run in parallel with other read-only calls; everything else runs one at
   a time, in order), `requires_approval`, `idempotent` (safe to repeat after a crash), `timeout`.
 - `ctx.operation_id` is the same when a call is repeated after a resume. Pass it to the system
   your tool calls as the idempotency key.
 
-Ready-made tools: `file_tools(root, writable=False)`, `shell_tool(cwd)`, `web_tools()`,
-`notes_tools(directory)`, `current_time`.
+Ready-made tools, in `qagents.toolkits`: `file_tools(root, writable=False)`, `shell_tool(cwd)`,
+`web_tools()`, `notes_tools(directory)`, `current_time`, `todo_tools()` (a plan kept in the
+session state) and `ask_user` (a question that pauses the run). The tools of an MCP server come
+from `qagents.toolkits.mcp.MCPToolkit` (extra `mcp`).
 
 ## Permissions and approvals
 
@@ -140,6 +175,8 @@ Decisions are made by code, outside the model, in a fixed order: `deny` rules, y
 answers decides (a deny always wins), and an exception while deciding refuses the call.
 
 ```python
+from qagents import Permissions
+
 Permissions(mode="default", allow=["read_*"], ask=["send_*"], deny=["delete_*"])
 ```
 
@@ -157,6 +194,8 @@ Tool calls of the same turn that needed no approval have already run, and are no
 ## Sessions and recovery
 
 ```python
+from qagents import Session, SQLiteStore
+
 store = SQLiteStore("agents.db")
 await agent.run("My name is Maria.", session=Session(store, id="user-42"))
 await agent.run("What is my name?", session=Session(store, id="user-42"))
@@ -202,11 +241,11 @@ gets the validation error and `Limits.output_retries` more attempts.
 ## Several agents
 
 ```python
+from qagents import Agent
+
 researcher = Agent(model, name="researcher", description="Finds facts.", tools=[search])
 lead = Agent(model, tools=[researcher])  # sub-agent: own context, returns its answer
-triage = Agent(
-    model, name="triage", handoffs=[billing]
-)  # handoff: billing takes over the conversation
+triage = Agent(model, name="triage", handoffs=[billing])  # billing takes over the conversation
 ```
 
 A sub-agent sees only the task text and the caller sees only its answer; its usage is counted in
@@ -216,6 +255,8 @@ orchestrator with isolated workers and a single writer.
 For jobs with several steps, write a normal async function and wrap the units in a `Workflow`:
 
 ```python
+from qagents import Workflow
+
 wf = Workflow(store, id=f"report:{topic}")
 notes = await wf.run_agent("research", researcher, f"Research {topic}")
 draft = await wf.run_agent("write", writer, f"Write a report from:\n{notes.text}")
@@ -224,6 +265,34 @@ await wf.step("publish", lambda: publish(draft.text))
 
 A finished step never runs again for the same workflow id. An agent step that was interrupted or
 paused is resumed at the exact tool call. Use `asyncio.gather` for parallel branches.
+
+## Coding agents as workers
+
+A coding agent such as Devvi runs its own loop, model, tools and sandbox. qagents drives it as an
+external agent over ACP (or Devvi's SDK protocol): it sends the task, sees each step as an event,
+decides every permission request with your `Permissions`, and cancels it with your limits. MCP
+is not how you drive an agent: MCP gives an agent tools, and qagents uses it only to hand its
+own tools to the coding agent.
+
+```python
+from qagents import Agent, Permissions
+from qagents.integrations.devvi import DevviAgent
+
+coder = DevviAgent(
+    workspace="C:/work/repo",
+    patches=[{"id": "tool-web", "disabled": True}],  # Devvi never asks before a web fetch
+    allow_unmetered=True,  # ACP reports no token counts
+)
+lead = Agent(
+    "qcloud:<model-id>",
+    tools=[coder.as_tool(name="coder", timeout=1800)],
+    permissions=Permissions(ask=["coder.bash", "coder.pwsh"]),  # Devvi asks only to leave its sandbox
+)
+```
+
+`pip install "qagents[devvi]"` needs no extra dependency; giving Devvi qagents tools
+(`expose_tools`) needs `qagents[mcp]`. See [External agents](docs/concepts/external-agents.md)
+and [Devvi as a coding worker](docs/integrations/devvi.md).
 
 ## Providers
 
@@ -246,13 +315,18 @@ from qagents import OpenAIChatModel
 model = OpenAIChatModel("my-model", base_url="http://localhost:8000/v1", api_key="...")
 ```
 
+Claude through the Messages API: `Agent("anthropic:<model-id>")` or `AnthropicModel(...)`, with
+the `anthropic` extra. `FallbackModel([...])` tries the next model when one refuses at admission,
+and `RateLimitedModel(model, ...)` stays under a provider's limits.
+
 To add a provider, subclass `Model` and implement `stream`. The message model keeps reasoning
-parts with opaque provider data, so adapters for Anthropic Messages or the Responses API can be
-added without changing stored conversations.
+parts with opaque provider data, so adapters for other APIs (the Responses API, for example) can
+be added without changing stored conversations.
 
 ## Testing your agents
 
 ```python
+from qagents import Agent
 from qagents.models.testing import ScriptedModel, call
 
 model = ScriptedModel([call("get_weather", city="Athens"), "It is sunny."])
@@ -269,7 +343,13 @@ assert model.requests[1].messages[-1].tool_results[0].content == "Sunny in Athen
 | OpenAI-compatible provider | Tests against a local HTTP transport: streaming, tool-call deltas, retries, error mapping |
 | QCloud provider | Tests through the real `qcloud_ai` 0.4.0 SDK with its HTTP transport replaced locally |
 | Toolkits | Unit tests, including path-escape and non-public-address refusals |
-| Tracing | Tests with the OpenTelemetry SDK's in-memory exporter |
+| Anthropic provider | Tests through the real `anthropic` SDK with its HTTP transport replaced locally |
+| `PostgresStore`, `AgentRuntime` | The store and recovery tests run on `InMemoryStore`, `SQLiteStore` and, with `QAGENTS_TEST_POSTGRES_DSN` set, a real PostgreSQL server |
+| MCP client toolkit | Tests against a real MCP server, as a subprocess over stdio and over streamable HTTP on 127.0.0.1 |
+| Tracing | Tests with the OpenTelemetry SDK's in-memory exporter, and MLflow against a real tracking store (SQLite) |
+| AG-UI events, command line | Tests with scripted models and no network |
+| External agents (ACP client, Devvi, MCP tool server) | Offline tests against Devvi's recorded ACP and SDK transcripts and fake agent processes, process-tree kill on Windows, the official MCP client; opt-in tests against the real Devvi CLI with a local mock model |
+| Docs server for coding agents | Tests of search, pages, API introspection, the code checker, the command line, and the MCP server over stdio with the official client |
 
 Examples are executed and documentation code blocks are compiled by `tests/test_examples.py`.
 
@@ -277,20 +357,25 @@ Not verified yet: a request against the live QCloud API (`examples/live_acceptan
 this and has only been run with `--dry-run`; `examples/quickstart.py` has not been run),
 tool-calling reliability of specific catalog models, Python 3.11 and 3.12, Linux and macOS (the
 suite ran on Python 3.13 on Windows, where the POSIX file-symlink test of `file_tools` is
-skipped, so that test has never run; the junction tests do run), and behaviour under load.
+skipped, so that test has never run; the junction tests do run), behaviour under load, and
+external agents against a paid model route or another ACP agent than Devvi.
 
 ## Roadmap
 
 Shipped in 0.2 (see the [changelog](CHANGELOG.md)): `PostgresStore` and `AgentRuntime` with
 leases and recovery, the MCP client toolkit, signed approval tokens, the final-answer tool as a
 third structured-output mode, budgets and depth inherited by sub-agents, and the Anthropic and
-AG-UI adapters.
+AG-UI adapters. Since 0.2 (unreleased): external agents (the ACP client, Devvi, the MCP tool
+server) and the docs server for coding agents.
 
 Next, in this order:
 
 1. Live acceptance on QCloud: one paid tool loop with usage and cost reconciled, and a small
    tool-calling eval per model you plan to use.
 2. Deferred tool loading for large tool sets.
+3. External agents: live Devvi acceptance (one paid task, usage reconciled), recorded fixtures
+   for more ACP agents, the devvi.sh platform as a `Model`, and qagents as an ACP agent server.
 
 Deliberately not planned: a graph DSL, role-play crews, built-in RAG or vector stores, a universal
-provider gateway, in-process code sandboxes, and pickled state.
+provider gateway, in-process code sandboxes, pickled state, and driving agents over MCP (MCP
+gives an agent tools; agents are driven over ACP).
