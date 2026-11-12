@@ -3,8 +3,8 @@
 ``MCPToolkit.stdio`` starts the inventory server in ``examples/patterns/_mcp_server.py`` with
 this Python interpreter and exposes its tools as qagents tools. The server's annotations decide
 how each one is treated: ``list_items`` and ``get_item`` are read-only and run at once;
-``update_stock`` is destructive, so every call asks for approval first (``approval=
-"destructive"``, the default). An ``on_ask`` policy answers in code: a change of up to 10
+``update_stock`` is not read-only, so every call asks for approval first (``approval=
+"side_effects"``, the default). An ``on_ask`` policy answers in code: a change of up to 10
 units of an item goes through, a larger one is declined for a manager, and so is every later
 change of that item. The agent books a delivery of 5 cables and 40 monitors: the cables are
 booked, the monitors wait.

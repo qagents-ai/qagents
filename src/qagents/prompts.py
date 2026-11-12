@@ -23,6 +23,14 @@ OUTPUT_RETRY = (
 """Sent as a user message when a structured final answer fails validation, or an output
 validator rejects it with `ModelRetry` (``{error}`` is then the validator's message)."""
 
+OUTPUT_VALIDATOR_RETRY = (
+    "Your reply could not be used as the final answer: {error}\n"
+    "Correct it. You may call tools first if you need to; then reply with only the corrected JSON."
+)
+"""Sent as a user message when an output validator rejects a structured final answer with
+`ModelRetry` (``output_mode`` ``"native"`` or ``"prompted"``). Unlike `OUTPUT_RETRY`, it lets
+the model call tools, which the correction may need."""
+
 OUTPUT_TEXT_RETRY = (
     "Your reply could not be used as the final answer: {error}\n"
     "Reply again with a corrected answer."
@@ -36,6 +44,13 @@ OUTPUT_TOOL_INSTRUCTIONS = (
     "An answer written as plain text is not accepted."
 )
 """Appended to the instructions when ``output_mode="tool"``; ``name`` is the tool's name."""
+
+OUTPUT_TOOL_TEXT_INSTRUCTIONS = (
+    "When you have the final answer, give it by calling the {name} tool, or reply with it as "
+    "plain text."
+)
+"""Appended instead of `OUTPUT_TOOL_INSTRUCTIONS` when ``output_mode="tool"`` and the agent has
+no ``output_type``: its answer is text, so a plain-text reply is accepted too."""
 
 OUTPUT_TOOL_DESCRIPTION = (
     "Give your final answer. Call this once, when the work is done; the arguments are the answer."
@@ -70,15 +85,80 @@ INVALID_ARGUMENTS_JSON = (
     "Call the tool again with a valid JSON object."
 )
 
+TOOL_CALL_TRUNCATED = (
+    "the response reached its output token limit (max_tokens) before the arguments of this "
+    "call were complete"
+)
+"""The ``{error}`` of `INVALID_ARGUMENTS_JSON` for a tool call that the output token limit
+(``max_tokens``) cut off. The model adapters set it as the call's ``parse_error``, so the
+call is refused instead of run with arguments the model never finished writing."""
+
 INVALID_ARGUMENTS = (
     "Invalid arguments for {name!r}:\n{error}\nCall the tool again with corrected arguments."
 )
 
 PERMISSION_DENIED = "{name!r} was not run: {reason}"
 
+PERMISSION_REASON_DEFAULT = "it is not permitted."
+"""The reason in `PERMISSION_DENIED` when the permission check refused a call without one."""
+
+PERMISSION_REASON_DENY_RULE = "a deny rule matches this tool."
+PERMISSION_REASON_READ_ONLY = "only read-only tools are allowed."
+PERMISSION_REASON_CHECK_FAILED = "the permission check failed."
+PERMISSION_REASON_CHECK_REFUSED = "the permission check refused it."
+PERMISSION_REASON_APPROVAL_FAILED = "the approval request failed."
+"""Reasons in `PERMISSION_DENIED` for the refusals `Permissions` makes: a deny rule, the
+``read_only`` mode, a ``can_use_tool`` that raised or refused without a reason, and an
+``on_ask`` that raised."""
+
 APPROVAL_DECLINED = "The user declined this tool call."
 
-TOOL_TIMEOUT = "{name!r} did not finish within {seconds:g} seconds and was stopped."
+APPROVAL_ARGUMENTS_CHANGED = (
+    "The approver changed the arguments of this call before it ran. It ran with: {arguments}"
+)
+"""Put before the result of a call that ran with arguments an approver edited
+(``Approval.arguments``), so the model does not report its own arguments as executed."""
+
+UNSIGNABLE_CALL = (
+    "its arguments hold a value that cannot be written as standard JSON (NaN, an infinity, an "
+    "integer too large to be exact, or broken Unicode text), so it cannot wait for approval or "
+    "input. Call it again with valid values."
+)
+"""The reason (in `PERMISSION_DENIED`) a call that would pause is refused, when pauses
+are signed and its arguments cannot be."""
+
+TOOL_TIMEOUT = (
+    "{name!r} did not finish within {seconds:g} seconds and was cancelled. What it had already "
+    "done may have taken effect: check what happened before calling it again."
+)
+"""An async tool took longer than its timeout and was cancelled part-way."""
+
+TOOL_TIMEOUT_ABANDONED = (
+    "{name!r} did not finish within {seconds:g} seconds. It could not be stopped and may still "
+    "be running, so its outcome is unknown: check what happened before calling it again."
+)
+"""A sync tool (run in a worker thread, which cannot be stopped) took longer than its
+timeout: its thread was abandoned and keeps running."""
+
+TOOL_NOT_STARTED = (
+    "{name!r} was not run: no worker thread became free within {seconds:g} seconds. "
+    "Try again later."
+)
+"""A sync tool waited for a worker thread for longer than its timeout and never started."""
+
+TOOL_THREADS_EXHAUSTED = (
+    "{name!r} was not run: {count} earlier calls of sync tools did not finish within their "
+    "timeouts and still occupy every worker thread. Try again later."
+)
+"""A sync tool call refused at once, because abandoned calls hold every worker thread."""
+
+TOOL_WAITED_FOR_EARLIER = (
+    "{name!r} was not run: an earlier tool call did not finish within its timeout and is "
+    "still running, and calls like this one run one at a time. It was "
+    "still running after {seconds:g} more seconds. Try again later."
+)
+"""A call that runs one at a time (``Limits.parallel_tools``) waited its whole timeout for
+the thread of an earlier sync call that timed out and still runs, and never started."""
 
 TOOL_FAILED = "{name!r} failed: {error}"
 
@@ -86,12 +166,15 @@ TOOL_INTERRUPTED = (
     "{name!r} had started when the run stopped, and it never reported a result. "
     "Its outcome is unknown: check what happened before calling it again."
 )
-"""A tool had started when the process stopped and it is not safe to repeat."""
+"""A tool that is neither read-only nor idempotent had started when the run stopped (the
+process died, or the run was cancelled or timed out while the tool ran)."""
 
 TOOL_NOT_EXECUTED = "{name!r} was not run because the run was interrupted before it started."
-"""A tool call was still waiting when a new run started on the same session."""
+"""A tool call was still waiting when the run was cancelled, timed out or refused by the
+provider, or when a new run started on the same session."""
 
 TOOL_CANCELLED = "{name!r} was cancelled before it finished."
+"""A read-only or idempotent tool was running when the run was cancelled or timed out."""
 
 TOOL_CALL_LIMIT = "{name!r} was not run: the run reached its limit of {limit} tool calls."
 """Result of the calls a run did not start because ``Limits.max_tool_calls`` was reached."""
@@ -121,6 +204,13 @@ SUBAGENT_DESCRIPTION = (
 """Default description of an agent exposed as a tool with ``agent.as_tool()``."""
 
 SUBAGENT_STOPPED = "{name} stopped before finishing ({reason})."
+
+SUBAGENT_TOO_DEEP = (
+    "{name} was not started: runs may nest at most {limit} levels deep, and this one would be "
+    "at depth {depth}. Do the task yourself or with the tools you have."
+)
+"""Error result of an agent used as a tool whose run would nest deeper than
+``Limits.max_depth``."""
 
 SUBAGENT_TASK_DESCRIPTION = "The complete task, self-contained."
 """Description of the ``task`` parameter of an agent exposed with ``agent.as_tool()``."""
@@ -169,6 +259,12 @@ ASK_USER_DESCRIPTION = (
 )
 """Description of ``ask_user``. The tool reads it when the toolkit module is imported."""
 
+ASK_USER_QUESTION_DESCRIPTION = "The question, complete and self-contained."
+"""Description of the ``question`` parameter of ``ask_user``, read when the module is imported."""
+
+ASK_USER_CHOICES_DESCRIPTION = "The answers to offer, when they are known in advance."
+"""Description of the ``choices`` parameter of ``ask_user``, read when the module is imported."""
+
 # --- toolkits: planning (qagents.toolkits.planning) ----------------------------
 
 WRITE_TODOS_DESCRIPTION = (
@@ -180,8 +276,21 @@ WRITE_TODOS_DESCRIPTION = (
 )
 """Description of the ``write_todos`` tool made by ``todo_tools()``."""
 
+WRITE_TODOS_TODOS_DESCRIPTION = "The complete list, in the order the work should be done."
+"""Description of the ``todos`` parameter of ``write_todos``."""
+
+TODO_ITEM_DESCRIPTION = "One step of the plan."
+"""Description of one item of the ``todos`` parameter."""
+
+TODO_CONTENT_DESCRIPTION = "What to do, as a short imperative sentence."
+"""Description of an item's ``content``."""
+
+TODO_STATUS_DESCRIPTION = "pending (not started), in_progress (being worked on) or completed."
+"""Description of an item's ``status``."""
+
 READ_TODOS_DESCRIPTION = "Read your current todo list, with the status of each item."
-"""Description of the ``read_todos`` tool made by ``todo_tools()``."""
+"""Description of the ``read_todos`` tool made by ``todo_tools()``. The ``WRITE_TODOS_*``,
+``TODO_*_DESCRIPTION`` and ``READ_TODOS_DESCRIPTION`` texts are read when the tools are made."""
 
 TODOS_HEADER = "Current plan (update it with write_todos as you work):"
 """First line of ``render_todos``; the items follow, one per line."""

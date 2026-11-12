@@ -26,7 +26,9 @@ class TrippedGuardrail(BaseModel):
     """The reason given to `GuardrailTripped`."""
     stage: GuardrailStage
     """``"input"``: the prompt was blocked and never joined the conversation.
-    ``"output"``: the final answer was blocked; it stays in the journal."""
+    ``"output"``: the final answer was blocked; it stays in the journal, and a
+    later read of the session (`Session.state`, a later run's ``messages``)
+    marks that assistant message with ``metadata["blocked"] = True``."""
 
 
 class RunResult(BaseModel):
@@ -51,7 +53,15 @@ class RunResult(BaseModel):
     the provider's refusal; ``output`` is the refusal text for a plain-text
     agent and ``None`` when an ``output_type`` is set.
 
-    Provider failures and broken hooks are raised as exceptions instead.
+    Provider failures and broken hooks are raised as exceptions instead, and
+    so is a final answer that is still rejected when ``Limits.output_retries``
+    are used up (`OutputValidationError`): there is no ``limit_reached``
+    result for it. The run stays open in the journal as failed.
+
+    Each assistant message a model wrote carries, in its ``metadata``, the
+    ``model`` and ``provider`` that answered (with `FallbackModel`, the model
+    that actually answered, as far as the provider reports it) and the
+    ``finish_reason``.
     """
 
     run_id: str
@@ -63,13 +73,22 @@ class RunResult(BaseModel):
     stop_reason: str | None = None
     output: Any = None
     text: str = ""
-    """Text of the last assistant message; empty when the run was blocked."""
+    """Text of the last assistant message; empty when the run was blocked.
+
+    It is what the model wrote, not the accepted answer: use ``output``. They
+    differ when an output validator replaced the answer, and in
+    ``output_mode="tool"``, where the answer is the final-answer call's
+    arguments and ``text`` is usually empty."""
     messages: list[Message] = Field(default_factory=list)
     """The whole conversation, including earlier runs of the session."""
     new_messages: list[Message] = Field(default_factory=list)
     """Only what this run added."""
     usage: Usage = Field(default_factory=Usage)
+    """Usage of the whole run: a resumed run includes what it used before it
+    stopped, as the journal records it (model responses and the usage tools
+    added with ``ctx.add_usage``)."""
     turns: int = 0
+    """Model requests of the whole run that produced a response, across resumes."""
     pending_approvals: list[PendingApproval] = Field(default_factory=list)
     """Tool calls that wait for a human decision (``status == "paused"``)."""
     pending_inputs: list[PendingInput] = Field(default_factory=list)

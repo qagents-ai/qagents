@@ -23,20 +23,25 @@ agent = Agent(
 | `file_tools(root)` | `list_files`, `read_file`, `search_files` | yes | no |
 | `file_tools(root, writable=True)` | adds `write_file`, `edit_file` | no | yes |
 | `shell_tool(cwd)` | `run_command` | no | yes |
-| `web_tools()` | `fetch_url` | yes | no |
+| `web_tools()` | `fetch_url` | no | yes, unless `allow_hosts` is given |
+| `web_tools(allow_hosts=[...])` | `fetch_url` | yes | no |
 | `notes_tools(directory)` | `list_notes`, `read_note`, `save_note`, `delete_note` | reads only | no |
 | `current_time` | `current_time` | yes | no |
 
 ## Files
 
-`file_tools(root, writable=False, max_read_chars=100_000, max_results=200)`
+`file_tools(root, writable=False, max_read_chars=100_000, max_results=200, max_file_bytes=10_000_000, search_timeout=30.0, search_python=None)`
 
 Every path the model gives is resolved, following symlinks, and must end up inside `root`.
 Anything else is refused with a message that tells the model to use a relative path. Directory
-listings and searches skip symlinks and the usual noise (`.git`, `node_modules`, `.venv`).
+listings and searches skip symlinks, Windows junctions and the usual noise (`.git`,
+`node_modules`, `.venv`).
 
 - `read_file` returns numbered lines and tells the model how to continue reading a long file.
-- `search_files` takes a regular expression and an optional file-name pattern.
+- `search_files` takes a regular expression and an optional file-name pattern. The regex runs
+  in a child `python -I` process that is stopped at `search_timeout`, so a catastrophic pattern
+  cannot freeze the agent; files larger than `max_file_bytes` are skipped. In a frozen or
+  embedded app, pass `search_python=` (the interpreter to use), or the tool refuses.
 - `edit_file` replaces one exact piece of text, and refuses when the text is missing or appears
   more than once, so the model cannot silently change the wrong place.
 
@@ -55,7 +60,11 @@ processes it started.
 
 ## Web
 
-`web_tools(allow_hosts=None, allow_private=False, max_bytes=1_000_000, max_chars=40_000, timeout=20, max_redirects=5)`
+`web_tools(allow_hosts=None, allow_private=False, max_bytes=1_000_000, max_chars=40_000, timeout=20, max_redirects=5, requires_approval=None)`
+
+Without `allow_hosts`, every `fetch_url` call asks for approval and the tool is not read-only
+(so `Permissions(mode="read_only")` refuses it); with `allow_hosts`, or `requires_approval=False`,
+it is read-only and runs without asking.
 
 `fetch_url` fetches a page and returns its readable text (HTML is reduced to visible text). The
 same checks apply to the first URL and to every redirect:

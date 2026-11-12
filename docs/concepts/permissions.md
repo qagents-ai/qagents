@@ -14,7 +14,8 @@ the first match:
 4. `allow` patterns: the call runs.
 5. The `mode` default.
 
-The more restrictive rule always wins: deny beats ask, ask beats allow. If anything goes wrong
+The first rule that answers decides. `deny` is checked first, so a deny always wins; an allow
+from `can_use_tool` skips the `ask` rules, `requires_approval` and the mode. If anything goes wrong
 while deciding (your callback raises, or returns something that is not a decision), the call is
 refused.
 

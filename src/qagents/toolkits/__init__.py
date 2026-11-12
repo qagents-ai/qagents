@@ -17,12 +17,15 @@ agent = Agent(
 
 ``MCPToolkit`` (tools of an MCP server, ``pip install "qagents[mcp]"``) is
 resolved on first access, so importing this package does not import the MCP
-SDK.
+SDK. Without the SDK, ``qagents.toolkits.MCPToolkit`` raises an
+``AttributeError`` that names the extra to install, and ``dir()`` leaves it out.
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import sys
 from datetime import UTC, datetime, tzinfo
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -68,13 +71,19 @@ def __getattr__(name: str) -> Any:
     module = _LAZY.get(name)
     if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(importlib.import_module(module), name)
+    try:
+        imported = importlib.import_module(module)
+    except ImportError as error:
+        # AttributeError, so hasattr(), help() and inspect treat the name as absent.
+        raise AttributeError(str(error), name=name, obj=sys.modules[__name__]) from error
+    value = getattr(imported, name)
     globals()[name] = value
     return value
 
 
 def __dir__() -> list[str]:
-    return sorted({*globals(), *_LAZY})
+    sdk = all(importlib.util.find_spec(package) is not None for package in ("mcp", "mcp_types"))
+    return sorted({*globals(), *(_LAZY if sdk else ())})
 
 
 __all__ = [

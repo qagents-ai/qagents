@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from qagents import Agent, Approval, Permissions, RunContext, Session, tool
+from qagents.errors import ConfigurationError
 from qagents.messages import ToolCallPart
 from qagents.models.testing import ScriptedModel, call
 
@@ -89,6 +90,27 @@ async def test_denied_calls_are_reported_to_the_model():
     assert log == []
 
 
+async def test_refusal_reasons_come_from_prompts_at_decision_time(monkeypatch):
+    from qagents import prompts
+
+    read_order, _, send_email = make_tools([])
+    monkeypatch.setattr(prompts, "PERMISSION_REASON_DENY_RULE", "deny rule hit.")
+    monkeypatch.setattr(prompts, "PERMISSION_REASON_READ_ONLY", "read-only mode.")
+    monkeypatch.setattr(prompts, "PERMISSION_REASON_CHECK_FAILED", "check crashed.")
+    monkeypatch.setattr(prompts, "PERMISSION_REASON_CHECK_REFUSED", "check said no.")
+
+    def broken(*args):
+        raise RuntimeError("boom")
+
+    reasons = [
+        (await decide(Permissions(deny=["send_*"]), send_email, to="a")).reason,
+        (await decide(Permissions(mode="read_only"), send_email, to="a")).reason,
+        (await decide(Permissions(can_use_tool=broken), read_order, order="1")).reason,
+        (await decide(Permissions(can_use_tool=lambda *a: False), read_order, order="1")).reason,
+    ]
+    assert reasons == ["deny rule hit.", "read-only mode.", "check crashed.", "check said no."]
+
+
 async def test_on_ask_resolves_approvals_inline():
     log: list[str] = []
     asked: list[tuple[str, str | None]] = []
@@ -115,7 +137,11 @@ async def test_on_ask_resolves_approvals_inline():
     assert asked == [("refund_order", "this tool requires approval.")] * 2
     assert log == ["refund A 10.0"]  # the approver's edited arguments were used
     approved, declined = result.messages[2].tool_results
-    assert approved.content == "refunded 10.0"
+    # The model is told the call ran with the approver's arguments, not its own.
+    assert approved.content == (
+        "The approver changed the arguments of this call before it ran. It ran with: "
+        '{"order": "A", "amount": 10.0}\nrefunded 10.0'
+    )
     assert declined.content == "'refund_order' was not run: Refunds over 100 need a manager."
 
 
@@ -204,3 +230,120 @@ async def test_on_ask_may_answer_with_a_bool(answer):
     permissions = Permissions(on_ask=lambda ctx, target, call, reason: answer)
     await Agent(model, tools=make_tools(log), permissions=permissions).run("refund")
     assert bool(log) is answer
+
+
+# -- approvals given to resume (F52, F53, F88, F134, L3) ---------------------------------
+
+
+async def test_an_approval_never_overrides_a_deny_rule():
+    """A call left open by a stop after model_responded, then 'approved' by a client."""
+    log: list[str] = []
+    model = ScriptedModel([call("send_email", to="ceo@x")])
+    agent = Agent(model, tools=make_tools(log), permissions=Permissions(deny=["send_*"]))
+    session = Session()
+    stream = agent.stream("email", session=session)
+    async with stream:
+        async for event in stream:
+            if event.type == "model_responded":
+                break
+    call_id = (await session.state()).messages[-1].tool_calls[0].id
+
+    later = Agent(
+        ScriptedModel(["Not sent."]),
+        tools=make_tools(log),
+        permissions=Permissions(deny=["send_*"]),
+    )
+    result = await later.resume(session, approvals={call_id: True})
+    assert log == []
+    assert "a deny rule matches" in result.messages[2].tool_results[0].content
+
+
+async def test_a_deny_rule_added_while_paused_refuses_the_approved_call():
+    log: list[str] = []
+    model = ScriptedModel([call("refund_order", order="A", amount=5), "ok"])
+    session = Session()
+    paused = await Agent(model, tools=make_tools(log)).run("refund", session=session)
+    pending = paused.pending_approvals[0]
+
+    incident = Agent(model, tools=make_tools(log), permissions=Permissions(deny=["refund_*"]))
+    result = await incident.resume(session, approvals={pending.tool_call_id: True})
+    assert log == [] and result.status == "completed"
+    assert "a deny rule matches" in result.messages[2].tool_results[0].content
+
+
+async def test_edited_arguments_are_checked_journaled_and_shown_to_the_model():
+    log: list[str] = []
+
+    def policy(ctx, target, call):
+        if target.name == "refund_order" and call.arguments["amount"] > 100:
+            return "deny"
+        return None
+
+    permissions = Permissions(can_use_tool=policy)
+    model = ScriptedModel(
+        [
+            call("refund_order", order="A", amount=10),
+            call("refund_order", order="B", amount=1),
+            "ok",
+        ]
+    )
+    agent = Agent(model, tools=make_tools(log), permissions=permissions)
+    session = Session()
+    paused = await agent.run("refund", session=session)
+    pending = paused.pending_approvals[0]
+
+    too_much = Approval(approved=True, arguments={"order": "SOMEONE-ELSE", "amount": 100000})
+    second = await agent.resume(session, approvals={pending.tool_call_id: too_much})
+    assert log == []  # the edited call is checked like any other, and denied
+    refused = second.messages[2].tool_results[0]
+    assert (
+        refused.is_error and refused.content == "'refund_order' was not run: it is not permitted."
+    )
+    decided = [e.data for e in await session.entries() if e.kind == "approval_decided"]
+    assert decided == [
+        {
+            "tool_call_id": pending.tool_call_id,
+            "name": "refund_order",
+            "approved": True,
+            "reason": None,
+            "arguments_changed": True,
+            "arguments": {"order": "SOMEONE-ELSE", "amount": 100000},
+        }
+    ]
+
+    pending = second.pending_approvals[0]
+    edit = Approval(approved=True, arguments={"order": "B", "amount": 2})
+    done = await agent.resume(session, approvals={pending.tool_call_id: edit})
+    assert log == ["refund B 2.0"]
+    assert done.messages[4].tool_results[0].content.startswith("The approver changed the arguments")
+
+
+@pytest.mark.parametrize("answer", ["false", 1, None, "yes"])
+async def test_an_approval_that_is_not_a_bool_or_an_approval_is_refused(answer):
+    log: list[str] = []
+    model = ScriptedModel([call("refund_order", order="A", amount=5), "ok"])
+    agent = Agent(model, tools=make_tools(log))
+    session = Session()
+    pending = (await agent.run("refund", session=session)).pending_approvals[0]
+    with pytest.raises(ConfigurationError, match="Give True, False or an Approval"):
+        await agent.resume(session, approvals={pending.tool_call_id: answer})
+    assert log == [] and (await session.state()).pending_approvals == [pending]
+
+
+async def test_an_approval_for_a_call_that_is_not_open_never_approves_a_later_call():
+    log: list[str] = []
+    # A provider that numbers calls per turn: ids repeat across turns.
+    turn_one = [
+        ToolCallPart(id="call_0", name="refund_order", arguments={"order": "A", "amount": 1})
+    ]
+    turn_two = [
+        ToolCallPart(id="call_0", name="refund_order", arguments={"order": "B", "amount": 1}),
+        ToolCallPart(id="call_1", name="refund_order", arguments={"order": "M", "amount": 9}),
+    ]
+    model = ScriptedModel([turn_one, turn_two, "ok"])
+    agent = Agent(model, tools=make_tools(log))
+    session = Session()
+    await agent.run("refund", session=session)
+    result = await agent.resume(session, approvals={"call_0": True, "call_1": True})
+    assert log == ["refund A 1.0"]  # call_1 of the next turn was never reviewed
+    assert sorted(p.tool_call_id for p in result.pending_approvals) == ["call_0", "call_1"]

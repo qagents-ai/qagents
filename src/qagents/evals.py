@@ -62,8 +62,9 @@ from pydantic import (
 from pydantic_core import to_jsonable_python
 
 from . import prompts
-from .agent import Agent, Limits, extract_json
+from .agent import Agent, Limits, RunStream, extract_json
 from .errors import ConfigurationError
+from .hooks import Hooks
 from .messages import Message, Usage
 from .models.base import Model, ModelSettings
 from .results import RunResult
@@ -232,6 +233,11 @@ class EvalContext:
     """Wall-clock seconds the run took, evaluators excluded."""
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
     """Tool calls the model made in this run, in order."""
+    structured: bool | None = None
+    """Whether the agent has an ``output_type``, so that ``output`` is a validated value even
+    when it is text (a ``Literal`` or ``Enum`` of strings). ``output_type=str`` is the same as
+    no ``output_type``: a plain-text agent. ``None`` when that is not known: a target function
+    returned the `RunResult` itself, and its text output is treated as a plain-text answer."""
 
     @property
     def output(self) -> Any:
@@ -241,8 +247,18 @@ class EvalContext:
 
     @property
     def text(self) -> str:
-        """Text of the last assistant message."""
+        """Text of the last assistant message. With ``output_mode="tool"`` the answer is not
+        in it; use `answer_text`."""
         return self.result.text
+
+    @property
+    def answer_text(self) -> str:
+        """The answer as text: ``output`` when it is text, otherwise `text`.
+
+        A text answer given with the final-answer tool (``output_mode="tool"``), or replaced
+        by an output validator, is in ``output`` only. A structured output is the JSON text the
+        model wrote, its last assistant message."""
+        return self.output if isinstance(self.output, str) else self.text
 
     @property
     def expected(self) -> Any:
@@ -346,7 +362,7 @@ class ExactMatch(Evaluator):
 
 
 class Contains(Evaluator):
-    """The answer text contains a value, or every one of several values.
+    """The answer text (`EvalContext.answer_text`) contains a value, or every one of several.
 
     The score is the fraction of values found; the evaluator passes when all are.
     """
@@ -376,7 +392,8 @@ class Contains(Evaluator):
         needles = [value] if isinstance(value, str) else list(value)
         if not needles or not all(isinstance(item, str) for item in needles):
             return self._verdict(False, "Contains needs text, or a non-empty list of text")
-        haystack = ctx.text if self.case_sensitive else ctx.text.casefold()
+        answer = ctx.answer_text
+        haystack = answer if self.case_sensitive else answer.casefold()
         missing = [
             needle
             for needle in needles
@@ -389,7 +406,7 @@ class Contains(Evaluator):
 
 
 class Regex(Evaluator):
-    """The answer text matches a regular expression."""
+    """The answer text (`EvalContext.answer_text`) matches a regular expression."""
 
     def __init__(
         self, pattern: str, *, flags: int = 0, fullmatch: bool = False, name: str = "regex"
@@ -414,7 +431,7 @@ class Regex(Evaluator):
         self.name = name
 
     def __call__(self, ctx: EvalContext) -> EvaluatorResult:
-        text = ctx.text
+        text = ctx.answer_text
         found = (
             self.pattern.fullmatch(text.strip()) if self.fullmatch else self.pattern.search(text)
         )
@@ -427,8 +444,9 @@ class Regex(Evaluator):
 class JSONSchemaValid(Evaluator):
     """The output is valid against a JSON Schema.
 
-    A structured output is checked as it serialises; a text answer is read as
-    JSON first (bare, fenced, or surrounded by a few words). Needs the
+    A structured output (any ``output_type`` value, text included) is checked
+    as it serialises. A plain-text answer is read as JSON first (bare, fenced,
+    or surrounded by a few words), and text that holds no JSON fails. Needs the
     ``jsonschema`` package.
     """
 
@@ -466,12 +484,10 @@ class JSONSchemaValid(Evaluator):
     def __call__(self, ctx: EvalContext) -> EvaluatorResult:
         if ctx.result.status != "completed":
             return self._verdict(False, f"no output: {_ended(ctx)}")
-        value = ctx.output
-        if isinstance(value, str):
-            try:
-                value = extract_json(ctx.text)
-            except ValueError as error:
-                return self._verdict(False, f"the answer is not JSON: {error}")
+        try:
+            value = _answer_value(ctx)
+        except ValueError as error:
+            return self._verdict(False, f"the answer is not JSON: {error}")
         errors = sorted(
             self._validator.iter_errors(to_jsonable_python(value, fallback=str)),
             key=lambda item: list(item.path),
@@ -488,7 +504,9 @@ class IsInstance(Evaluator):
     """The output is, or validates as, a type: a pydantic model, a dataclass,
     ``list[int]``, a ``Literal``...
 
-    A text answer is read as JSON before it is validated.
+    A structured output (any ``output_type`` value, text included) is validated
+    as it is. A plain-text answer passes ``IsInstance(str)``; for other types it
+    is read as JSON before it is validated, and text that holds no JSON fails.
     """
 
     def __init__(
@@ -508,14 +526,12 @@ class IsInstance(Evaluator):
     def __call__(self, ctx: EvalContext) -> EvaluatorResult:
         if ctx.result.status != "completed":
             return self._verdict(False, f"no output: {_ended(ctx)}")
-        value = ctx.output
-        if isinstance(self.output_type, type) and isinstance(value, self.output_type):
+        if isinstance(self.output_type, type) and isinstance(ctx.output, self.output_type):
             return self._verdict(True)
-        if isinstance(value, str) and self.output_type is not str:
-            try:
-                value = extract_json(ctx.text)
-            except ValueError as error:
-                return self._verdict(False, f"the answer is not JSON: {error}")
+        try:
+            value = _answer_value(ctx)
+        except ValueError as error:
+            return self._verdict(False, f"the answer is not JSON: {error}")
         try:
             self._adapter.validate_python(value, strict=self.strict)
         except ValidationError as error:
@@ -636,7 +652,7 @@ class Custom(Evaluator):
     and 1 (it passes at ``threshold`` or above), or a ``(value, reason)`` tuple
     of either.
 
-        Custom(lambda ctx: len(ctx.text) < 200, name="short")
+        Custom(lambda ctx: len(ctx.answer_text) < 200, name="short")
     """
 
     def __init__(
@@ -685,7 +701,9 @@ class LLMJudge(Evaluator):
     fresh run, and a run that did not complete is not sent to the judge. The run
     passes when the judge says it passed and its score is at least
     ``threshold``; the stricter of the two wins. The judge's usage is recorded
-    on its `EvaluatorResult`, apart from the case's own usage.
+    on its `EvaluatorResult`, apart from the case's own usage, also when the
+    judge fails (it raises, refuses or gives no valid verdict): that grading
+    then fails, with the usage of the requests it made.
     """
 
     def __init__(
@@ -697,9 +715,10 @@ class LLMJudge(Evaluator):
         name: str = "llm_judge",
         include_input: bool = True,
         include_expected: bool = True,
-        output_mode: Literal["native", "prompted"] = "native",
+        output_mode: Literal["native", "prompted", "tool"] = "native",
         settings: ModelSettings | None = None,
         limits: Limits | None = None,
+        hooks: Iterable[Hooks] = (),
     ) -> None:
         """
         Args:
@@ -710,9 +729,11 @@ class LLMJudge(Evaluator):
             include_input: Show the judge the case's prompt.
             include_expected: Show the judge the case's expected value, when it has one.
             output_mode: How the built judge asks for structured output:
-                ``"prompted"`` for models without JSON Schema support.
+                ``"prompted"`` for models without JSON Schema support, ``"tool"`` for
+                a final-answer tool call.
             settings: Model settings of the built judge (``temperature=0`` is a good choice).
             limits: Limits of the built judge.
+            hooks: Hooks of the built judge, for example a tracer.
 
         Raises:
             ConfigurationError: The rubric is empty, the threshold is out of range,
@@ -738,6 +759,7 @@ class LLMJudge(Evaluator):
                 output_mode=output_mode,
                 settings=settings,
                 limits=limits,
+                hooks=list(hooks),
             )
         self.rubric = rubric
         self.threshold = threshold
@@ -763,17 +785,25 @@ class LLMJudge(Evaluator):
         if ctx.result.status != "completed":
             # Grading an answer that was never finished costs a request and proves nothing.
             return self._verdict(False, f"not graded: {_ended(ctx)}")
-        result = await self.agent.run(self.prompt(ctx))
+        stream: RunStream | None = None
+        try:
+            stream = self.agent.stream(self.prompt(ctx))
+            result = await stream.wait()
+        except Exception as error:  # the requests it made before failing were billed
+            logger.debug("The judge raised on case %r", ctx.case.name, exc_info=True)
+            reason = f"the evaluator raised {type(error).__name__}: {_brief(str(error))}"
+            return self._failed(reason, _usage_so_far(stream))
         if result.status != "completed":
             reason = result.stop_reason or result.status
-            return EvaluatorResult(
-                name=self.name,
-                score=0.0,
-                passed=False,
-                reason=f"the judge did not finish ({reason})",
-                usage=result.usage,
-            )
-        verdict = JudgeVerdict.model_validate(to_jsonable_python(result.output, fallback=str))
+            return self._failed(f"the judge did not finish ({reason})", result.usage)
+        if result.output is None:  # a refusal (content_filter) gives no structured output
+            reason = result.stop_reason or "no output"
+            return self._failed(f"the judge gave no verdict ({reason})", result.usage)
+        try:
+            verdict = JudgeVerdict.model_validate(to_jsonable_python(result.output, fallback=str))
+        except ValidationError as error:
+            reason = f"the judge's answer is not a verdict: {_brief(str(error))}"
+            return self._failed(reason, result.usage)
         return EvaluatorResult(
             name=self.name,
             score=verdict.score,
@@ -781,6 +811,9 @@ class LLMJudge(Evaluator):
             reason=verdict.reason,
             usage=result.usage,
         )
+
+    def _failed(self, reason: str, usage: Usage) -> EvaluatorResult:
+        return EvaluatorResult(name=self.name, score=0.0, passed=False, reason=reason, usage=usage)
 
 
 # --- results and reports ----------------------------------------------------------
@@ -798,12 +831,17 @@ class CaseResult(BaseModel):
     when running the case raised."""
     stop_reason: str | None = None
     output_text: str = ""
-    """Text of the last assistant message."""
+    """The answer as text (`EvalContext.answer_text`): the output when it is text (also a
+    final-answer tool's text), otherwise the text of the last assistant message."""
     output: Any = None
-    """The structured output as JSON data, when the agent has an ``output_type``."""
+    """The output as JSON data when the agent has an ``output_type`` (a ``Literal`` or ``Enum``
+    of strings included; ``output_type=str`` is a plain-text agent, whose answer is only in
+    ``output_text``), or when a target function's `RunResult` holds an output that is not
+    text."""
     evaluations: list[EvaluatorResult] = Field(default_factory=list)
     usage: Usage = Field(default_factory=Usage)
-    """The run's own usage; evaluator (judge) usage is in ``judge_usage``."""
+    """The run's own usage, also when it raised: the requests made before the failure count.
+    Evaluator (judge) usage is in ``judge_usage``."""
     latency_s: float = 0.0
     turns: int = 0
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
@@ -860,7 +898,8 @@ class EvalSummary(BaseModel):
     pass_rates: dict[str, float] = Field(default_factory=dict)
     """Fraction of runs each evaluator passed."""
     total_cost_usd: float | None = None
-    """``None`` when no run reported a cost."""
+    """``None`` when no run reported a cost. Costs and tokens include the requests a run made
+    before it raised."""
     mean_cost_usd: float | None = None
     """Over the runs that reported a cost."""
     latency_mean_s: float | None = None
@@ -1113,16 +1152,20 @@ async def _run_case(
     session_id: str | None = None
     result: RunResult | None = None
     error: BaseException | None = None
+    stream: RunStream | None = None
+    structured: bool | None = None
     began = time.perf_counter()
     try:
         produced = await _produce(target, case)
         if isinstance(produced, Agent):
+            structured = produced.output_type is not None
             session = new_session(case, index)
             session_id = session.id
             history, prompt = _split_prompt(case.prompt)
-            result = await produced.run(
+            stream = produced.stream(
                 prompt, history=history, deps=case.deps, session=session, limits=limits
             )
+            result = await stream.wait()
         elif isinstance(produced, RunResult):
             result = produced
         else:
@@ -1151,27 +1194,37 @@ async def _run_case(
                 )
                 for check in checks
             ],
+            usage=_usage_so_far(stream),
             latency_s=latency,
             error=message,
             error_type=type(error).__name__,
             session_id=session_id,
+            run_id=stream.run_id if stream is not None else None,
             metadata=dict(case.metadata),
         )
 
     calls = _tool_calls(result.new_messages)
-    ctx = EvalContext(case=case, result=result, repeat=index, latency_s=latency, tool_calls=calls)
+    ctx = EvalContext(
+        case=case,
+        result=result,
+        repeat=index,
+        latency_s=latency,
+        tool_calls=calls,
+        structured=structured,
+    )
     evaluations = [await _apply(check, ctx) for check in checks]
     completed = result.status == "completed"
     passed = (completed or not require_completed) and all(item.passed for item in evaluations)
-    structured = result.output if not isinstance(result.output, str) else None
+    if structured is None:  # a RunResult from a target function: text is in output_text
+        structured = not isinstance(result.output, str)
     return CaseResult(
         case=case.name,
         repeat=index,
         passed=passed,
         status=result.status,
         stop_reason=result.stop_reason,
-        output_text=result.text,
-        output=to_jsonable_python(structured, fallback=str),
+        output_text=ctx.answer_text,
+        output=to_jsonable_python(result.output, fallback=str) if structured else None,
         evaluations=evaluations,
         usage=result.usage,
         latency_s=latency,
@@ -1327,7 +1380,11 @@ def regressions(baseline: EvalReport, current: EvalReport) -> list[str]:
 
 
 def log_to_mlflow(
-    report: EvalReport, run_name: str | None = None, *, record_content: bool = False
+    report: EvalReport,
+    run_name: str | None = None,
+    *,
+    record_content: bool = False,
+    parent_run_id: str | None = None,
 ) -> str:
     """Record a report as a run in the active MLflow experiment.
 
@@ -1335,18 +1392,29 @@ def log_to_mlflow(
     costs, latency percentiles, tokens), the report's settings and
     ``metadata`` as params, and two artifacts: ``qagents_eval/cases.json``
     (one row per run) and ``qagents_eval/report.md``. When an MLflow run is
-    already active, the report is logged as a nested run inside it, so several
-    reports (one per provider, say) sit side by side.
+    active in the calling thread, or ``parent_run_id`` is given, the report is
+    logged as a nested run inside it, so several reports (one per provider,
+    say) sit side by side.
 
     Output text, structured outputs, tool arguments, error messages and
     evaluator reasons stay out of MLflow unless ``record_content=True``.
-    MLflow's client blocks; from async code, call this through ``asyncio.to_thread``.
+
+    MLflow's client blocks; from async code, call this through
+    ``asyncio.to_thread``. MLflow keeps the active run per thread, so the worker
+    thread does not see yours: pass its id.
+
+        parent = mlflow.active_run()
+        await asyncio.to_thread(
+            log_to_mlflow, report, parent_run_id=parent.info.run_id if parent else None
+        )
 
     Args:
         report: What `evaluate` returned.
         run_name: The MLflow run's name. Defaults to the report's name.
         record_content: Also log content, and the full report as
             ``qagents_eval/report.json``.
+        parent_run_id: Log the report as a nested run of this MLflow run.
+            ``None`` nests it in the calling thread's active run, if any.
 
     Returns:
         The MLflow run id.
@@ -1407,8 +1475,10 @@ def log_to_mlflow(
         params.setdefault(_mlflow_key(str(key)), rendered)
     params = {key: value[:_MLFLOW_PARAM_CHARS] for key, value in params.items()}
 
-    nested = mlflow.active_run() is not None
-    with mlflow.start_run(run_name=run_name or report.name, nested=nested) as run:
+    nesting: dict[str, Any] = {"nested": mlflow.active_run() is not None}
+    if parent_run_id is not None:
+        nesting = {"nested": True, "parent_run_id": parent_run_id}
+    with mlflow.start_run(run_name=run_name or report.name, **nesting) as run:
         mlflow.log_params(params)
         mlflow.log_metrics(metrics)
         mlflow.set_tags({"qagents.evaluation_id": report.id, "qagents.dataset": report.dataset})
@@ -1541,9 +1611,30 @@ def _render_value(value: Any) -> str:
 
 
 def _render_answer(ctx: EvalContext) -> str:
-    if ctx.output is not None and not isinstance(ctx.output, str):
-        return _render_value(ctx.output)
-    return ctx.text
+    # The output, text included: a final-answer tool's text is not in the last message.
+    return _render_value(ctx.output) if ctx.output is not None else ctx.text
+
+
+def _answer_value(ctx: EvalContext) -> Any:
+    """The value a schema or type check looks at.
+
+    A structured output is used as it is, a validated text one (a ``Literal`` or ``Enum`` of
+    strings) included. A plain-text answer, or a text output whose kind is unknown, is read
+    as JSON.
+
+    Raises:
+        ValueError: The text answer holds no JSON. It is never checked as it is: a schema
+            without ``type`` would accept any text.
+    """
+    value = ctx.output
+    if isinstance(value, str) and not ctx.structured:
+        return extract_json(value)
+    return value
+
+
+def _usage_so_far(stream: RunStream | None) -> Usage:
+    """The usage of a run that raised: the requests made before the failure were billed."""
+    return stream._run.usage if stream is not None else Usage()
 
 
 def _preview(value: Any, limit: int = 200) -> str:

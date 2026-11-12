@@ -20,7 +20,8 @@ descriptions. The few strings it adds are in `qagents.prompts`. There are no def
 no hidden system prompts and no prompt templating language.
 
 **Control lives in code, outside the model.** Permissions are deterministic rules evaluated in a
-fixed order, the more restrictive rule wins, and any failure while deciding refuses the call.
+fixed order: the first rule that answers decides, `deny` is checked first and always wins, and
+any failure while deciding refuses the call.
 Hooks that raise stop the run. Published prompt-injection defences that rely on detection have
 all been bypassed; rules and least privilege are what holds.
 
@@ -66,7 +67,8 @@ Not guaranteed:
 
 - **Exactly-once side effects.** Delivery is at-least-once. Use `ctx.operation_id` with the
   system your tool calls.
-- **Liveness.** Nothing detects a dead run and resumes it for you in 0.1.
+- **Liveness.** Nothing detects a dead run and resumes it for you unless you run
+  `AgentRuntime`, whose `recover()` resumes runs whose worker's lease expired.
 - **Cost accuracy.** `cost_usd` is computed from catalog prices and reported tokens.
 - **Model behaviour.** Whether a model calls tools reliably or honours a JSON schema depends on
   the model and how it is served. Measure it on the models you use.
@@ -89,7 +91,7 @@ Not verified yet:
   only been run with `--dry-run`.
 - Tool-calling and structured-output reliability of specific catalog models.
 - Python 3.11 and 3.12, Linux and macOS. The suite ran on Python 3.13 on Windows, where the
-  `file_tools` symlink test is skipped.
+  POSIX file-symlink test of `file_tools` is skipped (the junction tests run).
 - Behaviour under load and with long journals.
 
 ## Deliberately left out

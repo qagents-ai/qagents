@@ -18,7 +18,11 @@ Four names come from optional extras and are resolved on first access, so
 packages: ``AnthropicModel`` (``qagents[anthropic]``), ``MCPToolkit``
 (``qagents[mcp]``), ``MLflowHooks`` (``qagents[mlflow]``) and
 ``PostgresStore`` (``qagents[postgres]``). They are not in ``__all__``, so
-``from qagents import *`` does not need the extras either. The submodules
+``from qagents import *`` does not need the extras either. ``MCPToolkit``
+needs its SDK to be imported at all: without it, ``qagents.MCPToolkit`` raises
+an ``AttributeError`` that says which extra to install (so ``hasattr``,
+``help(qagents)`` and ``inspect`` keep working), and ``dir(qagents)`` leaves
+it out. The submodules
 ``qagents.evals``, ``qagents.tracing``, ``qagents.integrations`` and
 ``qagents.cli`` are imported only when you import them.
 """
@@ -26,6 +30,8 @@ packages: ``AnthropicModel`` (``qagents[anthropic]``), ``MCPToolkit``
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import sys
 from typing import TYPE_CHECKING, Any
 
 from . import prompts
@@ -37,6 +43,7 @@ from .errors import (
     DeferToolCall,
     GuardrailTripped,
     LeaseError,
+    MaxDepthExceeded,
     ModelError,
     ModelRetry,
     OutputValidationError,
@@ -79,7 +86,7 @@ from .session import (
     SessionStore,
     SQLiteStore,
 )
-from .tools import RunContext, Tool, Toolkit, tool
+from .tools import RunContext, Tool, Toolkit, ToolTimeout, tool
 from .workflow import Workflow, WorkflowStatus
 
 if TYPE_CHECKING:
@@ -99,18 +106,30 @@ _LAZY = {
 }
 """Names from optional extras, resolved on first access."""
 
+_NEEDS = {"MCPToolkit": ("mcp", "mcp_types")}
+"""Lazy names whose module cannot be imported without these packages."""
+
+
+def _installed(name: str) -> bool:
+    return all(importlib.util.find_spec(package) is not None for package in _NEEDS.get(name, ()))
+
 
 def __getattr__(name: str) -> Any:
     module = _LAZY.get(name)
     if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(importlib.import_module(module), name)
+    try:
+        imported = importlib.import_module(module)
+    except ImportError as error:
+        # AttributeError, so hasattr(), help() and inspect treat the name as absent.
+        raise AttributeError(str(error), name=name, obj=sys.modules[__name__]) from error
+    value = getattr(imported, name)
     globals()[name] = value
     return value
 
 
 def __dir__() -> list[str]:
-    return sorted({*globals(), *_LAZY})
+    return sorted({*globals(), *(name for name in _LAZY if _installed(name))})
 
 
 __all__ = [
@@ -131,6 +150,7 @@ __all__ = [
     "InputResult",
     "LeaseError",
     "Limits",
+    "MaxDepthExceeded",
     "Message",
     "Model",
     "ModelError",
@@ -163,6 +183,7 @@ __all__ = [
     "ToolError",
     "ToolResultClearing",
     "ToolResultPart",
+    "ToolTimeout",
     "Toolkit",
     "TrippedGuardrail",
     "Usage",

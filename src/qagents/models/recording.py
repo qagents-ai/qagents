@@ -33,8 +33,13 @@ Responses are looked up by the request's fingerprint (see `request_fingerprint`)
 so a cassette keeps working when unrelated requests are added or reordered, and
 fails loudly when the conversation, the tools, the settings or the output schema
 change. The cassette holds what the model received and answered as qagents sees
-it; it never sees HTTP headers or API keys, and secret-looking keys in
-``ModelSettings.extra`` are stored as ``"<redacted>"``.
+it; it never sees HTTP headers or the keys given to a provider adapter
+(``api_key=``, ``headers=``), which is where credentials belong.
+
+Values in ``ModelSettings.extra`` are stored as ``"<redacted>"`` when their key
+looks secret (see `is_secret_setting_key`) or the value itself looks like a
+credential. That is a best-effort guess from names: pass ``redact_keys=`` for
+the names your deployment uses, and read a new cassette before committing it.
 
 Requests that fail are not recorded: a replay of a run that needed a retry
 answers on the first attempt.
@@ -52,7 +57,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -83,17 +88,31 @@ CASSETTE_VERSION = 1
 """Version of the cassette layout written by this module. Older versions are read."""
 
 CASSETTE_MODE_ENV = "QAGENTS_CASSETTE_MODE"
-"""Environment variable that overrides ``cassette(..., mode="auto")``.
+"""Environment variable read by `cassette`.
 
-Set it to ``replay`` in CI so that a missing cassette fails instead of making a
-paid request, or to ``record`` to record every cassette again."""
+Set it to ``replay`` in CI so that no cassette is recorded: a missing cassette
+fails instead of making a paid request, and ``mode="record"`` is refused. Set it
+to ``record`` to record every ``mode="auto"`` cassette again. `RecordingModel`
+and `ReplayModel` do not read it."""
 
 SECRET_SETTING_KEYS = re.compile(
-    r"(?i)(^|[-_])(api[-_]?key|apikey|authorization|auth|password|passwd|secret|token"
-    r"|access[-_]?token|bearer|cookie|headers?)$"
+    r"(^|_)(secrets?|password|passwd|passphrase|pwd|credentials?|token|auth|authorization"
+    r"|authentication|bearer|cookies?|signature|private|apikey|headers?|keys?)(_|$)"
 )
-"""Keys of ``ModelSettings.extra`` (at any depth) whose values are never written to a
-cassette. They are replaced by `REDACTED` before the request is fingerprinted."""
+"""Matched against a key of ``ModelSettings.extra`` (at any depth) in snake_case
+(``clientSecret`` as ``client_secret``): any of these words marks it as secret,
+so ``key``, ``secret_key``, ``authToken`` and ``aws_secret_access_key`` all do.
+Its value is replaced by `REDACTED` before the request is fingerprinted, so a
+changed secret does not change the fingerprint. Over-redacting is the safe side;
+`PUBLIC_SETTING_KEYS` lists the exceptions."""
+
+PUBLIC_SETTING_KEYS = frozenset({"prompt_cache_key", "cache_key", "idempotency_key"})
+"""Keys that `SECRET_SETTING_KEYS` would match but that are documented request
+fields, not secrets. They stay readable and part of the fingerprint."""
+
+SECRET_VALUE = re.compile(r'^(?:sk-|AKIA|-----BEGIN|[Bb]earer\s)|"private_key"')
+"""String values in ``ModelSettings.extra`` redacted whatever their key: API keys,
+AWS key ids, PEM blocks, bearer tokens and service-account JSON."""
 
 REDACTED = "<redacted>"
 """What a cassette stores instead of a secret-looking value."""
@@ -110,7 +129,7 @@ _EventAdapter: TypeAdapter[TextDelta | ReasoningDelta | ToolCallDelta] = TypeAda
 _EVENT_TYPES = frozenset({"text_delta", "reasoning_delta", "tool_call_delta"})
 
 
-def request_fingerprint(request: ModelRequest) -> str:
+def request_fingerprint(request: ModelRequest, *, redact_keys: Iterable[str] = ()) -> str:
     """The key a cassette stores a response under.
 
     It is the SHA-256 of the canonical JSON (sorted keys, no whitespace) of the
@@ -121,16 +140,34 @@ def request_fingerprint(request: ModelRequest) -> str:
       provider receives it;
     * fields whose value is ``None`` are left out, so a new optional field in a
       later qagents version does not change fingerprints;
-    * secret-looking keys in ``settings.extra`` (see `SECRET_SETTING_KEYS`)
-      are replaced by `REDACTED`.
+    * secret-looking values in ``settings.extra`` (see `is_secret_setting_key`
+      and `SECRET_VALUE`) are replaced by `REDACTED`.
 
     Args:
         request: The request the agent is about to send.
+        redact_keys: More keys of ``settings.extra`` to redact, as in `cassette`.
 
     Returns:
         A 64-character hex digest.
     """
-    return _digest(_canonical(request))
+    return _digest(_canonical(request, _names(redact_keys)))
+
+
+def is_secret_setting_key(key: str, redact_keys: Iterable[str] = ()) -> bool:
+    """Whether the value under ``key`` in ``ModelSettings.extra`` is kept out of cassettes.
+
+    Args:
+        key: A key at any depth of ``ModelSettings.extra``.
+        redact_keys: More keys to treat as secret, compared in snake_case.
+
+    Returns:
+        ``True`` when `SECRET_SETTING_KEYS` matches the key in snake_case and it
+        is not in `PUBLIC_SETTING_KEYS`, or when it is one of ``redact_keys``.
+    """
+    name = _snake(key)
+    if name in _names(redact_keys):
+        return True
+    return name not in PUBLIC_SETTING_KEYS and SECRET_SETTING_KEYS.search(name) is not None
 
 
 class RecordingModel(Model):
@@ -145,16 +182,27 @@ class RecordingModel(Model):
     Args:
         inner: The real model. ``"provider:model-id"`` strings are resolved.
         path: The cassette file. Missing parent directories are created.
-        overwrite: Delete an existing cassette now and start a new one.
-            Without it, new interactions are appended to the existing file.
+        overwrite: Start a new cassette. The file found now is replaced when
+            this model records its first response, so a run that fails before
+            that leaves it in place. If the file has changed by then (another
+            model on the same path wrote first), this model appends to it
+            instead. Without it, new interactions are appended.
+        redact_keys: More keys of ``ModelSettings.extra`` whose values are
+            never written (see `is_secret_setting_key`). Pass the same names
+            to the `ReplayModel`, since they are left out of the fingerprint.
 
     Raises:
-        ConfigurationError: ``path`` exists but is not a cassette this version
-            can read.
+        ConfigurationError: ``path`` exists but is not a cassette (with
+            ``overwrite``), or not one this version can read (without it).
     """
 
     def __init__(
-        self, inner: Model | str, path: str | os.PathLike[str], *, overwrite: bool = False
+        self,
+        inner: Model | str,
+        path: str | os.PathLike[str],
+        *,
+        overwrite: bool = False,
+        redact_keys: Iterable[str] = (),
     ) -> None:
         self.inner = resolve_model(inner)
         """The model that answers."""
@@ -163,15 +211,19 @@ class RecordingModel(Model):
         self.name = self.inner.name
         self.provider = self.inner.provider
         self._lock = _file_lock(self.path)
+        self._redact = _names(redact_keys)
         self._capabilities: dict[str, Any] | None = None
+        self._replace = overwrite  # this model's first write replaces the cassette it found
+        self._found: tuple[int, int, int] | None = None
         with self._lock:
             if overwrite:
-                self.path.unlink(missing_ok=True)
+                _refuse_foreign(self.path)  # never replace a file that is not a cassette
+                self._found = _identity(self.path)
             else:
                 _read(self.path)  # an unreadable file fails now, not after a paid request
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        canonical = _canonical(request)
+        canonical = _canonical(request, self._redact)
         events: list[dict[str, Any]] = []
         async with contextlib.aclosing(self.inner.stream(request)) as source:
             async for event in source:
@@ -198,8 +250,9 @@ class RecordingModel(Model):
         if dumped != self._capabilities:
             self._capabilities = dumped
             with self._lock:
-                data = _read(self.path)
-                if data is not None:  # otherwise they are written with the first response
+                # A cassette about to be replaced, or none yet: written with the first response.
+                data = None if self._replaces_now() else _read(self.path)
+                if data is not None:
                     data["capabilities"] = dumped
                     _write(self.path, data)
         return capabilities
@@ -210,9 +263,17 @@ class RecordingModel(Model):
     async def aclose(self) -> None:
         await self.inner.aclose()
 
+    def _replaces_now(self) -> bool:
+        """Whether the next write starts a new cassette: ``overwrite``, nothing
+        written by this model yet, and the file is still the one it found (a
+        model sharing the path may have started the new cassette already)."""
+        return self._replace and _identity(self.path) == self._found
+
     def _save(self, interaction: dict[str, Any]) -> None:
         with self._lock:
-            data = _read(self.path) or {
+            data = None if self._replaces_now() else _read(self.path)
+            self._replace = False
+            data = data or {
                 "format": CASSETTE_FORMAT,
                 "version": CASSETTE_VERSION,
                 "model": self.inner.name,
@@ -255,17 +316,25 @@ class ReplayModel(Model):
             ``False``, serve the earliest recording not served yet instead,
             and log a warning; use it while a request changes on purpose
             between runs (a timestamp in the instructions, for example).
+        redact_keys: The ``redact_keys`` the cassette was recorded with.
 
     Raises:
         ConfigurationError: The file does not exist or is not a cassette this
             version can read.
     """
 
-    def __init__(self, path: str | os.PathLike[str], *, strict: bool = True) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        strict: bool = True,
+        redact_keys: Iterable[str] = (),
+    ) -> None:
         self.path = Path(path)
         """The cassette file."""
         self.strict = strict
         """Whether a request without a matching recording fails."""
+        self._redact = _names(redact_keys)
         self.requests: list[ModelRequest] = []
         """Every request received, in order."""
         data = _read(self.path)
@@ -308,7 +377,7 @@ class ReplayModel(Model):
         return self._capabilities.model_copy()
 
     def _take(self, request: ModelRequest) -> _Recorded:
-        canonical = _canonical(request)
+        canonical = _canonical(request, self._redact)
         fingerprint = _digest(canonical)
         queue = self._by_fingerprint.get(fingerprint)
         while queue:
@@ -377,6 +446,7 @@ def cassette(
     mode: CassetteMode = "auto",
     *,
     strict: bool = True,
+    redact_keys: Iterable[str] = (),
 ) -> Model:
     """Record ``inner`` to ``path``, or replay ``path`` without calling ``inner``.
 
@@ -388,38 +458,47 @@ def cassette(
         path: The cassette file.
         mode: ``"auto"`` replays when the file exists and records otherwise;
             the `CASSETTE_MODE_ENV` environment variable overrides it.
-            ``"record"`` deletes an existing cassette and records a new one.
-            ``"replay"`` only replays.
+            ``"record"`` records a new cassette, which replaces the existing
+            one when its first response is recorded. ``"replay"`` only replays.
         strict: Passed to `ReplayModel`.
+        redact_keys: More keys of ``ModelSettings.extra`` whose values are
+            never written to the cassette (see `is_secret_setting_key`).
 
     Returns:
         A `ReplayModel` or a `RecordingModel`.
 
     Raises:
-        ConfigurationError: The mode is unknown, or recording was chosen
-            without a model.
+        ConfigurationError: The mode is unknown, recording was chosen without a
+            model, or ``mode="record"`` while `CASSETTE_MODE_ENV` is ``replay``.
     """
     chosen = _checked_mode(mode, "mode")
-    if chosen == "auto":
-        override = os.environ.get(CASSETTE_MODE_ENV, "").strip().lower()
-        if override:
-            chosen = _checked_mode(override, CASSETTE_MODE_ENV)
+    override = os.environ.get(CASSETTE_MODE_ENV, "").strip().lower()
+    if override:
+        forced = _checked_mode(override, CASSETTE_MODE_ENV)
+        if chosen == "auto":
+            chosen = forced
+        elif chosen == "record" and forced == "replay":
+            raise ConfigurationError(
+                f"{CASSETTE_MODE_ENV}=replay forbids recording, and cassette(model, "
+                f"{str(path)!r}, mode='record') would send real, possibly paid, requests. "
+                f"Unset {CASSETTE_MODE_ENV} to record the cassette again."
+            )
     if chosen == "auto":
         chosen = "replay" if Path(path).exists() else "record"
     if chosen == "replay":
-        return ReplayModel(path, strict=strict)
+        return ReplayModel(path, strict=strict, redact_keys=redact_keys)
     if inner is None:
         raise ConfigurationError(
             f"The cassette {path} has to be recorded, which needs the real model: "
             "cassette(model, path). To only replay, record the cassette first."
         )
-    return RecordingModel(inner, path, overwrite=True)
+    return RecordingModel(inner, path, overwrite=True, redact_keys=redact_keys)
 
 
 # -- request canonical form ------------------------------------------------------------
 
 
-def _canonical(request: ModelRequest) -> dict[str, Any]:
+def _canonical(request: ModelRequest, redact_keys: frozenset[str] = frozenset()) -> dict[str, Any]:
     data = request.model_dump(mode="json")
     messages = []
     for message in data["messages"]:
@@ -433,7 +512,7 @@ def _canonical(request: ModelRequest) -> dict[str, Any]:
         messages.append(_without_none(message))
     settings = _without_none(data["settings"])
     if settings.get("extra"):
-        settings["extra"] = _redacted(settings["extra"])
+        settings["extra"] = _redacted(settings["extra"], redact_keys)
     canonical: dict[str, Any] = {
         "messages": messages,
         "tools": [_without_none(spec) for spec in data["tools"]],
@@ -448,15 +527,34 @@ def _without_none(fields: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in fields.items() if value is not None}
 
 
-def _redacted(value: Any) -> Any:
+def _redacted(value: Any, redact_keys: frozenset[str]) -> Any:
     if isinstance(value, dict):
         return {
-            key: REDACTED if SECRET_SETTING_KEYS.search(str(key)) else _redacted(item)
+            key: REDACTED
+            if is_secret_setting_key(str(key), redact_keys)
+            else _redacted(item, redact_keys)
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_redacted(item) for item in value]
+        return [_redacted(item, redact_keys) for item in value]
+    if isinstance(value, str) and SECRET_VALUE.search(value):
+        return REDACTED
     return value
+
+
+_WORDS = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[^A-Za-z]|$)|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def _snake(key: str) -> str:
+    """``key`` as lower-case words joined by ``_``: ``Ocp-Apim-Subscription-Key`` is
+    ``ocp_apim_subscription_key`` and ``clientSecret`` is ``client_secret``."""
+    return "_".join(word.lower() for word in _WORDS.findall(key))
+
+
+def _names(keys: Iterable[str]) -> frozenset[str]:
+    if isinstance(keys, str):
+        keys = (keys,)
+    return frozenset(_snake(key) for key in keys)
 
 
 def _compact(value: Any) -> str:
@@ -574,11 +672,39 @@ _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
 
 
+def _identity(path: Path) -> tuple[int, int, int] | None:
+    """What tells this file apart from the next version `_write` puts in its place."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _lock_key(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
 def _file_lock(path: Path) -> threading.Lock:
     """One lock per cassette file in this process, shared by every model using it."""
-    key = os.path.normcase(str(path.resolve()))
+    key = _lock_key(path)
     with _LOCKS_GUARD:
         return _LOCKS.setdefault(key, threading.Lock())
+
+
+def _refuse_foreign(path: Path) -> None:
+    """Raise unless ``path`` is missing or marked as a cassette. Its content is not checked."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        data = None
+    if not isinstance(data, dict) or data.get("format") != CASSETTE_FORMAT:
+        raise ConfigurationError(
+            f"{path} is not a qagents cassette (its 'format' is not {CASSETTE_FORMAT!r}), so it "
+            "is not replaced. Point the model at a different file, or delete this one."
+        )
 
 
 def _read(path: Path) -> dict[str, Any] | None:

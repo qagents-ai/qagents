@@ -9,12 +9,18 @@ not exist: ``entries`` (one row per journal entry, ``data`` as ``jsonb``,
 primary key ``(session_id, seq)``) and ``sessions`` (run status and lease per
 session), in their own schema, ``qagents`` by default.
 
+Privileges: creating the schema needs ``CREATE`` on the database (or an
+existing schema owned by the role). Once it exists at this version, a role
+needs only ``USAGE`` on the schema and ``SELECT, INSERT, UPDATE, DELETE`` on
+``entries``, ``sessions`` and ``schema_version``: the store then runs no DDL.
+
 What it guarantees:
 
 - `append` is one transaction that locks the session's ``sessions`` row, so
   concurrent writers to one session are serialised: entries keep their
   order and ``seq`` is gap-free per session. The run status is updated in
-  the same transaction.
+  the same transaction. `delete` takes the same lock first, so an append in
+  flight is either deleted with the rest or starts a new session after it.
 - `append_leased` checks the lease under that same row lock, so a worker
   whose lease was taken over cannot write any more.
 - Leases and ``updated_at`` use the database server's clock
@@ -22,10 +28,18 @@ What it guarantees:
   `SessionStatus.lease_expires_at` is in that clock too. ``Entry.ts`` is
   still set by the process that created the entry.
 
-Two properties of ``jsonb`` to know about: it does not keep the order of
-object keys (a loaded entry compares equal, but its keys may come back in
-another order), and it cannot store the NUL character (``\\u0000``); an
-entry that contains one is refused with a `SessionError` that says so.
+Properties of ``jsonb`` to know about:
+
+- It does not keep the order of object keys: a loaded entry compares equal,
+  but its keys may come back in another order.
+- It keeps numbers as decimals, so a float with no fractional part comes
+  back as an int (``2e16`` as ``20000000000000000``, ``15.0`` as ``15``) and
+  ``-0.0`` as ``0``. They compare equal in Python, and approval tokens sign
+  numbers in a form (RFC 8785) that does not change, but code that checks a
+  stored value's type sees the difference.
+- It cannot store the NUL character (``\\u0000``), a lone surrogate (half
+  of an emoji pair, ``\\ud83d``), NaN or an infinity. An entry that holds one
+  is refused with a `SessionError` that says which, and nothing is written.
 
 On Windows, psycopg's async mode needs a selector event loop instead of
 asyncio's default proactor loop:
@@ -85,8 +99,9 @@ class PostgresStore(SessionStore):
             own defaults and ``PG*`` variables apply.
         pool_size: Most connections the pool opens. Each `append` holds one
             for the length of its transaction.
-        schema: Schema for the tables; created when missing. Use different
-            schemas to keep separate applications apart in one database.
+        schema: Schema for the tables; created when missing (see the
+            privileges above). Use different schemas to keep separate
+            applications apart in one database.
         connect_timeout_s: Seconds to wait for the first connection before
             failing with a `SessionError`.
 
@@ -168,6 +183,42 @@ class PostgresStore(SessionStore):
         return pool
 
     async def _create_schema(self, connection: AsyncConnection[Any]) -> None:
+        if await self._schema_version(connection) == SCHEMA_VERSION:
+            return  # nothing to create: a role without CREATE privileges can use it
+        import psycopg
+
+        try:
+            await self._create_tables(connection)
+        except psycopg.errors.InsufficientPrivilege as error:
+            raise SessionError(
+                f"The PostgreSQL schema {self.schema!r} does not exist at version "
+                f"{SCHEMA_VERSION}, and this role may not create it ({error}). Create it once "
+                "with a role that has CREATE on the database (open a PostgresStore with that "
+                "role). Roles that only run agents need USAGE on the schema and SELECT, "
+                "INSERT, UPDATE, DELETE on its tables entries, sessions and schema_version."
+            ) from error
+
+    async def _schema_version(self, connection: AsyncConnection[Any]) -> int | None:
+        """The version in ``schema_version``, read without DDL; None when there is none."""
+        cursor = await connection.execute("SELECT to_regclass(%s)", (f"{self._q}.schema_version",))
+        found = await cursor.fetchone()
+        if found is None or found[0] is None:
+            return None
+        cursor = await connection.execute(f"SELECT max(version) FROM {self._q}.schema_version")
+        row = await cursor.fetchone()
+        version = row[0] if row is not None else None
+        self._check_version(version)
+        return version
+
+    def _check_version(self, version: int | None) -> None:
+        if version is not None and version > SCHEMA_VERSION:
+            raise SessionError(
+                f"The PostgreSQL schema {self.schema!r} was created by a newer qagents "
+                f"(schema version {version}; this version reads up to {SCHEMA_VERSION}). "
+                "Upgrade qagents."
+            )
+
+    async def _create_tables(self, connection: AsyncConnection[Any]) -> None:
         q = self._q
         async with connection.transaction():
             # Workers starting together must not race on CREATE TABLE.
@@ -181,12 +232,7 @@ class PostgresStore(SessionStore):
             cursor = await connection.execute(f"SELECT max(version) FROM {q}.schema_version")
             row = await cursor.fetchone()
             version = row[0] if row is not None else None
-            if version is not None and version > SCHEMA_VERSION:
-                raise SessionError(
-                    f"The PostgreSQL schema {self.schema!r} was created by a newer qagents "
-                    f"(schema version {version}; this version reads up to {SCHEMA_VERSION}). "
-                    "Upgrade qagents."
-                )
+            self._check_version(version)  # again, under the lock
             if version is not None:
                 return
             await connection.execute(
@@ -229,24 +275,22 @@ class PostgresStore(SessionStore):
             return
         import psycopg
 
-        documents = [json.dumps(entry.data, ensure_ascii=False) for entry in entries]
+        documents = [_document(session_id, entry) for entry in entries]
         q = self._q
         pool = await self._ready()
         async with pool.connection() as connection:
             try:
                 async with connection.transaction():
-                    await connection.execute(
-                        f"INSERT INTO {q}.sessions (session_id) VALUES (%s)"
-                        " ON CONFLICT (session_id) DO NOTHING",
-                        (session_id,),
-                    )
+                    # One statement creates or locks the row and reads it, so a delete that
+                    # commits in between cannot leave it missing (the row is then new).
                     cursor = await connection.execute(
-                        "SELECT status, open_run_id, agent, failures, last_seq, lease_owner"
-                        f" FROM {q}.sessions WHERE session_id = %s FOR UPDATE",
+                        f"INSERT INTO {q}.sessions (session_id) VALUES (%s)"
+                        " ON CONFLICT (session_id) DO UPDATE SET session_id = excluded.session_id"
+                        " RETURNING status, open_run_id, agent, failures, last_seq, lease_owner",
                         (session_id,),
                     )
                     found = await cursor.fetchone()
-                    assert found is not None  # inserted above, and rows are never deleted here
+                    assert found is not None  # an upsert with RETURNING always returns the row
                     if owner is not None and found[5] != owner:
                         raise LeaseError(_lease_lost(session_id, owner, found[5]))
                     status = SessionStatus(
@@ -317,11 +361,13 @@ class PostgresStore(SessionStore):
     async def delete(self, session_id: str) -> None:
         pool = await self._ready()
         async with pool.connection() as connection, connection.transaction():
-            await connection.execute(
-                f"DELETE FROM {self._q}.entries WHERE session_id = %s", (session_id,)
-            )
+            # The sessions row first: it waits for an append in flight (which holds its
+            # lock), and the entries delete that follows then sees what that append wrote.
             await connection.execute(
                 f"DELETE FROM {self._q}.sessions WHERE session_id = %s", (session_id,)
+            )
+            await connection.execute(
+                f"DELETE FROM {self._q}.entries WHERE session_id = %s", (session_id,)
             )
 
     # -- run status ------------------------------------------------------------------
@@ -401,6 +447,28 @@ class PostgresStore(SessionStore):
                 " WHERE session_id = %s AND lease_owner = %s",
                 (session_id, owner),
             )
+
+
+def _document(session_id: str, entry: Entry) -> str:
+    """The ``jsonb`` text of an entry's data; refuses what ``jsonb`` cannot hold."""
+    try:
+        text = json.dumps(entry.data, ensure_ascii=False, allow_nan=False)
+    except ValueError as error:
+        raise SessionError(
+            f"PostgreSQL jsonb cannot store NaN or an infinity, which appears in a "
+            f"{entry.kind} entry of session {session_id!r} ({error}). Nothing was written. "
+            "Store such a value as None or as a string."
+        ) from error
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise SessionError(
+            f"PostgreSQL jsonb cannot store a lone surrogate (half of a UTF-16 pair, such as "
+            f"an emoji cut in two), which appears in a {entry.kind} entry of session "
+            f"{session_id!r}. Nothing was written. Repair the text first, for example with "
+            "text.encode('utf-16', 'surrogatepass').decode('utf-16', 'replace')."
+        ) from error
+    return text
 
 
 def _check_event_loop() -> None:

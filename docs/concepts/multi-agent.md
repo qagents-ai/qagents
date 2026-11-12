@@ -37,9 +37,14 @@ result = await lead.run("How fast did solar grow in 2025?")
 `agent.as_tool(name=..., description=..., read_only=True)` gives you the tool explicitly, for
 example to let several read-only sub-agents run in parallel.
 
-!!! note "Not in 0.1"
+!!! note "Limits and approvals of sub-agents"
     A sub-agent cannot pause the caller for approval. Give sub-agents permission rules that
-    decide immediately, or an `on_ask` handler. Limits are per agent and are not inherited.
+    decide immediately, or an `on_ask` handler; a child whose permissions have none uses the
+    caller's `on_ask`, and the caller's hooks with `propagate = True` run in it too. A child's
+    token, cost and time budgets are capped at what remains of the caller's, and children that
+    run at once share it live. Runs nest at most `Limits.max_depth` levels (5 by default, the
+    lowest value along the chain applies); a deeper child is not started, and the caller's
+    model gets `prompts.SUBAGENT_TOO_DEEP`.
 
 ## Handoffs
 

@@ -44,7 +44,13 @@ from .fallback import FallbackModel
 from .openai_chat import OpenAIChatModel
 from .qcloud import QCloudModel
 from .ratelimit import RateLimitedModel
-from .recording import RecordingModel, ReplayModel, cassette, request_fingerprint
+from .recording import (
+    RecordingModel,
+    ReplayModel,
+    cassette,
+    is_secret_setting_key,
+    request_fingerprint,
+)
 
 if TYPE_CHECKING:
     # Re-exports for type checkers; at run time __getattr__ resolves them.
@@ -102,6 +108,7 @@ __all__ = [
     "ToolCallDelta",
     "ToolSpec",
     "cassette",
+    "is_secret_setting_key",
     "register_provider",
     "request_fingerprint",
     "resolve_model",

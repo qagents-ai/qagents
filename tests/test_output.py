@@ -240,7 +240,8 @@ async def test_model_retry_in_a_validator_sends_the_message_back_in_every_mode()
     model = ScriptedModel(['{"number": "A", "total": 0}', '{"number": "A", "total": 5}'])
     agent = Agent(model, output_type=Invoice, output_validators=[total_must_be_positive])
     assert (await agent.run("go")).output.total == 5
-    assert model.requests[1].messages[-1].text == prompts.OUTPUT_RETRY.format(
+    # A validator's rejection lets the model call tools before it answers again.
+    assert model.requests[1].messages[-1].text == prompts.OUTPUT_VALIDATOR_RETRY.format(
         error="The total must be positive; read it again."
     )
 

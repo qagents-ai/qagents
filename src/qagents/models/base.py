@@ -74,6 +74,11 @@ class ModelResponse(BaseModel):
     provider: str | None = None
     response_id: str | None = None
     """The provider's id for this response, for support requests and logs."""
+    context_tokens: int | None = None
+    """Prompt plus output tokens of the last request the provider ran for this response:
+    the size of the conversation now. Set when ``usage`` sums several requests (continued
+    or server-compacted turns, fallback attempts), so it is not their total; ``None`` means
+    the input plus output of ``usage`` is that size."""
 
 
 class ModelCapabilities(BaseModel):

@@ -18,7 +18,7 @@ result = agent.run_sync("What is the weather in Athens?")
 print(result.output)
 ```
 
-**Status: 0.1.0, alpha.** The test suite runs without network access, including the QCloud
+**Status: 0.2.0, alpha.** The test suite runs without network access, including the QCloud
 provider driven through the real `qcloud_ai` SDK against a local transport. No request has been
 made against the live QCloud API yet; see [What is verified](#what-is-verified).
 
@@ -66,7 +66,7 @@ capability.
 | Your code inside the loop | subclass `Hooks` |
 | Several agents | `tools=[other_agent]` (sub-agent) or `handoffs=[other_agent]` |
 | A multi-step job that resumes | `Workflow(store, id=...)` with `step` and `run_agent` |
-| Traces | `hooks=[OTelHooks()]` |
+| Traces | `hooks=[OTelHooks()]`, with `from qagents.tracing import OTelHooks` |
 | Tests without a model | `ScriptedModel([...])` |
 
 ## How it works
@@ -136,8 +136,8 @@ Ready-made tools: `file_tools(root, writable=False)`, `shell_tool(cwd)`, `web_to
 ## Permissions and approvals
 
 Decisions are made by code, outside the model, in a fixed order: `deny` rules, your
-`can_use_tool` function, `ask` rules, `allow` rules, then the mode default. The more restrictive
-rule wins, and an exception while deciding refuses the call.
+`can_use_tool` function, `ask` rules, `allow` rules, then the mode default. The first rule that
+answers decides (a deny always wins), and an exception while deciding refuses the call.
 
 ```python
 Permissions(mode="default", allow=["read_*"], ask=["send_*"], deny=["delete_*"])
@@ -173,8 +173,9 @@ What the journal guarantees, stated plainly:
   result, so the conversation stays valid for the provider.
 - Delivery is at-least-once, like every agent framework. Use `ctx.operation_id` for side effects.
 
-`agent.resume` continues a run; nothing calls it for you. Detecting dead runs across replicas
-(leases, heartbeats) is on the roadmap, not in 0.1.
+`agent.resume` continues a run; nothing calls it for you, unless you run `AgentRuntime`: it
+holds a lease on each session it drives (renewed by a heartbeat, on `SQLiteStore` or
+`PostgresStore`), and its `recover()` resumes runs whose worker died.
 
 ## Streaming, cancel and voice
 
@@ -275,21 +276,21 @@ Examples are executed and documentation code blocks are compiled by `tests/test_
 Not verified yet: a request against the live QCloud API (`examples/live_acceptance.py` exists for
 this and has only been run with `--dry-run`; `examples/quickstart.py` has not been run),
 tool-calling reliability of specific catalog models, Python 3.11 and 3.12, Linux and macOS (the
-suite ran on Python 3.13 on Windows, where the `file_tools` symlink test is skipped, so that test
-has never run), and behaviour under load.
+suite ran on Python 3.13 on Windows, where the POSIX file-symlink test of `file_tools` is
+skipped, so that test has never run; the junction tests do run), and behaviour under load.
 
 ## Roadmap
+
+Shipped in 0.2 (see the [changelog](CHANGELOG.md)): `PostgresStore` and `AgentRuntime` with
+leases and recovery, the MCP client toolkit, signed approval tokens, the final-answer tool as a
+third structured-output mode, budgets and depth inherited by sub-agents, and the Anthropic and
+AG-UI adapters.
 
 Next, in this order:
 
 1. Live acceptance on QCloud: one paid tool loop with usage and cost reconciled, and a small
    tool-calling eval per model you plan to use.
-2. `PostgresStore` with leases and a recovery worker that finds and resumes dead runs.
-3. MCP client toolkit (spec revision 2026-07-28, with fallback to 2025-11-25) and deferred tool
-   loading for large tool sets.
-4. Signed approval tokens, so a stored pause cannot be forged.
-5. A final-answer tool as a third structured-output mode, and budgets inherited by sub-agents.
-6. Adapters: Anthropic Messages, AG-UI event projection.
+2. Deferred tool loading for large tool sets.
 
 Deliberately not planned: a graph DSL, role-play crews, built-in RAG or vector stores, a universal
 provider gateway, in-process code sandboxes, and pickled state.

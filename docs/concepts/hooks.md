@@ -78,7 +78,8 @@ agent = Agent(
 )
 ```
 
-When the last request used more than `trigger_tokens` tokens, everything except the last
+When the next request would hold more than `trigger_tokens` tokens (or a `trigger_fraction`
+of the model's context window), everything except the last
 `keep_last` messages is summarised by a model request (the agent's own model, or `model=` for a
 cheaper one), and the summary takes its place. A tool call is never separated from its result.
 The summarising prompt is `qagents.prompts.SUMMARY_REQUEST`.
@@ -112,5 +113,8 @@ Datadog). Install with `pip install "qagents[otel]"`.
   `qagents.tracing.ATTR`.
 - Message and tool content is **not** recorded unless you pass `record_content=True`, because it
   often contains personal data.
-- A run that is cancelled as an asyncio task (not through `stream.cancel()`) does not reach
-  `on_run_end`, so its root span is not closed by the hook.
+- A run that is cancelled as an asyncio task, or a stream closed early, still reaches
+  `on_run_end`, with the `CancelledError` or `GeneratorExit` as `error`, so its root span is
+  closed.
+- Error text (a failed tool's status description, exception messages and stack traces) counts
+  as content: without `record_content=True` a span records only the exception's type.

@@ -134,7 +134,11 @@ def specialist(ctx: ExampleContext, area: str, role: str, data: Tool) -> Tool:
         limits=Limits(max_turns=4),  # its cost is capped by what is left of the manager's
     )
     # Several specialist runs on a reasoning model can outlast Limits.tool_timeout_s (120 s).
-    return fan_out(agent, name=f"ask_{area}", max_parallel=3, max_tasks=3, timeout=240)
+    # The specialists only read data, so the manager's three ask_* calls may run together
+    # (fan_out is not read-only unless you say so).
+    return fan_out(
+        agent, name=f"ask_{area}", max_parallel=3, max_tasks=3, timeout=240, read_only=True
+    )
 
 
 def build_manager(ctx: ExampleContext) -> Agent:

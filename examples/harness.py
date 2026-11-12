@@ -469,6 +469,14 @@ def final_answer(**arguments: Any) -> ToolCallPart:
     return call("final_answer", **arguments)
 
 
+def structured_answer(request: ModelRequest, **fields: Any) -> ToolCallPart | str:
+    """A structured answer in either output mode: a ``final_answer`` call when the request
+    offers that tool (``output_mode="tool"``), else the fields as JSON text (``"native"``)."""
+    if "final_answer" in tool_names(request):
+        return final_answer(**fields)
+    return json.dumps(fields)
+
+
 def scripted_context(
     policy: Callable[[ModelRequest], Any] | Model | Sequence[Any],
     tmp_path: Path,

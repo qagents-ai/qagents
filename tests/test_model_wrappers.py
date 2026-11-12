@@ -566,9 +566,15 @@ async def test_cassette_modes(tmp_path, monkeypatch):
     monkeypatch.setenv(CASSETTE_MODE_ENV, "replay")  # what CI sets
     with pytest.raises(ConfigurationError, match="no cassette at"):
         cassette(ScriptedModel([]), tmp_path / "missing.json")
+    with pytest.raises(ConfigurationError, match="forbids recording"):  # no paid calls in CI
+        cassette(ScriptedModel([]), path, mode="record")
     monkeypatch.setenv(CASSETTE_MODE_ENV, "record")
-    assert isinstance(cassette(ScriptedModel([]), path), RecordingModel)
-    assert not path.exists()  # recording again starts from an empty cassette
+    again = cassette(ScriptedModel(["newer"]), path)
+    assert isinstance(again, RecordingModel)
+    assert ReplayModel(path).remaining == 1  # the old cassette stays until a response is recorded
+    await again.request(ask())
+    replayer = ReplayModel(path)  # then recording again starts from an empty cassette
+    assert replayer.remaining == 1 and (await replayer.request(ask())).message.text == "newer"
     monkeypatch.setenv(CASSETTE_MODE_ENV, "sometimes")
     with pytest.raises(ConfigurationError, match=CASSETTE_MODE_ENV):
         cassette(ScriptedModel([]), path)
@@ -795,3 +801,172 @@ async def test_rate_limited_model_passes_through_identity_and_checks():
 
     agent = Agent(RateLimitedModel(weather_script(), max_concurrent=1), tools=[get_weather])
     assert (await agent.run("Weather?")).output == "Sunny in Athens, Paris and Rome."
+
+
+async def test_max_wait_counts_the_slot_and_the_bucket_together():
+    async def slow(request: ModelRequest) -> str:
+        await asyncio.sleep(0.3)
+        return "done"
+
+    # One slot, busy for 0.3 s; one request per 0.6 s. Each wait alone is under 0.4 s.
+    model = RateLimitedModel(
+        FunctionModel(slow), max_concurrent=1, requests_per_minute=100, burst_s=0.6, max_wait_s=0.4
+    )
+    running = asyncio.create_task(model.request(ask()))
+    await asyncio.sleep(0.01)
+    began = time.perf_counter()
+    with pytest.raises(ModelRateLimitError, match="rate limit is used up"):
+        await model.request(ask())
+    assert time.perf_counter() - began < 0.45  # not 0.3 s for the slot plus 0.4 s more
+    assert (await running).message.text == "done"
+
+
+# -- secrets, safety switches and overwrites in cassettes -----------------------------------
+
+
+async def test_secret_settings_never_reach_a_cassette_whatever_their_spelling(tmp_path):
+    def extra(variant: str) -> dict:
+        return {
+            "aws_secret_access_key": f"wJalrXUtnFEMI-{variant}",
+            "vertex_credentials": f'{{"type": "service_account", "private_key": "{variant}"}}',
+            "metadata": {"authToken": f"tok-{variant}", "clientSecret": f"cs-{variant}", "user": "u-1"},
+            "Ocp-Apim-Subscription-Key": f"sub-{variant}",
+            "key": f"bare-{variant}",
+            "innocent_name": f"sk-{variant}",  # looks like a key whatever it is called
+            "deployment_pass": f"custom-{variant}",  # named by the caller
+            "prompt_cache_key": "cache-1",  # a public request field
+            "max_completion_tokens": 50,
+        }  # fmt: skip
+
+    path = tmp_path / "secrets.json"
+    names = ["deploymentPass"]
+    await RecordingModel(ScriptedModel(["ok"]), path, redact_keys=names).request(
+        ask(extra=extra("first"))
+    )
+    text = path.read_text(encoding="utf-8")
+    assert "first" not in text  # not one of the secret values
+    assert '"cache-1"' in text and '"u-1"' in text and '"max_completion_tokens": 50' in text
+
+    replayer = ReplayModel(path, redact_keys=names)
+    assert (await replayer.request(ask(extra=extra("rotated")))).message.text == "ok"
+    assert request_fingerprint(ask(extra=extra("a")), redact_keys=names) == request_fingerprint(
+        ask(extra=extra("b")), redact_keys=names
+    )
+    assert request_fingerprint(ask(extra={"prompt_cache_key": "a"})) != request_fingerprint(
+        ask(extra={"prompt_cache_key": "b"})
+    )
+
+
+async def test_recording_again_never_deletes_a_file_that_is_not_a_cassette(tmp_path):
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text('{"customers": [1, 2, 3]}', encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="not a qagents cassette"):
+        RecordingModel(ScriptedModel([]), fixture, overwrite=True)
+    with pytest.raises(ConfigurationError, match="not a qagents cassette"):
+        cassette(ScriptedModel([]), fixture, mode="record")
+    assert fixture.read_text(encoding="utf-8") == '{"customers": [1, 2, 3]}'
+
+
+async def test_a_failed_recording_run_keeps_the_previous_cassette(tmp_path):
+    path = tmp_path / "good.json"
+    await RecordingModel(ScriptedModel(["old"]), path).request(ask())
+
+    failing = RecordingModel(
+        ScriptedModel([ModelAuthenticationError("bad key")]), path, overwrite=True
+    )
+    with pytest.raises(ModelAuthenticationError):
+        await failing.request(ask())
+    assert (await ReplayModel(path).request(ask())).message.text == "old"  # still there
+
+    fresh = RecordingModel(ScriptedModel(["new", "newer"]), path, overwrite=True)
+    await fresh.request(ask())
+    await fresh.request(ask("again"))
+    replayer = ReplayModel(path)
+    assert replayer.remaining == 2 and (await replayer.request(ask())).message.text == "new"
+
+
+async def test_an_unused_overwrite_never_wipes_what_another_model_records(tmp_path):
+    path = tmp_path / "shared.json"
+    await RecordingModel(ScriptedModel(["old"]), path).request(ask())
+    RecordingModel(ScriptedModel([]), path, overwrite=True)  # made, never used
+    appender = RecordingModel(ScriptedModel(["second"]), path)
+    await appender.capabilities()
+    await appender.request(ask("two"))
+    assert ReplayModel(path).remaining == 2  # appended, not replaced
+
+    # two models re-recording one path: the first response starts the new
+    # cassette, and the other model's responses are added to it
+    first = RecordingModel(ScriptedModel(["a"]), path, overwrite=True)
+    second = RecordingModel(ScriptedModel(["b"]), path, overwrite=True)
+    await first.request(ask("one"))
+    await second.request(ask("two"))
+    replayer = ReplayModel(path)
+    assert replayer.remaining == 2
+    assert (await replayer.request(ask("one"))).message.text == "a"
+    assert (await replayer.request(ask("two"))).message.text == "b"
+
+
+# -- FallbackModel: per-model settings, cooldown, and who answered ---------------------------
+
+
+async def test_each_model_in_a_chain_can_have_its_own_settings():
+    primary = ScriptedModel([ModelRateLimitError("busy", retryable=True)], name="primary")
+    backup = ScriptedModel(["ok"], name="backup")
+    thinking = {"type": "enabled", "budget_tokens": 1024}
+    model = FallbackModel(
+        [primary, backup],
+        model_settings=[None, ModelSettings(temperature=None, extra={"thinking": thinking})],
+    )
+    await model.request(ask(temperature=0.3, extra={"user": "u-1"}))
+
+    assert primary.requests[0].settings.temperature == 0.3
+    sent = backup.requests[0].settings
+    assert sent.temperature is None and sent.extra == {"user": "u-1", "thinking": thinking}
+
+    mixed = FallbackModel(
+        [QCloudModel("q-model", use_catalog=False), ScriptedModel([])],
+        model_settings=[
+            ModelSettings(temperature=0.2),
+            ModelSettings(extra={"thinking": thinking}),
+        ],
+    )
+    mixed.validate_settings(ModelSettings())  # QCloud never receives "thinking"
+    with pytest.raises(ConfigurationError, match="Model 1 .*model_settings"):
+        FallbackModel(
+            [QCloudModel("q-model", use_catalog=False), ScriptedModel([])],
+            model_settings=[ModelSettings(extra={"thinking": thinking}), None],
+        ).validate_settings(ModelSettings())
+    with pytest.raises(ConfigurationError, match="one ModelSettings or None per model"):
+        FallbackModel([primary, backup], model_settings=[None])
+    with pytest.raises(ConfigurationError, match="cooldown_s"):
+        FallbackModel([primary, backup], cooldown_s=-1)
+
+
+async def test_a_failing_model_is_tried_last_while_it_cools_down(caplog):
+    primary = Failing(ModelServerError("down", retryable=True))
+    backup = ScriptedModel(["one", "two", "three"], name="backup")
+    model = FallbackModel([primary, backup], cooldown_s=0.2)
+
+    with caplog.at_level(logging.WARNING, logger="qagents.fallback"):
+        first = await model.request(ask())
+        second = await model.request(ask())
+    assert primary.calls == 1 and caplog.text.count("falling back") == 1  # not asked again
+    assert first.message.metadata["fallback"] == {
+        "answered_by": "test:backup",
+        "position": 1,
+        "failed": ["qcloud:primary-model: ModelServerError"],
+    }
+    assert second.message.metadata["fallback"]["failed"] == []
+
+    await asyncio.sleep(0.25)
+    await model.request(ask())
+    assert primary.calls == 2  # the cooldown is over: first choice again
+
+
+async def test_without_a_cooldown_the_order_never_changes():
+    primary = Failing(ModelServerError("down", retryable=True))
+    model = FallbackModel([primary, ScriptedModel(["a", "b"], name="backup")])
+    await model.request(ask())
+    response = await model.request(ask())
+    assert primary.calls == 2
+    assert response.message.metadata["fallback"]["answered_by"] == "test:backup"

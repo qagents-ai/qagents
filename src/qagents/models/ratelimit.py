@@ -98,9 +98,11 @@ class RateLimitedModel(Model):
             how providers that use token buckets count; lower it to spread
             requests evenly.
         max_wait_s: Raise `ModelRateLimitError` instead of waiting longer than
-            this for a turn. The request is not sent. Inside a `FallbackModel`
-            this moves the request to the next model; the agent loop retries it
-            after ``retry_after`` otherwise. ``None`` waits as long as needed.
+            this for a turn; the wait for a concurrency slot and the wait for
+            the buckets share this one budget. The request is not sent. Inside
+            a `FallbackModel` this moves the request to the next model; the
+            agent loop retries it after ``retry_after`` otherwise. ``None``
+            waits as long as needed.
 
     Raises:
         ConfigurationError: A limit is zero or negative.
@@ -157,10 +159,12 @@ class RateLimitedModel(Model):
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         slots, turnstile = self._primitives()
+        # One budget for the whole wait: for a slot, then for the buckets.
+        deadline = None if self.max_wait_s is None else time.monotonic() + self.max_wait_s
         if slots is not None:
-            await self._acquire_slot(slots)
+            await self._acquire_slot(slots, deadline)
         try:
-            await self._admit(turnstile)
+            await self._admit(turnstile, deadline)
             async with contextlib.aclosing(self.inner.stream(request)) as events:
                 async for event in events:
                     if isinstance(event, ResponseDone):
@@ -194,24 +198,23 @@ class RateLimitedModel(Model):
             self._turnstile = asyncio.Lock()
         return self._slots, self._turnstile
 
-    async def _acquire_slot(self, slots: asyncio.Semaphore) -> None:
-        if self.max_wait_s is None:
+    async def _acquire_slot(self, slots: asyncio.Semaphore, deadline: float | None) -> None:
+        if deadline is None:
             await slots.acquire()
             return
         try:
-            async with asyncio.timeout(self.max_wait_s):
+            async with asyncio.timeout(max(deadline - time.monotonic(), 0.0)):
                 await slots.acquire()
         except TimeoutError:
             raise self._too_long(
                 f"all {self.max_concurrent} concurrent request slot(s) stayed busy", None
             ) from None
 
-    async def _admit(self, turnstile: asyncio.Lock) -> None:
+    async def _admit(self, turnstile: asyncio.Lock, deadline: float | None) -> None:
         """Wait until the buckets allow one more request, then take it from them."""
         start = time.monotonic()
         if self._requests is None and self._tokens is None and start >= self._paused_until:
             return
-        deadline = None if self.max_wait_s is None else start + self.max_wait_s
         # One request waits at a time, so requests are admitted in arrival order.
         try:
             if deadline is None:

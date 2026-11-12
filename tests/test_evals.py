@@ -4,12 +4,23 @@ import asyncio
 import json
 import os
 import re
+from typing import Literal
 
 import pytest
 from pydantic import BaseModel
 
-from qagents import Agent, InMemoryStore, Limits, Message, RunContext, RunResult, Usage, tool
-from qagents.errors import ConfigurationError
+from qagents import (
+    Agent,
+    Hooks,
+    InMemoryStore,
+    Limits,
+    Message,
+    RunContext,
+    RunResult,
+    Usage,
+    tool,
+)
+from qagents.errors import ConfigurationError, ModelServerError
 from qagents.evals import (
     Case,
     CaseResult,
@@ -36,7 +47,7 @@ from qagents.evals import (
     log_to_mlflow,
     regressions,
 )
-from qagents.models.base import ModelRequest
+from qagents.models.base import ModelRequest, ModelResponse
 from qagents.models.testing import FunctionModel, ScriptedModel, call
 
 PRICED = Usage(requests=1, input_tokens=10, output_tokens=5, cost_usd=0.001)
@@ -687,6 +698,150 @@ async def test_llm_judge_with_your_own_agent_and_its_failures():
     assert (verdict.passed, verdict.reason) == (False, "the judge did not finish (max_turns)")
 
 
+PAID = Usage(requests=1, input_tokens=100, output_tokens=20, cost_usd=0.02)
+
+
+async def test_a_judge_that_fails_keeps_the_usage_it_was_billed_for():
+    grader = FunctionModel(lambda request: "I refuse to use JSON.", usage=PAID)
+    hopeless = LLMJudge(grader, "rubric", output_mode="prompted")
+    report = await evaluate(
+        Agent(ScriptedModel(["answer"])), [Case(name="a", prompt="q")], [hopeless]
+    )
+    (failed,) = report.results[0].evaluations
+    assert not failed.passed
+    assert failed.reason.startswith("the evaluator raised OutputValidationError")
+    assert failed.usage is not None and failed.usage.requests == len(grader.requests) == 3
+    assert report.summary.judge_cost_usd == pytest.approx(0.06)
+
+    def refuse(request: ModelRequest) -> ModelResponse:
+        message = Message.assistant("I cannot grade this.")
+        return ModelResponse(message=message, finish_reason="content_filter", usage=PAID)
+
+    refused = await LLMJudge(FunctionModel(refuse), "rubric")(context("answer"))
+    assert (refused.passed, refused.reason) == (False, "the judge gave no verdict (content_filter)")
+    assert refused.usage is not None and refused.usage.cost_usd == pytest.approx(0.02)
+
+    class Loose(BaseModel):  # an own judge agent whose output is not a verdict
+        score: float
+
+    own = Agent(ScriptedModel(['{"score": 3}'], usage=PAID), output_type=Loose)
+    invalid = await LLMJudge(own, "rubric")(context("answer"))
+    assert invalid.reason.startswith("the judge's answer is not a verdict")
+    assert invalid.usage is not None and invalid.usage.cost_usd == pytest.approx(0.02)
+
+
+async def test_a_built_judge_can_answer_with_a_tool_and_has_hooks():
+    seen: list[str] = []
+
+    class Watch(Hooks):
+        async def after_model(self, ctx: RunContext, response: ModelResponse) -> None:
+            seen.append(response.finish_reason)
+
+    grader = ScriptedModel([call("final_answer", reason="fine", score=0.9, passed=True)])
+    judge = LLMJudge(grader, "rubric", output_mode="tool", hooks=[Watch()])
+    verdict = await judge(context("answer"))
+    assert (verdict.passed, verdict.score) == (True, 0.9)
+    assert [spec.name for spec in grader.requests[0].tools] == ["final_answer"]
+    assert seen == ["tool_calls"]
+
+
+# --- what evaluators look at ---------------------------------------------------------------
+
+
+async def test_tool_mode_answers_are_what_evaluators_judges_and_reports_see():
+    category = Literal["billing", "technical"]
+    grader = judge_model(1.0)
+    agent = Agent(
+        ScriptedModel([call("final_answer", value="billing")]),
+        output_type=category,
+        output_mode="tool",
+    )
+    report = await evaluate(
+        agent,
+        [Case(name="refund", prompt="I was charged twice.", expected="billing")],
+        [
+            IsInstance(category),
+            JSONSchemaValid({"type": "string", "enum": ["billing", "technical"]}),
+            Contains("bill"),
+            Regex("billing", fullmatch=True),
+            ExactMatch(),
+            LLMJudge(grader, "The category is right."),
+        ],
+    )
+    (item,) = report.results
+    assert item.passed, {e.name: e.reason for e in item.evaluations}
+    assert (item.output, item.output_text) == ("billing", "billing")
+    assert grader.requests[0].messages[1].text.endswith("<answer>\nbilling\n</answer>")
+
+    # A text answer given with the final-answer tool, and one an output validator replaced.
+    tool_text = Agent(
+        ScriptedModel([call("final_answer", value="It is sunny in Athens.")]), output_mode="tool"
+    )
+    replaced = Agent(
+        ScriptedModel(["sunny"]),
+        output_validators=[lambda ctx, answer: f"It is {answer} in Athens."],
+    )
+    for target in (tool_text, replaced):
+        report = await evaluate(
+            target,
+            [Case(name="athens", prompt="Weather?", expected="It is sunny in Athens.")],
+            [Contains("It is sunny"), Regex(r"^It is \w+"), ExactMatch()],
+        )
+        (item,) = report.results
+        assert item.passed, {e.name: e.reason for e in item.evaluations}
+        assert (item.output_text, item.output) == ("It is sunny in Athens.", None)
+        assert "It is sunny in Athens." in report.to_markdown()
+
+
+def test_a_structured_text_output_is_checked_as_it_is():
+    # A validated output_type value is checked as it is, even when it holds no JSON.
+    billing = context("billing")
+    billing.structured = True
+    assert IsInstance(Literal["billing"])(billing).passed
+    assert JSONSchemaValid({"enum": ["billing"]})(billing).passed
+    # A validated output_type value is never re-read as JSON, even when it looks like JSON.
+    structured = context('{"a": 1}')
+    structured.structured = True
+    assert JSONSchemaValid({"type": "string"})(structured).passed
+    assert not JSONSchemaValid({"type": "string"})(context('{"a": 1}')).passed  # a text answer
+    rating = context("1")
+    rating.structured = True
+    assert IsInstance(Literal["1", "2"])(rating).passed
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [{"required": ["name"], "properties": {"name": {"type": "string"}}}, {}, {"enum": ["billing"]}],
+)
+async def test_a_plain_text_answer_that_holds_no_json_fails_the_schema(schema):
+    # Fail closed: a schema without "type" accepts any JSON string, so the text itself is
+    # never checked as if it were the JSON value.
+    for output_type in (None, str):  # output_type=str is a plain-text agent
+        agent = Agent(ScriptedModel(["billing"]), output_type=output_type)
+        report = await evaluate(agent, [Case(name="c", prompt="x")], [JSONSchemaValid(schema)])
+        (verdict,) = report.results[0].evaluations
+        assert not verdict.passed and verdict.reason.startswith("the answer is not JSON")
+    for ctx in (context("billing"), context("Sorry, I cannot help.")):  # kind unknown
+        assert not JSONSchemaValid(schema)(ctx).passed
+        assert not IsInstance(Literal["billing"])(ctx).passed
+
+
+async def test_a_run_that_raises_keeps_the_usage_it_was_billed_for():
+    def reply(request: ModelRequest) -> object:
+        if request.messages[-1].role == "user":
+            return call("get_weather", city="Athens")
+        raise ModelServerError("upstream down")
+
+    agent = Agent(FunctionModel(reply, usage=PRICED), tools=[get_weather])
+    report = await evaluate(agent, [Case(name="a", prompt="Weather in Athens?")], [Contains("x")])
+    (item,) = report.results
+    assert item.outcome == "error" and item.error_type == "ModelServerError"
+    assert item.usage.requests == 1 and item.cost_usd == pytest.approx(0.001)
+    assert item.run_id is not None
+    assert report.summary.total_cost_usd == pytest.approx(0.001)
+    assert report.summary.total_tokens == 15
+
+
 # --- reports ----------------------------------------------------------------------------
 
 
@@ -1013,6 +1168,12 @@ async def check_logged_report(mlflow) -> None:
     rows = mlflow.artifacts.load_dict(f"runs:/{child}/qagents_eval/cases.json")["cases"]
     assert rows[0]["output_text"] == "It is sunny in athens."
     assert rows[0]["tool_calls"][0]["arguments"] == {"city": "Athens"}
+
+    # MLflow keeps the active run per thread: from a worker thread, the parent is passed.
+    with mlflow.start_run(run_name="threaded parent") as parent:
+        child = await asyncio.to_thread(log_to_mlflow, report, parent_run_id=parent.info.run_id)
+        assert mlflow.active_run().info.run_id == parent.info.run_id
+    assert client.get_run(child).data.tags["mlflow.parentRunId"] == parent.info.run_id
 
 
 async def test_log_to_mlflow_sqlite(mlflow_at, tmp_path):

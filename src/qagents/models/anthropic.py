@@ -4,8 +4,9 @@ The SDK keeps ownership of transport and authentication. This adapter adds
 what the agent loop needs on top:
 
 * translation between qagents messages and Messages API content blocks, with
-  thinking blocks kept byte for byte and replayed only while the conversation
-  before them is unchanged (the API rejects them otherwise);
+  thinking blocks kept byte for byte; on the models that run the API's
+  history-editing check (`PREFIX_CHECK_MODELS`) a block is replayed only while
+  the conversation before it is unchanged;
 * prompt caching with a stable prefix: tools, then system, then the
   conversation;
 * the request checks the API would otherwise fail with a 400, made locally
@@ -30,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
 
+from .. import prompts
 from ..errors import (
     ConfigurationError,
     ModelAuthenticationError,
@@ -90,6 +92,15 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 THINKING_UPDATES_BETA = "thinking-display-updates-2026-08-18"
 """Beta header for ``thinking.display = "updates"`` (progress updates between tool calls)."""
 
+THINKING_UPDATES_MODELS = frozenset(
+    {
+        "claude-fable-5", "claude-fable-5-1", "claude-fable-5-2", "claude-mythos-5-1",
+        "claude-mythos-5-2", "claude-opus-5-5", "claude-sonnet-5-5",
+    }
+)  # fmt: skip
+"""Known models that accept ``thinking.display = "updates"``. On another model in
+`MODEL_LIMITS`, ``thinking_display="updates"`` fails when the model is built."""
+
 FALLBACK_MODELS = frozenset(
     {
         "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5",
@@ -97,7 +108,32 @@ FALLBACK_MODELS = frozenset(
     }
 )  # fmt: skip
 """Models with safety classifiers that support server-side fallback. ``fallbacks="default"``
-is sent only to these; Claude Haiku 5.5 rejects the parameter."""
+is sent only to these."""
+
+NO_SERVER_FALLBACK = frozenset({"claude-haiku-5-5"})
+"""Models without server-side fallback: ``fallbacks: "default"`` does nothing on them and a
+list of fallback models is a 400, so a list fails when the model or agent is built."""
+
+PREFIX_CHECK_MODELS = frozenset(
+    {
+        "claude-fable-5-1", "claude-fable-5-2", "claude-mythos-5-1", "claude-mythos-5-2",
+        "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+    }
+)  # fmt: skip
+"""Models that run the API's history-editing check on replayed thinking blocks: a block is
+valid only while the system prompt, the tools and every earlier message are unchanged. Other
+models, and every request with manual thinking (``thinking.type = "enabled"``, which none of
+these models accepts), get every block back unchanged."""
+
+NO_EFFORT = frozenset({"claude-haiku-4-5"})
+"""Models that reject ``output_config.effort``."""
+
+NO_XHIGH_EFFORT = frozenset({"claude-opus-4-6", "claude-sonnet-4-6"})
+"""Models released before the ``xhigh`` effort level."""
+
+MANUAL_THINKING_ONLY = frozenset({"claude-haiku-4-5"})
+"""Models with manual extended thinking only (``budget_tokens``): adaptive thinking, which
+``thinking_display`` sends, is rejected."""
 
 NO_FORCED_TOOL_CHOICE = frozenset(
     {
@@ -108,23 +144,29 @@ NO_FORCED_TOOL_CHOICE = frozenset(
 """Models that return a 400 for ``tool_choice`` ``any`` or ``tool``. A required or named
 tool choice is sent to them as ``auto``, with a warning."""
 
-NO_STRUCTURED_OUTPUT = frozenset(
-    {"claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-sonnet-4-5"}
-)
-"""Current models the Claude documentation does not list for structured outputs
-(``output_config.format``). Use ``output_mode="prompted"`` with them."""
+NO_STRUCTURED_OUTPUT: frozenset[str] = frozenset()
+"""Kept for backward compatibility; empty. Every current model supports structured outputs
+(``output_config.format``). Where an organization cannot use them, the API's 400 is raised
+as `ModelBadRequestError`."""
 
 ALLOWED_EXTRA = frozenset(
     {
         "betas", "cache_control", "compaction", "container", "context_management",
-        "diagnostics", "fallback_credit_token", "fallbacks", "inference_geo", "mcp_servers",
-        "metadata", "output_config", "service_tier", "speed", "stop_sequences", "thinking",
-        "thread", "user_profile_id", "workspace_id",
+        "diagnostics", "fallback_credit_token", "fallbacks", "inference_geo", "metadata",
+        "output_config", "service_tier", "speed", "stop_sequences", "thinking",
+        "user_profile_id", "workspace_id",
     }
 )  # fmt: skip
 """``ModelSettings.extra`` keys passed to the Messages API as they are. ``model``,
 ``messages``, ``system``, ``tools``, ``tool_choice`` and ``max_tokens`` are built from the
 request and its settings, so they cannot be set here."""
+
+_UNSUPPORTED_EXTRA = {
+    "thread": "this adapter sends the whole conversation, the system prompt and the tools on "
+    "every request, so a server-side thread cannot be continued",
+    "mcp_servers": "the MCP connector needs an mcp_toolset entry in tools, which this adapter "
+    "does not build; use qagents.toolkits.mcp.MCPToolkit",
+}
 
 REQUEST_OPTIONS = frozenset({"extra_headers", "extra_query", "extra_body", "timeout"})
 """SDK per-request options accepted in ``request_options`` besides `ALLOWED_EXTRA`."""
@@ -135,6 +177,8 @@ _DATA_URL = re.compile(r"^data:(?P<media_type>[^;,]+);base64,(?P<data>.*)$", re.
 _DATE_SUFFIX = re.compile(r"-\d{8}$")
 _DEFAULT_HOST = "https://api.anthropic.com"
 _THINKING_TYPES = ("thinking", "redacted_thinking")
+_TOOL_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_CUT_OFF = ("max_tokens", "model_context_window_exceeded")
 
 _INSTALL_HINT = (
     "The Anthropic provider needs the anthropic SDK (2.x). Install it with "
@@ -254,6 +298,38 @@ def _base_id(model: str) -> str:
     return _DATE_SUFFIX.sub("", model)
 
 
+def _open_maps(schema: Any, path: str) -> list[str]:
+    """JSON paths of objects with free-form keys (``additionalProperties`` other than
+    false, ``patternProperties``, or an object with no ``properties`` that is not
+    closed). Objects with ``properties`` that only omit ``additionalProperties`` are
+    not open maps: closing them keeps their declared properties."""
+    if not isinstance(schema, dict):
+        return []
+    extra = schema.get("additionalProperties")
+    kind = schema.get("type")
+    bare = (
+        (kind == "object" or (isinstance(kind, list) and "object" in kind))
+        and "properties" not in schema
+        and extra is not False
+    )
+    found = (
+        [path]
+        if (extra is not None and extra is not False) or "patternProperties" in schema or bare
+        else []
+    )
+    for key in ("properties", "$defs", "definitions", "patternProperties"):
+        if isinstance(schema.get(key), dict):
+            for name, sub in schema[key].items():
+                found += _open_maps(sub, f"{path}.{key}.{name}")
+    for key in ("items", "additionalProperties", "not"):
+        found += _open_maps(schema.get(key), f"{path}.{key}")
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        if isinstance(schema.get(key), list):
+            for position, sub in enumerate(schema[key]):
+                found += _open_maps(sub, f"{path}.{key}[{position}]")
+    return found
+
+
 # --- the model ------------------------------------------------------------------------------
 
 
@@ -271,7 +347,10 @@ class AnthropicModel(Model):
     client you pass in. The SDK would repeat 5xx responses and timeouts, which may
     already have been processed and billed. The qagents loop repeats only errors
     that provably did not run (429, 529 overloaded, a connection that was never
-    made), and never a request whose stream had started.
+    made), and never a request whose stream had started. Once one segment of a
+    paused turn (``pause_turn``, ``compaction``) has run, every later error of
+    that model request is ambiguous, since repeating it would run the billed
+    segment again.
 
     Fallbacks: with ``fallbacks="default"`` (the default), requests to models
     with safety classifiers (`FALLBACK_MODELS`, which includes the default model)
@@ -281,16 +360,31 @@ class AnthropicModel(Model):
     ``ModelResponse.model`` names the model that answered. Pass a list such as
     ``[{"model": "claude-opus-5"}]`` to choose the targets, or ``fallbacks=None``
     to turn fallback off; a declined request then ends with
-    ``finish_reason="content_filter"``.
+    ``finish_reason="content_filter"``. Models in `NO_SERVER_FALLBACK` reject a
+    list. Usage and cost come from ``usage.iterations`` when the API reports it,
+    so declined attempts and server-side compaction are counted at their own
+    model's prices.
 
     Thinking: thinking blocks are kept in ``ReasoningPart.opaque`` and sent back
-    unchanged. Current models bind each block to the system prompt, the tools
-    and every earlier message; after an edit there (compaction that keeps recent
+    unchanged. The models in `PREFIX_CHECK_MODELS` run a history-editing check:
+    a block is valid only while the system prompt, the tools and every earlier
+    message are unchanged, and after an edit there (compaction that keeps recent
     turns, instructions that change between turns, a different tool set) the API
-    rejects the block. The adapter records a fingerprint of that prefix with each
-    block and leaves out the blocks whose prefix changed, so those requests
-    still succeed without the old reasoning. Blocks are sent to any Claude model;
-    the API ignores the ones a model cannot read.
+    may reject it (by default on accounts created on or after 2026-08-31, and on
+    every account for Claude Fable 5.2 and Claude Mythos 5.1 / 5.2). For those
+    models, and for model ids this adapter does not know, it records a
+    fingerprint of that prefix with each block and leaves out the blocks whose
+    prefix changed, so those requests still succeed without the old reasoning.
+    Every other model, and every request with manual thinking
+    (``thinking.type = "enabled"``, which an open tool round needs to keep its
+    thinking block for), gets every block back unchanged; the API ignores the
+    ones a model cannot read.
+
+    Exhausted continuations: when a turn is still paused after
+    ``max_continuations`` continuations, the partial turn is returned with
+    ``finish_reason="length"`` and ``"incomplete": "max_continuations"`` in the
+    message's ``anthropic`` metadata. Server tool calls left without their result
+    are not sent back in later requests.
 
     Args:
         model: The model id, such as ``"claude-opus-5-5"`` or ``"claude-sonnet-5-5"``.
@@ -300,13 +394,15 @@ class AnthropicModel(Model):
         timeout: Request timeout in seconds for a client created by the model.
         max_retries: SDK-level retries. Keep 0 unless you accept repeated, billed requests.
         max_tokens: ``max_tokens`` when ``ModelSettings.max_tokens`` is unset. Defaults to
-            `DEFAULT_MAX_TOKENS`, capped at the model's maximum output.
+            `DEFAULT_MAX_TOKENS`, capped at the model's maximum output. A value above the
+            maximum output of a known model is a `ConfigurationError`.
         effort: ``output_config.effort``: ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"`` or
             ``"max"``. ``None`` leaves the model's default (``medium`` on Claude Opus 5.5,
             ``high`` on most others).
         thinking_display: ``"summarized"`` returns readable summaries of the reasoning (as
             ``ReasoningDelta`` events and ``ReasoningPart.text``), ``"updates"`` returns only
-            progress updates between tool calls (beta), ``"omitted"`` returns empty thinking
+            progress updates between tool calls (beta; the models in
+            `THINKING_UPDATES_MODELS` and unknown ids), ``"omitted"`` returns empty thinking
             text. ``None`` sends no ``thinking`` field, so the model's default applies.
         cache: Prompt caching: a breakpoint after the stable prefix (the system prompt, or
             the last tool when there is none) plus automatic caching of the conversation.
@@ -319,7 +415,8 @@ class AnthropicModel(Model):
         pricing: Prices for this model, replacing the `PRICING` entry.
         request_options: Extra fields for every request (keys of `ALLOWED_EXTRA`) and SDK
             options (``extra_headers``, ``extra_query``, ``extra_body``, ``timeout``).
-            ``ModelSettings.extra`` takes precedence.
+            ``ModelSettings.extra`` takes precedence. An ``anthropic-beta`` value in
+            ``extra_headers`` is merged with the betas the adapter sends.
         max_continuations: How many times a ``pause_turn`` response is continued within one
             model request.
     """
@@ -370,6 +467,33 @@ class AnthropicModel(Model):
             )
         if max_retries < 0 or max_continuations < 0:
             raise ConfigurationError("max_retries and max_continuations cannot be negative.")
+        base = _base_id(model)
+        limits = MODEL_LIMITS.get(base)
+        if max_tokens is not None and (max_tokens < 1 or (limits and max_tokens > limits[1])):
+            raise ConfigurationError(
+                f"max_tokens must be between 1 and {limits[1] if limits else 'the model maximum'}"
+                f" for {model}; got {max_tokens}."
+            )
+        if effort is not None and base in NO_EFFORT:
+            raise ConfigurationError(f"{model} has no effort parameter; leave effort=None.")
+        if effort == "xhigh" and base in NO_XHIGH_EFFORT:
+            raise ConfigurationError(f"{model} has no 'xhigh' effort; use 'high' or 'max'.")
+        if thinking_display is not None and base in MANUAL_THINKING_ONLY:
+            raise ConfigurationError(
+                f"{model} has no adaptive thinking, which thinking_display needs. Leave "
+                "thinking_display=None and pass ModelSettings(extra={'thinking': {'type': "
+                "'enabled', 'budget_tokens': N}}) for manual extended thinking."
+            )
+        if thinking_display == "updates" and limits and base not in THINKING_UPDATES_MODELS:
+            raise ConfigurationError(
+                f"{model} has no thinking_display='updates' (progress updates between tool "
+                "calls); use 'summarized' or 'omitted'."
+            )
+        if isinstance(fallbacks, list) and base in NO_SERVER_FALLBACK:
+            raise ConfigurationError(
+                f"{model} has no server-side fallback and rejects a fallbacks list. Use "
+                "fallbacks=None and handle finish_reason='content_filter'."
+            )
         self.name = model
         self.max_retries = max_retries
         self.max_tokens = max_tokens
@@ -384,18 +508,47 @@ class AnthropicModel(Model):
         self.request_options = dict(request_options or {})
         unknown = sorted(set(self.request_options) - ALLOWED_EXTRA - REQUEST_OPTIONS)
         if unknown:
+            reasons = "".join(
+                f" {name}: {_UNSUPPORTED_EXTRA[name]}."
+                for name in unknown
+                if name in _UNSUPPORTED_EXTRA
+            )
             raise ConfigurationError(
                 f"request_options has key(s) the Messages API does not accept: "
-                f"{', '.join(unknown)}. Accepted: "
+                f"{', '.join(unknown)}.{reasons} Accepted: "
                 f"{', '.join(sorted(ALLOWED_EXTRA | REQUEST_OPTIONS))}."
             )
         self._check_extra(self.request_options)
+        self._header_betas = self._take_header_betas()
         self._client = client
         self._owns_client = client is None
         self._request_client: Any = None
         self._client_options = {"api_key": api_key, "base_url": base_url, "timeout": timeout}
         self._warned_tool_choice = False
         self._rejected_signatures: set[str] = set()
+
+    def _take_header_betas(self) -> list[str]:
+        """Move ``anthropic-beta`` out of ``extra_headers``: the SDK would let it replace
+        the header built from ``betas``, dropping the betas the adapter adds."""
+        headers = self.request_options.get("extra_headers")
+        if headers is None:
+            return []
+        if not isinstance(headers, Mapping):
+            raise ConfigurationError("request_options['extra_headers'] must be a mapping.")
+        betas: list[str] = []
+        kept: dict[str, Any] = {}
+        for key, value in headers.items():
+            if str(key).lower() != "anthropic-beta":
+                kept[key] = value
+            elif isinstance(value, str):
+                betas.extend(item.strip() for item in value.split(",") if item.strip())
+            else:
+                raise ConfigurationError(
+                    "An anthropic-beta header in extra_headers must be a string; pass betas "
+                    "in request_options['betas'] instead."
+                )
+        self.request_options["extra_headers"] = kept
+        return betas
 
     # -- client ------------------------------------------------------------------------------
 
@@ -470,6 +623,12 @@ class AnthropicModel(Model):
                     f"The Claude API rejects {', '.join(sampling)} on every model (API version "
                     "2026-10-21). Remove it from ModelSettings.extra."
                 )
+            unsupported = [name for name in unknown if name in _UNSUPPORTED_EXTRA]
+            if unsupported:
+                name = unsupported[0]
+                raise self._bad_request(
+                    f"ModelSettings.extra[{name!r}] is not supported: {_UNSUPPORTED_EXTRA[name]}."
+                )
             raise self._bad_request(
                 f"The Messages API does not accept the request field(s) {', '.join(unknown)} "
                 f"in ModelSettings.extra. Accepted: {', '.join(sorted(ALLOWED_EXTRA))}. "
@@ -495,6 +654,23 @@ class AnthropicModel(Model):
         for name in ("output_config", "thinking", "metadata"):
             if name in extra and extra[name] is not None and not isinstance(extra[name], dict):
                 raise self._bad_request(f"{name} must be a JSON object (a dict).")
+        base = _base_id(self.name)
+        effort = (extra.get("output_config") or {}).get("effort")
+        if effort is not None and base in NO_EFFORT:
+            raise self._bad_request(f"{self.name} has no effort parameter (output_config.effort).")
+        if effort == "xhigh" and base in NO_XHIGH_EFFORT:
+            raise self._bad_request(f"{self.name} has no 'xhigh' effort; use 'high' or 'max'.")
+        thinking = extra.get("thinking") or {}
+        if thinking.get("type") == "adaptive" and base in MANUAL_THINKING_ONLY:
+            raise self._bad_request(
+                f"{self.name} has no adaptive thinking; use {{'type': 'enabled', "
+                "'budget_tokens': N}."
+            )
+        if isinstance(extra.get("fallbacks"), list) and base in NO_SERVER_FALLBACK:
+            raise self._bad_request(
+                f"{self.name} has no server-side fallback and rejects a fallbacks list. Use "
+                "fallbacks=None and handle finish_reason='content_filter'."
+            )
 
     # -- request building ------------------------------------------------------------------------
 
@@ -517,14 +693,24 @@ class AnthropicModel(Model):
         named_in_history = _tool_names_in(prefinal)
         stub_tools = not tools and bool(named_in_history)
         if stub_tools:
-            # The API needs a definition for every tool named in the history. An agent with
-            # no tools of its own (a handoff target, say) still carries earlier calls.
+            # A request whose history holds tool_use blocks is rejected when it defines no
+            # tools at all. An agent with no tools of its own (a handoff target, say) still
+            # carries earlier calls, so they are declared as stubs and tool_choice is none.
             tools = [
                 {"name": name, "input_schema": {"type": "object"}}
                 for name in sorted(named_in_history)
             ]
         fingerprint = _Fingerprint(system_blocks, tools)
-        messages = _finalize(prefinal, fingerprint.prefixes(prefinal), self._rejected_signatures)
+        options = {**self.request_options, **settings.extra}
+        # Manual thinking needs the open tool round to start with its thinking block, and
+        # no model with the history-editing check accepts it, so its blocks are all kept.
+        if not _manual_thinking(options) and (
+            base in PREFIX_CHECK_MODELS or base not in MODEL_LIMITS
+        ):
+            prefixes: list[str | None] = list(fingerprint.prefixes(prefinal))
+        else:
+            prefixes = [None] * len(prefinal)  # no history-editing check: replay every block
+        messages = _finalize(prefinal, prefixes, self._rejected_signatures)
         if not messages:
             raise self._bad_request("The request has no messages to send.")
         if messages[0]["role"] != "user":
@@ -538,7 +724,6 @@ class AnthropicModel(Model):
             "max_tokens": self._max_tokens(settings),
             "messages": messages,
         }
-        options = {**self.request_options, **settings.extra}
         if system_blocks:
             system = [dict(block) for block in system_blocks]
             if self.cache:
@@ -561,7 +746,7 @@ class AnthropicModel(Model):
         if self.effort is not None:
             output_config["effort"] = self.effort
         if request.output is not None:
-            output_config["format"] = self._output_format(request, base)
+            output_config["format"] = self._output_format(request)
         if isinstance(options.get("output_config"), dict):
             output_config.update(options.pop("output_config"))
         if output_config:
@@ -569,7 +754,7 @@ class AnthropicModel(Model):
         if self.thinking_display is not None:
             params["thinking"] = {"type": "adaptive", "display": self.thinking_display}
 
-        betas: list[str] = []
+        betas: list[str] = [*self._header_betas]
         if self.thinking_display == "updates":
             betas.append(THINKING_UPDATES_BETA)
         if "fallbacks" not in options:
@@ -604,10 +789,9 @@ class AnthropicModel(Model):
     def _eager(self) -> bool:
         if self.eager_input_streaming is not None:
             return self.eager_input_streaming
-        if self._client is None:
-            custom = self._client_options.get("base_url")
-            return custom is None or str(custom).rstrip("/") == _DEFAULT_HOST
-        return str(self._client.base_url).rstrip("/") == _DEFAULT_HOST
+        # The base URL the SDK resolves (argument, ANTHROPIC_BASE_URL, profile), so the
+        # first request and the later ones send the same tool definitions.
+        return str(self.client.base_url).rstrip("/") == _DEFAULT_HOST
 
     def _tools(self, request: ModelRequest) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
@@ -656,14 +840,8 @@ class AnthropicModel(Model):
             wire = {**(wire or {"type": "auto"}), "disable_parallel_tool_use": True}
         return wire
 
-    def _output_format(self, request: ModelRequest, base: str) -> dict[str, Any]:
+    def _output_format(self, request: ModelRequest) -> dict[str, Any]:
         assert request.output is not None
-        if base in NO_STRUCTURED_OUTPUT:
-            raise self._bad_request(
-                f"{self.name} does not support structured outputs (output_config.format). "
-                'Build the agent with output_mode="prompted", or use a model such as '
-                "claude-opus-5-5."
-            )
         schema = self._strict_schema(request.output.json_schema, "the output schema")
         return {"type": "json_schema", "schema": schema}
 
@@ -672,8 +850,21 @@ class AnthropicModel(Model):
 
         Objects get ``additionalProperties: false``; constraints the API does not
         enforce (``minimum``, ``maxLength``, ...) move into the description. The
-        loop still validates the result against the original schema.
+        loop still validates the result against the original schema. Output schemas
+        are always sent in this form: ``output_config.format`` has no unenforced mode.
+
+        An open map (``dict[str, X]``, a bare ``dict``, ``patternProperties``) cannot be
+        expressed: closing it would let the model return only ``{}`` for it. Such a
+        schema is refused here, before anything is sent.
         """
+        open_maps = _open_maps(schema, "$")
+        if open_maps:
+            raise self._bad_request(
+                f"{what} has an open map at {', '.join(open_maps)} (a dict with free-form "
+                "keys), which Claude structured outputs cannot express. Model it as a list of "
+                'key/value objects, or use output_mode="prompted" (or output_mode="tool" '
+                "without output_strict), or drop strict=True on the tool."
+            )
         try:
             from anthropic import transform_schema
         except ImportError as error:
@@ -697,17 +888,24 @@ class AnthropicModel(Model):
             accumulator = _Accumulator(
                 model=self.name, fingerprint=fingerprint, first_tool_index=tool_index
             )
-            stream = await self._open(client, params)
             try:
-                async for raw in stream:
-                    for event in accumulator.feed(raw):
-                        yield event
-            except ModelError:
+                stream, params = await self._open(client, params)
+                try:
+                    async for raw in stream:
+                        for event in accumulator.feed(raw):
+                            yield event
+                except ModelError:
+                    raise
+                except Exception as error:
+                    raise self._map_error(error, started=accumulator.started) from error
+                finally:
+                    await stream.close()
+            except ModelError as error:
+                if responses:
+                    # An earlier segment of this turn ran and was billed, and it may have
+                    # emitted nothing: repeating the model request would run it again.
+                    error.ambiguous = True
                 raise
-            except Exception as error:
-                raise self._map_error(error, started=accumulator.started) from error
-            finally:
-                await stream.close()
             if not accumulator.complete:
                 raise ModelResponseError(
                     "The response stream ended before the model finished.",
@@ -723,16 +921,23 @@ class AnthropicModel(Model):
             ):
                 break
             # The server paused a long turn: send the partial turn back and it continues.
-            params, fingerprint = _continue(params, accumulator)
+            # Every segment ends up in one assistant message, so its thinking blocks keep
+            # the fingerprint of the prefix before that message.
+            params = _continue(params, accumulator)
         yield ResponseDone(response=self._response(responses))
 
-    async def _open(self, client: Any, params: dict[str, Any]) -> Any:
+    async def _open(self, client: Any, params: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+        """The open stream, and the parameters actually sent (thinking may be stripped)."""
         try:
-            return await self._create(client, params)
+            return await self._create(client, params), params
         except ModelError:
             raise
         except Exception as error:
-            if not _is_thinking_signature_error(error):
+            if not _is_thinking_signature_error(error) or (
+                _manual_thinking(params) and _in_tool_round(params["messages"])
+            ):
+                # Under manual thinking an open tool round must keep its thinking block,
+                # so a request without the blocks would only be rejected again.
                 raise self._map_error(error, started=False) from error
             # A thinking block failed the API's history check although its recorded
             # prefix matched. The request was rejected before it ran, so it is safe to
@@ -748,8 +953,11 @@ class AnthropicModel(Model):
                 self.name,
             )
             self._rejected_signatures.update(signatures)
+            sent = {**params, "messages": stripped}
             try:
-                return await self._create(client, {**params, "messages": stripped})
+                return await self._create(client, sent), sent
+            except ModelError:
+                raise
             except Exception as retry_error:
                 raise self._map_error(retry_error, started=False) from retry_error
 
@@ -783,13 +991,17 @@ class AnthropicModel(Model):
             cost = None if cost is None or piece is None else cost + piece
             metadata.update(accumulator.metadata())
         usage.cost_usd = cost
+        # The size of the last request sent, unlike usage, which sums every segment.
+        context_tokens = metadata["context_tokens"] = last.context_tokens()
         finish = _FINISH_REASONS.get(last.stop_reason or "", "stop")
         if last.stop_reason in ("pause_turn", "compaction"):
             logger.warning(
-                "%s paused its turn %d times; returning the partial turn.",
+                "%s paused its turn %d times; returning the partial turn. Raise "
+                "max_continuations to let it finish.",
                 self.name,
                 len(responses),
             )
+            metadata["incomplete"] = "max_continuations"
         if finish == "content_filter":
             # A refusal can cut a tool call off mid-input: never run that turn's tools.
             parts = [part for part in parts if not isinstance(part, ToolCallPart)]
@@ -806,19 +1018,41 @@ class AnthropicModel(Model):
             model=last.served_by or self.name,
             provider=self.provider,
             response_id=last.response_id,
+            context_tokens=context_tokens,
         )
 
+    def _prices(self, model: str) -> AnthropicPricing | None:
+        base = _base_id(model)
+        if self.pricing is not None and base == _base_id(self.name):
+            return self.pricing
+        return PRICING.get(base)
+
     def _cost(self, accumulator: _Accumulator) -> float | None:
-        served = _base_id(accumulator.served_by or self.name)
-        prices = self.pricing if served == _base_id(self.name) and self.pricing else None
-        prices = prices or PRICING.get(served)
+        if accumulator.iterations:
+            # Per attempt, each at its own model's prices: a declined attempt (counted even
+            # when it may be credited, so spend limits fail closed) and a compaction, which
+            # top-level usage leaves out.
+            total = 0.0
+            for entry in accumulator.iterations:
+                model = entry.model or (
+                    self.name if entry.kind == "compaction" else accumulator.served_by or self.name
+                )
+                piece = self._entry_cost(model, entry)
+                if piece is None:
+                    return None
+                total += piece
+            return total
+        return self._entry_cost(accumulator.served_by or self.name, accumulator.totals())
+
+    def _entry_cost(self, model: str, entry: _UsageEntry) -> float | None:
+        prices = self._prices(model)
         if prices is None:
             return None
-        write_5m, write_1h = accumulator.cache_writes(default_ttl=self.cache_ttl)
+        write_5m, write_1h = entry.cache_writes(default_ttl=self.cache_ttl)
         return prices.cost(
-            input_tokens=accumulator.input_tokens,
-            output_tokens=accumulator.output_tokens,
-            cache_read_tokens=accumulator.cache_read_tokens,
+            input_tokens=entry.input_tokens,
+            output_tokens=entry.output_tokens,
+            cache_read_tokens=entry.cache_read_tokens,
             cache_write_5m_tokens=write_5m,
             cache_write_1h_tokens=write_1h,
         )
@@ -936,7 +1170,33 @@ def _translate(
             wire[-1]["content"].extend(content)
         else:
             wire.append({"role": role, "content": content})
+    _unique_tool_ids(wire)
     return system, wire
+
+
+def _unique_tool_ids(wire: list[dict[str, Any]]) -> None:
+    """Give a tool call id that repeats an earlier call's id a suffix (``_2``, ``_3``, ...).
+
+    The Messages API needs unique ``tool_use`` ids, and some providers reuse ids such
+    as ``functions.search:0`` in every turn. A result goes with the latest call of its
+    id. The suffix depends only on the position in the history, so it is stable.
+    """
+    used: set[str] = set()
+    latest: dict[str, str] = {}
+    for message in wire:
+        for block in message["content"]:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                original = new = block["id"]
+                count = 1
+                while new in used:
+                    count += 1
+                    new = f"{original}_{count}"
+                used.add(new)
+                latest[original] = block["id"] = new
+            elif block.get("type") == "tool_result" and block["tool_use_id"] in latest:
+                block["tool_use_id"] = latest[block["tool_use_id"]]
 
 
 def _user_content(message: Message, bad_request: Any) -> list[Any]:
@@ -972,8 +1232,21 @@ def _image(part: ImagePart, bad_request: Any) -> dict[str, Any]:
     return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
 
 
+def _wire_id(value: str) -> str:
+    """A tool call id the Messages API accepts (``^[A-Za-z0-9_-]+$``).
+
+    Ids from other providers (``functions.search:0``, say) are mapped to a stable
+    valid id, the same for a call and its result in every request; valid ids are
+    kept as they are.
+    """
+    if _TOOL_ID.match(value):
+        return value
+    digest = hashlib.sha256(value.encode()).hexdigest()[:12]
+    return f"{re.sub(r'[^A-Za-z0-9_-]', '_', value)[:48]}_{digest}"
+
+
 def _tool_result(part: ToolResultPart) -> dict[str, Any]:
-    block: dict[str, Any] = {"type": "tool_result", "tool_use_id": part.tool_call_id}
+    block: dict[str, Any] = {"type": "tool_result", "tool_use_id": _wire_id(part.tool_call_id)}
     if part.content:
         block["content"] = part.content
     if part.is_error:
@@ -989,7 +1262,12 @@ def _assistant_content(message: Message) -> list[Any]:
                 content.append({"type": "text", "text": part.text})
         elif isinstance(part, ToolCallPart):
             content.append(
-                {"type": "tool_use", "id": part.id, "name": part.name, "input": part.arguments}
+                {
+                    "type": "tool_use",
+                    "id": _wire_id(part.id),
+                    "name": part.name,
+                    "input": part.arguments,
+                }
             )
         elif isinstance(part, ReasoningPart):
             opaque = part.opaque or {}
@@ -1061,15 +1339,24 @@ def _canonical(value: Any) -> bytes:
 
 
 def _finalize(
-    messages: list[dict[str, Any]], prefixes: list[str], rejected: set[str]
+    messages: list[dict[str, Any]], prefixes: list[str | None], rejected: set[str]
 ) -> list[dict[str, Any]]:
-    """Resolve thinking blocks: keep a block only while its recorded prefix still matches."""
+    """Resolve thinking blocks: keep a block only while its recorded prefix still matches.
+
+    A ``None`` prefix (a model without the history-editing check) keeps every block.
+    Server tool calls without their result are left out of every assistant message
+    but the last, where the API resumes them.
+    """
     final: list[dict[str, Any]] = []
-    for message, prefix in zip(messages, prefixes, strict=True):
+    last = len(messages) - 1
+    for position, (message, prefix) in enumerate(zip(messages, prefixes, strict=True)):
+        blocks = message["content"]
+        if message["role"] == "assistant" and position < last:
+            blocks = _without_unpaired_server_calls(blocks)
         content: list[dict[str, Any]] = []
-        for block in message["content"]:
+        for block in blocks:
             if isinstance(block, _Bound):
-                matches = block.prefix is None or block.prefix == prefix
+                matches = block.prefix is None or prefix is None or block.prefix == prefix
                 if matches and _signature(block.block) not in rejected:
                     content.append(block.block)
             else:
@@ -1081,6 +1368,23 @@ def _finalize(
         else:
             final.append({"role": message["role"], "content": content})
     return final
+
+
+def _is_server_call(block: Any) -> bool:
+    """A ``server_tool_use``, ``mcp_tool_use`` or other server-side tool call block."""
+    kind = block.get("type") if isinstance(block, dict) else None
+    return isinstance(kind, str) and kind.endswith("tool_use") and kind != "tool_use"
+
+
+def _without_unpaired_server_calls(content: list[Any]) -> list[Any]:
+    """Content without server tool calls that have no result block (a refused turn, or
+    one still paused after ``max_continuations``); the API rejects them mid-history."""
+    answered = {block.get("tool_use_id") for block in content if isinstance(block, dict)}
+    return [
+        block
+        for block in content
+        if not (_is_server_call(block) and block.get("id") not in answered)
+    ]
 
 
 def _signature(block: dict[str, Any]) -> str:
@@ -1106,6 +1410,23 @@ def _strip_thinking(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
     return stripped, signatures
 
 
+def _in_tool_round(messages: list[dict[str, Any]]) -> bool:
+    """Whether the last assistant message called tools: the request continues its round."""
+    for message in reversed(messages):
+        if message["role"] == "assistant":
+            return any(
+                isinstance(block, dict) and block.get("type") == "tool_use"
+                for block in message["content"]
+            )
+    return False
+
+
+def _manual_thinking(options: Mapping[str, Any]) -> bool:
+    """Whether the request uses manual extended thinking (``thinking.type = "enabled"``)."""
+    thinking = options.get("thinking")
+    return isinstance(thinking, Mapping) and thinking.get("type") == "enabled"
+
+
 def _is_thinking_signature_error(error: Exception) -> bool:
     try:
         import anthropic
@@ -1117,7 +1438,7 @@ def _is_thinking_signature_error(error: Exception) -> bool:
     return "signature" in text and "thinking" in text
 
 
-def _continue(params: dict[str, Any], accumulator: _Accumulator) -> tuple[dict[str, Any], str]:
+def _continue(params: dict[str, Any], accumulator: _Accumulator) -> dict[str, Any]:
     """The request that continues a paused turn: the partial turn appended as it was received."""
     messages = [dict(message) for message in params["messages"]]
     blocks = accumulator.replay_blocks()
@@ -1125,16 +1446,7 @@ def _continue(params: dict[str, Any], accumulator: _Accumulator) -> tuple[dict[s
         messages[-1] = {"role": "assistant", "content": [*messages[-1]["content"], *blocks]}
     else:
         messages.append({"role": "assistant", "content": blocks})
-    system = [
-        {key: value for key, value in block.items() if key != "cache_control"}
-        for block in params.get("system") or []
-    ]
-    tools = [
-        {key: value for key, value in tool.items() if key != "cache_control"}
-        for tool in params.get("tools") or []
-    ]
-    fingerprint = _Fingerprint(system, tools)
-    return {**params, "messages": messages}, fingerprint.of(messages)
+    return {**params, "messages": messages}
 
 
 # --- translation: stream events -> qagents ------------------------------------------------
@@ -1147,9 +1459,81 @@ _FINISH_REASONS: dict[str, FinishReason] = {
     "max_tokens": "length",
     "model_context_window_exceeded": "length",
     "refusal": "content_filter",
-    "pause_turn": "stop",
-    "compaction": "stop",
+    # Only a turn still paused after max_continuations ends on these: it is incomplete.
+    "pause_turn": "length",
+    "compaction": "length",
 }
+
+
+def _field(value: Any, name: str) -> Any:
+    return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+
+
+def _breakdown(value: Any) -> tuple[int, int] | None:
+    """The (5-minute, 1-hour) split of a ``cache_creation`` usage object."""
+    if value is None:
+        return None
+    return (
+        _field(value, "ephemeral_5m_input_tokens") or 0,
+        _field(value, "ephemeral_1h_input_tokens") or 0,
+    )
+
+
+class _UsageEntry:
+    """Token counts of one attempt (an entry of ``usage.iterations``) or of a whole response."""
+
+    def __init__(
+        self,
+        *,
+        kind: str = "message",
+        model: str | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        breakdown: tuple[int, int] | None = None,
+    ) -> None:
+        self.kind = kind
+        self.model = model
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cache_read_tokens = cache_read_tokens
+        self.cache_creation_tokens = cache_creation_tokens
+        self.breakdown = breakdown
+
+    @classmethod
+    def of(cls, item: Any) -> _UsageEntry:
+        model = _field(item, "model")
+        return cls(
+            kind=str(_field(item, "type") or "message"),
+            model=model if isinstance(model, str) else None,
+            input_tokens=_field(item, "input_tokens") or 0,
+            output_tokens=_field(item, "output_tokens") or 0,
+            cache_read_tokens=_field(item, "cache_read_input_tokens") or 0,
+            cache_creation_tokens=_field(item, "cache_creation_input_tokens") or 0,
+            breakdown=_breakdown(_field(item, "cache_creation")),
+        )
+
+    @property
+    def prompt_tokens(self) -> int:
+        """The whole prompt: qagents counts cache reads and writes as input too."""
+        return self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
+
+    def cache_writes(self, *, default_ttl: str) -> tuple[int, int]:
+        """Cache-write tokens with the 5-minute and the 1-hour lifetime.
+
+        The reported total is the authority. The TTL breakdown splits it while it
+        covers no more than the total; writes it does not cover (added later in a
+        server-side loop) get the request's lifetime.
+        """
+        total = self.cache_creation_tokens
+        if self.breakdown is not None and 0 < sum(self.breakdown) <= total:
+            write_5m, write_1h = self.breakdown
+            rest = total - write_5m - write_1h
+            if default_ttl == "1h":
+                return write_5m, write_1h + rest
+            return write_5m + rest, write_1h
+        return (0, total) if default_ttl == "1h" else (total, 0)
 
 
 class _Accumulator:
@@ -1174,9 +1558,12 @@ class _Accumulator:
         self.cache_read_tokens = 0
         self.cache_creation_tokens = 0
         self.thinking_tokens = 0
-        self._cache_breakdown: dict[str, int] | None = None
+        self.iterations: list[_UsageEntry] | None = None
+        """``usage.iterations``: one entry per attempt, when the API reports them."""
+        self._cache_breakdown: tuple[int, int] | None = None
         self._blocks: dict[int, dict[str, Any]] = {}
         self._json: dict[int, str] = {}
+        """Raw input text of every block that streams one: client and server tool calls."""
         self._tool_index: dict[int, int] = {}
         self.next_tool_index = first_tool_index
 
@@ -1219,21 +1606,25 @@ class _Accumulator:
             self.thinking_tokens = details.thinking_tokens
         breakdown = getattr(usage, "cache_creation", None)
         if breakdown is not None:
-            self._cache_breakdown = {
-                "5m": breakdown.ephemeral_5m_input_tokens or 0,
-                "1h": breakdown.ephemeral_1h_input_tokens or 0,
-            }
+            self._cache_breakdown = _breakdown(breakdown)
+        iterations = getattr(usage, "iterations", None)
+        if iterations:
+            # A snapshot of every attempt so far: the newest replaces the older one.
+            self.iterations = [_UsageEntry.of(item) for item in iterations]
 
     def _start(self, index: int, block: Any) -> list[ModelStreamEvent]:
         data = block.to_dict(mode="json")
         self._blocks[index] = data
-        if data.get("type") == "fallback":
+        kind = data.get("type")
+        if kind == "fallback":
             target = (data.get("to") or {}).get("model")
             if isinstance(target, str):
                 self.served_by = target
-        if data.get("type") != "tool_use":
+            self._cache_breakdown = None  # it described the declined attempt
+        if isinstance(kind, str) and kind.endswith("tool_use"):
+            self._json[index] = ""  # server_tool_use and mcp_tool_use stream input too
+        if kind != "tool_use":
             return []
-        self._json[index] = ""
         position = self.next_tool_index
         self._tool_index[index] = position
         self.next_tool_index += 1
@@ -1254,6 +1645,8 @@ class _Accumulator:
             block["signature"] = delta.signature
         elif kind == "input_json_delta" and index in self._json:
             self._json[index] += delta.partial_json
+            if index not in self._tool_index:
+                return []  # a server-side call: not a tool for the loop to run
             return [
                 ToolCallDelta(
                     index=self._tool_index[index],
@@ -1291,13 +1684,16 @@ class _Accumulator:
 
     def parts(self) -> list[Part]:
         parts: list[Part] = []
-        for index, block in self._ordered():
+        ordered = self._ordered()
+        # The output limit can cut off only the block that was open when it hit.
+        cut_index = ordered[-1][0] if ordered and self.stop_reason in _CUT_OFF else None
+        for index, block in ordered:
             kind = block.get("type")
             if kind == "text":
                 if block.get("text"):
                     parts.append(TextPart(text=block["text"]))
             elif kind == "tool_use":
-                parts.append(self._tool_call(index, block))
+                parts.append(self._tool_call(index, block, cut=index == cut_index))
             elif kind == "thinking":
                 text = block.get("thinking") or ""
                 if block.get("signature"):
@@ -1307,12 +1703,32 @@ class _Accumulator:
                 elif text:
                     parts.append(ReasoningPart(text=text, provider="anthropic"))
             else:
-                # redacted_thinking, fallback, compaction and server-side blocks: kept
-                # as received and sent back unchanged.
-                parts.append(
-                    ReasoningPart(text="", provider="anthropic", opaque=self._opaque(block))
-                )
+                # redacted_thinking, fallback, compaction and server-side blocks: kept as
+                # received (server tool calls with their streamed input) and sent back.
+                opaque = self._opaque(self._with_input(index, block))
+                parts.append(ReasoningPart(text="", provider="anthropic", opaque=opaque))
         return parts
+
+    def _with_input(self, index: int, block: dict[str, Any]) -> dict[str, Any]:
+        """A server-side tool call block with the input streamed for it."""
+        raw = self._json.get(index, "")
+        if block.get("type") == "tool_use" or not raw.strip():
+            return block
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        if not isinstance(parsed, dict):
+            if self.stop_reason in (*_CUT_OFF, "refusal"):
+                return block  # cut off before it ran; never replayed, being unpaired
+            # Never journal or replay a server call without the input it ran with.
+            raise ModelResponseError(
+                f"The input of a {block.get('type')} block in the response was not a JSON object.",
+                provider="anthropic",
+                model=self.model,
+                ambiguous=True,
+            )
+        return {**block, "input": parsed}
 
     def _opaque(self, block: dict[str, Any]) -> dict[str, Any]:
         opaque: dict[str, Any] = {
@@ -1324,9 +1740,18 @@ class _Accumulator:
             opaque["prefix"] = self.fingerprint
         return opaque
 
-    def _tool_call(self, index: int, block: dict[str, Any]) -> ToolCallPart:
+    def _tool_call(self, index: int, block: dict[str, Any], *, cut: bool = False) -> ToolCallPart:
         call_id, name = str(block.get("id") or ""), str(block.get("name") or "")
         raw = self._json.get(index, "")
+        if cut:
+            # The output limit ended the response inside this call: its input may be
+            # incomplete even when what arrived parses (or nothing arrived). Never run it.
+            return ToolCallPart(
+                id=call_id,
+                name=name,
+                raw_arguments=raw,
+                parse_error=prompts.TOOL_CALL_TRUNCATED,
+            )
         if not raw.strip():
             arguments = block.get("input")
             if isinstance(arguments, dict):
@@ -1359,26 +1784,48 @@ class _Accumulator:
                 block = {**block, "input": call.arguments}
             elif block.get("type") == "text" and not block.get("text"):
                 continue
+            else:
+                block = self._with_input(index, block)
             blocks.append(block)
         return blocks
 
-    def cache_writes(self, *, default_ttl: str) -> tuple[int, int]:
-        """Cache-write tokens with the 5-minute and the 1-hour lifetime."""
-        if self._cache_breakdown is not None and sum(self._cache_breakdown.values()):
-            return self._cache_breakdown["5m"], self._cache_breakdown["1h"]
-        if default_ttl == "1h":
-            return 0, self.cache_creation_tokens
-        return self.cache_creation_tokens, 0
+    def totals(self) -> _UsageEntry:
+        """The top-level usage: the attempt that produced the returned message."""
+        return _UsageEntry(
+            model=self.served_by,
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+            cache_creation_tokens=self.cache_creation_tokens,
+            breakdown=self._cache_breakdown,
+        )
 
     def usage(self) -> Usage:
+        # Every attempt when the API itemizes them (declined fallback attempts and
+        # compaction are absent from the top-level counts), else the top-level counts.
+        entries = self.iterations or [self.totals()]
         return Usage(
             requests=1,
             # qagents counts the whole prompt as input; the API reports cached parts apart.
-            input_tokens=self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens,
-            output_tokens=self.output_tokens,
-            cached_input_tokens=self.cache_read_tokens,
+            input_tokens=sum(entry.prompt_tokens for entry in entries),
+            output_tokens=sum(entry.output_tokens for entry in entries),
+            cached_input_tokens=sum(entry.cache_read_tokens for entry in entries),
             reasoning_tokens=self.thinking_tokens,
         )
+
+    def context_tokens(self) -> int:
+        """Prompt plus output of the last sampling step: the size of the conversation now.
+
+        From the last ``message`` entry of ``usage.iterations`` when there is one,
+        never from a ``compaction`` entry or from summed counts.
+        """
+        sampled = [
+            entry
+            for entry in self.iterations or []
+            if entry.kind in ("message", "fallback_message")
+        ]
+        last = sampled[-1] if sampled else self.totals()
+        return last.prompt_tokens + last.output_tokens
 
     def metadata(self) -> dict[str, Any]:
         metadata: dict[str, Any] = {}

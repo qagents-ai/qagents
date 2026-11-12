@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
-from qagents import Agent, Hooks, Limits, Permissions, RunContext, Session, Usage, prompts, tool
-from qagents.errors import ConfigurationError
+from qagents import (
+    Agent,
+    Hooks,
+    Limits,
+    Message,
+    Permissions,
+    RunContext,
+    Session,
+    Usage,
+    prompts,
+    tool,
+)
+from qagents.errors import ConfigurationError, ModelServerError
+from qagents.models.base import ModelResponse
 from qagents.models.testing import FunctionModel, ScriptedModel, call
 
 
@@ -258,7 +272,7 @@ async def test_max_tool_calls_stops_the_run_and_closes_the_open_calls():
     )
     # Two calls ran; the third was not started, and the run stopped there.
     assert (result.status, result.stop_reason) == ("limit_reached", "max_tool_calls")
-    assert log == ["a", "b"] and len(model.requests) == 2
+    assert sorted(log) == ["a", "b"] and len(model.requests) == 2  # read-only: in parallel
     refused = result.messages[-1].tool_results[0]
     assert refused.is_error
     assert refused.content == prompts.TOOL_CALL_LIMIT.format(name="lookup", limit=2)
@@ -270,3 +284,200 @@ async def test_max_tool_calls_stops_the_run_and_closes_the_open_calls():
     assert log == ["a"] and result.stop_reason == "max_tool_calls"
     ran, refused = result.messages[-1].tool_results
     assert (ran.content, refused.is_error) == ("a", True)
+
+
+# -- 0.2 review fixes: what a sub-agent returns, budgets shared live, depth ------------------
+
+
+async def test_as_tool_returns_the_accepted_output_not_the_last_message_text():
+    # A sub-agent in output_mode="tool" answers through final_answer: its text is empty.
+    geo = Agent(
+        ScriptedModel([call("final_answer", value="Paris")]), name="geo", output_mode="tool"
+    )
+    lead_model = ScriptedModel([call("geo", task="capital of France"), "done"])
+    await Agent(lead_model, tools=[geo]).run("go")
+    assert lead_model.requests[1].messages[-1].tool_results[0].content == "Paris"
+
+    # An output validator's replacement is what the caller sees.
+    def redact(ctx, text: str) -> str:
+        return text.replace("4111-1111", "[redacted]")
+
+    finder = Agent(
+        ScriptedModel(["card 4111-1111 found"]), name="finder", output_validators=[redact]
+    )
+    lead_model = ScriptedModel([call("finder", task="look"), "done"])
+    await Agent(lead_model, tools=[finder]).run("go")
+    assert lead_model.requests[1].messages[-1].tool_results[0].content == "card [redacted] found"
+
+
+async def test_a_refused_sub_agent_is_an_error_result_never_ok():
+    class Report(BaseModel):
+        summary: str
+
+    refusal = ModelResponse(
+        message=Message.assistant("I cannot help with that."), finish_reason="content_filter"
+    )
+    for output_type in (Report, None):
+        analyst = Agent(ScriptedModel([refusal]), name="analyst", output_type=output_type)
+        lead_model = ScriptedModel([call("analyst", task="analyse X"), "ok"])
+        await Agent(lead_model, tools=[analyst]).run("go")
+        result = lead_model.requests[1].messages[-1].tool_results[0]
+        assert result.is_error
+        assert result.content == prompts.SUBAGENT_STOPPED.format(
+            name="analyst", reason="content_filter"
+        )
+
+
+async def test_a_failed_or_timed_out_child_still_counts_its_usage_in_the_parent():
+    billed = Usage(requests=1, input_tokens=4000, output_tokens=1000)
+    worker = Agent(
+        ScriptedModel(
+            [call("search", query="x"), ModelServerError("down", retryable=False)], usage=billed
+        ),
+        name="worker",
+        tools=[search],
+    )
+    lead = Agent(
+        ScriptedModel([call("worker", task="dig"), "unreachable"]),
+        tools=[worker],
+        limits=Limits(max_total_tokens=3000),
+    )
+    result = await lead.run("go")
+    assert result.usage.total_tokens == 5000  # the failed child's request counts
+    assert (result.status, result.stop_reason) == ("limit_reached", "max_total_tokens")
+
+    async def reply(request):
+        if len(request.messages) < 3:
+            return call("search", query="x")
+        await asyncio.sleep(5)  # the second request never ends in time
+        return "late"
+
+    sleeper = Agent(FunctionModel(reply, usage=billed), name="sleeper", tools=[search])
+    lead = Agent(
+        ScriptedModel([call("sleeper", task="dig"), "done"]),
+        tools=[sleeper.as_tool(timeout=0.3)],
+    )
+    result = await lead.run("go")
+    assert "did not finish within 0.3 seconds" in result.messages[2].tool_results[0].content
+    assert result.usage.total_tokens == 5000  # its first request was billed before the timeout
+
+
+async def test_children_running_in_parallel_share_the_parents_budget_live():
+    def worker(name: str) -> Agent:
+        model = FunctionModel(
+            lambda request: call("search", query="more"),
+            usage=Usage(requests=1, input_tokens=25, output_tokens=5),
+        )
+        return Agent(model, name=name, tools=[search])
+
+    a, b = worker("a"), worker("b")
+    lead = Agent(
+        ScriptedModel([[call("a", task="dig"), call("b", task="dig")], "done"]),
+        tools=[a.as_tool(read_only=True), b.as_tool(read_only=True)],
+        limits=Limits(max_total_tokens=100),
+    )
+    result = await lead.run("go")
+    # 100 tokens are shared: four requests of 30 between the two children, not four each.
+    assert len(a.model.requests) + len(b.model.requests) == 4
+    assert result.usage.total_tokens == 120
+    assert result.stop_reason == "max_total_tokens"
+
+
+async def test_adding_a_childs_result_usage_again_does_not_count_it_twice():
+    child = Agent(ScriptedModel(["hi"], usage=Usage(requests=1, input_tokens=7)), name="child")
+
+    @tool
+    async def ask_child(ctx: RunContext[Any]) -> str:
+        """Ask the child."""
+        result = await child.run("hello", parent=ctx)
+        ctx.add_usage(result.usage)  # what code written for 0.2 does
+        return result.output
+
+    lead = Agent(ScriptedModel([call("ask_child"), "done"]), tools=[ask_child])
+    result = await lead.run("go")
+    assert result.usage.input_tokens == 7 and result.usage.requests == 3
+
+
+async def test_max_depth_is_inherited_by_every_level_and_reported_to_the_model():
+    leaf_model = ScriptedModel(["leaf answer"])
+    leaf = Agent(leaf_model, name="leaf")
+    mid_model = ScriptedModel([call("leaf", task="go deeper"), "mid answer"])
+    mid = Agent(mid_model, name="mid", tools=[leaf])  # default limits: max_depth=5
+    root = Agent(
+        ScriptedModel([call("mid", task="delegate"), "root answer"]),
+        name="root",
+        tools=[mid],
+        limits=Limits(max_depth=1),
+    )
+    tracer = Tracer()
+    root.hooks.append(tracer)
+    result = await root.run("go")
+
+    assert [depth for *_, depth in tracer.runs] == [0, 1]  # the leaf never started
+    assert leaf_model.requests == []
+    refused = mid_model.requests[1].messages[-1].tool_results[0]
+    assert refused.is_error
+    assert refused.content == prompts.SUBAGENT_TOO_DEEP.format(name="leaf", depth=2, limit=1)
+    assert result.output == "root answer"
+
+
+async def test_as_tool_takes_a_timeout_and_tools_can_read_their_limits():
+    helper = Agent(ScriptedModel([]), name="helper")
+    assert helper.as_tool(timeout=600).timeout == 600
+
+    seen: list[tuple[Any, dict[str, Any]]] = []
+
+    @tool(read_only=True)
+    def budget(ctx: RunContext[Any]) -> str:
+        """Report the budget."""
+        seen.append((ctx.limits, ctx.remaining_budget()))
+        return "ok"
+
+    worker = Agent(
+        ScriptedModel([call("budget"), "done"], usage=Usage(requests=1, input_tokens=10)),
+        name="worker",
+        tools=[budget],
+    )
+    lead = Agent(
+        ScriptedModel([call("worker", task="t"), "done"], usage=Usage(requests=1, input_tokens=30)),
+        tools=[worker],
+        limits=Limits(max_total_tokens=100, max_depth=3),
+    )
+    await lead.run("go")
+    ((limits, remaining),) = seen
+    assert limits.max_total_tokens == 70 and limits.max_depth == 3
+    assert remaining["max_total_tokens"] == 60  # live: the worker's own first request counts
+    assert RunContext().limits is None
+
+
+async def test_a_cost_that_is_not_reported_stops_a_run_with_a_cost_budget():
+    unpriced = FunctionModel(
+        lambda request: call("search", query="x"), usage=Usage(requests=1, input_tokens=200_000)
+    )
+    result = await Agent(unpriced, tools=[search], limits=Limits(max_cost_usd=0.01)).run("go")
+    assert (result.status, result.stop_reason) == ("limit_reached", "max_cost_usd")
+    assert len(unpriced.requests) == 1
+    assert result.usage.unpriced_requests == 1 and result.usage.cost_usd is None
+
+    priced = Usage(requests=1, input_tokens=10, cost_usd=0.001)
+    mixed = priced.add(Usage(requests=1, input_tokens=10))
+    assert mixed.cost_usd == 0.001 and mixed.unpriced_requests == 1 and not mixed.cost_complete
+    assert "unpriced_requests" not in priced.add(priced).model_dump()  # 0 is left out
+
+
+async def test_a_response_marked_unpriced_stops_a_run_with_a_cost_budget():
+    # What a model reports when its server sent no usage at all: no tokens, no cost, unpriced.
+    unreported = Usage(requests=1, unpriced_requests=1)
+    silent = FunctionModel(lambda request: call("search", query="x"), usage=unreported)
+    limits = Limits(max_cost_usd=0.01, max_turns=6)
+    session = Session()
+    result = await Agent(silent, tools=[search], limits=limits).run("go", session=session)
+    assert (result.status, result.stop_reason) == ("limit_reached", "max_cost_usd")
+    assert len(silent.requests) == 1
+    assert result.usage.unpriced_requests == 1 and not result.usage.cost_complete
+    assert (await session.state()).run_usage.unpriced_requests == 1  # journaled for a resume
+
+    # A test model's usage (one request, nothing else) counts as free.
+    free = FunctionModel(lambda request: "done", usage=Usage(requests=1))
+    plain = await Agent(free, limits=limits).run("go")
+    assert plain.completed and plain.usage.cost_complete

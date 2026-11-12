@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_serializer
 
 Role = Literal["system", "user", "assistant", "tool"]
 
@@ -128,22 +128,52 @@ class Usage(BaseModel):
     cached_input_tokens: int = 0
     reasoning_tokens: int = 0
     cost_usd: float | None = None
-    """``None`` when no request reported or allowed computing a cost."""
+    """The sum of the costs that are known; ``None`` when no request reported or
+    allowed computing one. Requests without a cost are counted in
+    ``unpriced_requests``, so a total that leaves some out says so."""
+    unpriced_requests: int = 0
+    """Requests that used tokens but whose cost is unknown, so ``cost_usd`` does
+    not include them. A sum (`add`) counts a single response that used tokens
+    and has no ``cost_usd`` as unpriced. A response with no tokens and no cost
+    counts as free, so a model whose server reported no usage at all must say so
+    by setting ``unpriced_requests=1`` (``Limits.max_cost_usd`` then stops the
+    run). Left out of the serialised form while 0."""
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
+    @property
+    def cost_complete(self) -> bool:
+        """Every request that used tokens has a known cost."""
+        return _unpriced(self) == 0
+
     def add(self, other: Usage) -> Usage:
-        if self.cost_usd is None and other.cost_usd is None:
-            cost = None
-        else:
-            cost = (self.cost_usd or 0.0) + (other.cost_usd or 0.0)
+        known = [usage.cost_usd for usage in (self, other) if usage.cost_usd is not None]
         return Usage(
             requests=self.requests + other.requests,
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
             cached_input_tokens=self.cached_input_tokens + other.cached_input_tokens,
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
-            cost_usd=cost,
+            cost_usd=sum(known) if known else None,
+            unpriced_requests=_unpriced(self) + _unpriced(other),
         )
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if not self.unpriced_requests:  # journals and reports keep their old shape
+            data.pop("unpriced_requests", None)
+        return data
+
+
+def _unpriced(usage: Usage) -> int:
+    """Requests of ``usage`` whose cost is unknown.
+
+    A provider reports one response without a cost as ``cost_usd=None``; it is
+    counted here, so a sum that mixes priced and unpriced responses keeps the count.
+    """
+    if usage.unpriced_requests or usage.cost_usd is not None:
+        return usage.unpriced_requests
+    return max(usage.requests, 1) if usage.total_tokens > 0 else 0

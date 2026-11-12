@@ -20,14 +20,16 @@ servers.
 What the toolkit does for safety:
 
 * **Approval for side effects.** A tool the server does not declare read-only
-  asks for approval unless the server declares it non-destructive
-  (``approval="destructive"``, the default). The MCP defaults treat a tool
-  without annotations as possibly destructive, and so does this toolkit.
+  asks for approval (``approval="side_effects"``, the default). With
+  ``approval="destructive"`` a tool the server declares non-destructive runs
+  without asking too. The MCP defaults treat a tool without annotations as
+  possibly destructive, and so does this toolkit.
 * **Pinned definitions.** Every tool has a `definition_hash`. Pass ``pins`` to
-  accept only the definitions you reviewed; a tool whose definition changed is
-  not exposed. Within one toolkit the first definition seen is pinned too, so a
-  server cannot change a tool's description or schema after the agent started
-  using it (a "rug pull").
+  expose only the definitions you reviewed: a tool that is not in ``pins`` is
+  left out (unless ``allow_unpinned=True``), and a pinned tool whose definition
+  changed is not exposed. Within one toolkit the first definition seen is pinned
+  too, so a server cannot change a tool's description or schema after the agent
+  started using it (a "rug pull").
 * **No binary for the model.** Images, audio and binary resources in a result
   become short text placeholders that name the MIME type.
 * **Failures are results.** A tool error, a timeout or a lost connection becomes
@@ -35,7 +37,11 @@ What the toolkit does for safety:
 
 Annotations (``readOnlyHint``, ``destructiveHint``, ``idempotentHint``) are
 claims made by the server. Trust them only as far as you trust the server; use
-``approval="all"`` or permission rules for servers you do not control.
+``approval="all"`` or permission rules for servers you do not control. With
+``approval="all"`` the toolkit ignores the annotations altogether: every tool
+asks, none counts as read-only (so ``Permissions(mode="read_only")`` refuses
+them and they run one at a time), and none counts as idempotent (so an
+interrupted call is not run again on resume).
 """
 
 from __future__ import annotations
@@ -87,7 +93,7 @@ from ..tools import RunContext, Tool, Toolkit
 
 logger = logging.getLogger("qagents.mcp")
 
-ApprovalPolicy = Literal["destructive", "all", "none"]
+ApprovalPolicy = Literal["side_effects", "destructive", "all", "none"]
 OnChange = Literal["error", "warn"]
 ServerTarget = Any
 """What `MCPToolkit` connects to: a zero-argument function that returns an MCP transport
@@ -135,10 +141,11 @@ class MCPProgress(BaseModel):
 def definition_hash(definition: mcp_types.Tool) -> str:
     """Fingerprint of what a tool tells the model and how it is treated.
 
-    The SHA-256 of the tool's name, description, input schema and annotations, in
-    canonical JSON. Annotations are included because they decide whether a call
-    needs approval: a server that starts calling a destructive tool read-only has
-    changed the tool.
+    The SHA-256 of the tool's name, description, title (when it has one), input
+    schema and annotations, in canonical JSON. The title is included because the
+    model reads it as the description when the tool has none. Annotations are
+    included because they decide whether a call needs approval: a server that
+    starts calling a destructive tool read-only has changed the tool.
 
     Args:
         definition: A tool as listed by the server.
@@ -157,6 +164,8 @@ def definition_hash(definition: mcp_types.Tool) -> str:
         "inputSchema": definition.input_schema,
         "annotations": annotations or None,
     }
+    if definition.title is not None:  # only when set: earlier pins of untitled tools stay valid
+        payload["title"] = definition.title
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -307,10 +316,11 @@ class MCPToolkit(Toolkit):
         separator: Literal["__", "_"] = "__",
         include: Iterable[str] | None = None,
         exclude: Iterable[str] = (),
-        approval: ApprovalPolicy = "destructive",
+        approval: ApprovalPolicy = "side_effects",
         pins: Mapping[str, str] | None = None,
         on_change: OnChange = "error",
         pin_on_first_use: bool = True,
+        allow_unpinned: bool = False,
         timeout: float | None = None,
         connect_timeout: float = 30.0,
         prefer_structured: bool = False,
@@ -329,16 +339,22 @@ class MCPToolkit(Toolkit):
             separator: ``"__"`` or ``"_"``.
             include: Glob patterns of server tool names to expose. Default: all.
             exclude: Glob patterns of server tool names to hide.
-            approval: ``"destructive"`` asks before tools the server does not
-                declare read-only or non-destructive; ``"all"`` asks before every
-                tool; ``"none"`` never asks (permission rules still apply).
-            pins: Server tool name -> expected `definition_hash`. A listed tool
-                whose hash differs is not exposed.
+            approval: ``"side_effects"`` asks before every tool the server does
+                not declare read-only; ``"destructive"`` asks only before tools
+                the server does not declare read-only or non-destructive;
+                ``"all"`` asks before every tool and ignores the server's
+                annotations (no tool counts as read-only or idempotent);
+                ``"none"`` never asks (permission rules still apply).
+            pins: Server tool name -> expected `definition_hash`. Only these
+                tools are exposed, and one whose hash differs is not. ``{}``
+                exposes nothing.
             on_change: When a pinned tool changed: ``"error"`` makes `tools`
                 raise `MCPToolChangedError`; ``"warn"`` logs a warning and leaves
                 the tool out.
             pin_on_first_use: Also pin each tool to the first definition this
                 toolkit saw, so it cannot change while in use.
+            allow_unpinned: With ``pins``, also expose the tools that are not in
+                ``pins`` instead of leaving them out with a warning.
             timeout: Seconds per tool call; ``None`` uses the run's
                 ``Limits.tool_timeout_s``.
             connect_timeout: Seconds to start the server and finish the handshake.
@@ -359,9 +375,10 @@ class MCPToolkit(Toolkit):
             )
         if separator not in ("__", "_"):
             raise ConfigurationError("MCP separator must be '__' or '_'.")
-        if approval not in ("destructive", "all", "none"):
+        if approval not in ("side_effects", "destructive", "all", "none"):
             raise ConfigurationError(
-                f"approval={approval!r} is not valid: use 'destructive', 'all' or 'none'."
+                f"approval={approval!r} is not valid: use 'side_effects', 'destructive', "
+                "'all' or 'none'."
             )
         if on_change not in ("error", "warn"):
             raise ConfigurationError(
@@ -394,6 +411,7 @@ class MCPToolkit(Toolkit):
         self.pins: dict[str, str] | None = dict(pins) if pins is not None else None
         self.on_change: OnChange = on_change
         self.pin_on_first_use = pin_on_first_use
+        self.allow_unpinned = allow_unpinned
         self.timeout = timeout
         self.connect_timeout = connect_timeout
         self.prefer_structured = prefer_structured
@@ -526,8 +544,9 @@ class MCPToolkit(Toolkit):
     async def definition_hashes(self) -> dict[str, str]:
         """`definition_hash` of every tool the server lists, before filters and pins.
 
-        Review the tools, then keep this mapping (or part of it) and pass it as
-        ``pins`` so later connections only expose those exact definitions.
+        Review the tools, then keep this mapping (or the part you want the agent
+        to use) and pass it as ``pins``: later connections expose only those tools,
+        and only with those exact definitions.
         """
         async with self._lock():
             connection = await self._ensure_connection()
@@ -537,18 +556,19 @@ class MCPToolkit(Toolkit):
     async def aclose(self) -> None:
         """Close the connection and stop the server process, if there is one.
 
-        The toolkit can be used again afterwards; it reconnects on demand.
+        A connection that is still being opened is waited for and then closed too.
+        That wait covers the connect and the first tool listing (up to
+        ``connect_timeout`` each), and stopping the server adds up to about 30
+        seconds more, so this can take about ``2 * connect_timeout + 30`` seconds
+        at worst. The toolkit can be used again afterwards; it reconnects on demand.
         """
-        connection, self._connection = self._connection, None
-        if connection is None:
-            return
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:  # pragma: no cover - called outside a loop
-            running = None
-        if connection.loop is not running:
-            return  # its loop is gone; closing that loop already stopped the server
-        await self._shutdown(connection)
+        async with self._lock():  # held by tools() and friends while they connect
+            connection, self._connection = self._connection, None
+            if connection is None:
+                return
+            if connection.loop is not asyncio.get_running_loop():
+                return  # its loop is gone; closing that loop already stopped the server
+            await self._shutdown(connection)
 
     async def __aenter__(self) -> MCPToolkit:
         await self.tools()
@@ -771,8 +791,16 @@ class MCPToolkit(Toolkit):
         built: list[MCPTool] = []
         changed: dict[str, tuple[str, str]] = {}
         seen_names: dict[str, str] = {}
+        unpinned: list[str] = []
         for definition in definitions:
             if not self._selected(definition.name):
+                continue
+            if (
+                self.pins is not None
+                and definition.name not in self.pins
+                and not self.allow_unpinned
+            ):
+                unpinned.append(definition.name)
                 continue
             digest = definition_hash(definition)
             expected = (self.pins or {}).get(definition.name)
@@ -801,12 +829,20 @@ class MCPToolkit(Toolkit):
                 )
             seen_names[exposed] = definition.name
             built.append(self._make_tool(definition, exposed))
-        if self.pins:
+        if self.pins is not None:
             missing = sorted(set(self.pins) - {definition.name for definition in definitions})
             if missing:
                 logger.warning(
                     "MCP server %r does not list the pinned tools %s.", self.name, missing
                 )
+        if unpinned:
+            logger.warning(
+                "MCP server %r lists tools that are not in pins=, so they are not exposed: %s. "
+                "Review them (MCPToolkit.definition_hashes() lists them) and add the ones you "
+                "trust to pins=.",
+                self.name,
+                sorted(unpinned),
+            )
         self._change_error = None
         if changed:
             summary = "; ".join(
@@ -825,15 +861,18 @@ class MCPToolkit(Toolkit):
         return built
 
     def _make_tool(self, definition: mcp_types.Tool, exposed: str) -> MCPTool:
-        hints = definition.annotations
+        # approval="all" is for servers you do not trust, so their claims count for nothing.
+        hints = definition.annotations if self.approval != "all" else None
         read_only = bool(hints is not None and hints.read_only_hint is True)
         destructive = not read_only and not (hints is not None and hints.destructive_hint is False)
         if self.approval == "all":
             requires_approval = True
         elif self.approval == "none":
             requires_approval = False
-        else:
+        elif self.approval == "destructive":
             requires_approval = destructive
+        else:
+            requires_approval = not read_only
         return MCPTool(
             self,
             definition,

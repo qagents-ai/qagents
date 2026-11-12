@@ -5,15 +5,33 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
+import logging
 from typing import Any, Literal
 
 import pytest
+from pydantic import BaseModel
 
-from qagents import Agent, Hooks, Limits, RunContext, Session, Usage, prompts, tool
-from qagents.errors import ConfigurationError, GuardrailTripped, OutputValidationError
-from qagents.models.base import ModelRequest
+from qagents import (
+    Agent,
+    Hooks,
+    InMemoryStore,
+    Limits,
+    Message,
+    RunContext,
+    Session,
+    Usage,
+    prompts,
+    tool,
+)
+from qagents.errors import (
+    ConfigurationError,
+    GuardrailTripped,
+    ModelServerError,
+    OutputValidationError,
+)
+from qagents.models.base import ModelRequest, ModelResponse
 from qagents.models.testing import FunctionModel, ScriptedModel, call
-from qagents.multi import RouteResult, fan_out, route
+from qagents.multi import FAN_OUT_TIMEOUT_S, RouteResult, fan_out, route
 
 ONE = Usage(requests=1, input_tokens=10, output_tokens=2)
 
@@ -225,7 +243,8 @@ async def test_cancelling_the_parent_cancels_the_children():
 
     assert (result.status, result.stop_reason) == ("cancelled", "cancelled")
     assert sorted(stopped) == ["a", "b"]  # the third task never started
-    assert result.messages[-1].tool_results[0].content == prompts.TOOL_CANCELLED.format(
+    # Not read-only by default: its outcome is unknown, so it is not repeated.
+    assert result.messages[-1].tool_results[0].content == prompts.TOOL_INTERRUPTED.format(
         name="worker_parallel"
     )
 
@@ -361,3 +380,171 @@ async def test_route_from_a_tool_links_both_runs_and_counts_their_usage():
         ("billing", 1),
     ]
     assert result.usage.requests == 4
+
+
+# -- fixes ----------------------------------------------------------------------------------
+
+
+async def test_the_usage_of_a_worker_that_raises_or_times_out_reaches_the_lead():
+    @tool(read_only=True)
+    def search(query: str) -> str:
+        """Search."""
+        return "found"
+
+    def bills_then_fails(request: ModelRequest) -> Any:
+        if request.messages[-1].role == "tool":
+            raise ModelServerError("the provider is down")
+        return call("search", query="q")  # a billed response
+
+    worker = Agent(FunctionModel(bills_then_fails, usage=ONE), name="worker", tools=[search])
+    lead = Agent(
+        ScriptedModel([call("worker_parallel", tasks=["a", "b"]), "ok"], usage=ONE),
+        tools=[fan_out(worker)],
+    )
+    result = await lead.run("go")
+    assert all("error" in entry for entry in fan_out_result(result))
+    assert result.usage.requests == 2 + 2  # the lead's two, and one billed response per worker
+
+    @tool(read_only=True)
+    async def wait_forever(query: str) -> str:
+        """Search slowly."""
+        await asyncio.Event().wait()
+        return "never"
+
+    stuck = Agent(
+        FunctionModel(lambda request: call("wait_forever", query="q"), usage=ONE),
+        name="w",
+        tools=[wait_forever],
+    )
+    lead = Agent(
+        ScriptedModel([call("w_parallel", tasks=["a"]), "ok"], usage=ONE),
+        tools=[fan_out(stuck, timeout=0.1)],
+    )
+    result = await lead.run("go")
+    assert result.messages[2].tool_results[0].is_error  # the fan-out timed out
+    assert result.usage.requests == 3  # the stuck worker's request still counts
+
+
+async def test_route_counts_the_usage_of_a_route_that_raises():
+    triage = Agent(
+        ScriptedModel(['"billing"'], usage=ONE),
+        name="triage",
+        output_type=Literal["billing", "technical"],
+    )
+    broken = Agent(
+        ScriptedModel([call("missing_tool"), ModelServerError("down")], usage=ONE), name="billing"
+    )
+
+    @tool(read_only=True)
+    async def ask_team(ctx: RunContext[Any], question: str) -> str:
+        """Ask the right team."""
+        routed = await route(triage, {"billing": broken, "technical": broken}, question, parent=ctx)
+        return routed.result.text
+
+    lead = Agent(
+        ScriptedModel([call("ask_team", question="Invoice?"), "Done."], usage=ONE),
+        tools=[ask_team],
+    )
+    result = await lead.run("go")
+    assert result.messages[2].tool_results[0].is_error
+    assert result.usage.requests == 2 + 1 + 1  # lead, classifier, the route's billed request
+
+
+async def test_fan_out_is_not_read_only_by_default_so_a_resume_does_not_repeat_it():
+    sent: list[str] = []
+    started = asyncio.Event()
+
+    @tool
+    async def send_email(to: str) -> str:
+        """Send an email."""
+        sent.append(to)
+        started.set()
+        await asyncio.Event().wait()
+        return "sent"
+
+    mailer = Agent(ScriptedModel([call("send_email", to="a@x")]), name="mailer", tools=[send_email])
+    parallel = fan_out(mailer)
+    assert parallel.read_only is False and parallel.timeout == FAN_OUT_TIMEOUT_S
+    lead_model = ScriptedModel([call("mailer_parallel", tasks=["mail a@x"]), "I am not sure."])
+    lead = Agent(lead_model, name="lead", tools=[parallel])
+    session = Session()
+    running = asyncio.create_task(lead.run("go", session=session))
+    await asyncio.wait_for(started.wait(), 5)
+    running.cancel()  # the process stops while the worker sends the email
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    resumed = await lead.resume(session)
+    assert resumed.status == "completed" and sent == ["a@x"]
+    content = resumed.messages[2].tool_results[0].content
+    assert content == prompts.TOOL_INTERRUPTED.format(name="mailer_parallel")
+
+
+async def test_a_refusing_worker_is_an_error_not_an_answer():
+    refusal = ModelResponse(
+        message=Message.assistant("I cannot help with that."), finish_reason="content_filter"
+    )
+
+    class Facts(BaseModel):
+        facts: list[str]
+
+    plain = Agent(ScriptedModel([refusal]), name="plain")
+    typed = Agent(ScriptedModel([refusal]), name="typed", output_type=Facts)
+    lead = Agent(
+        ScriptedModel(
+            [[call("plain_parallel", tasks=["a"]), call("typed_parallel", tasks=["b"])], "ok"]
+        ),
+        tools=[fan_out(plain), fan_out(typed)],
+    )
+    result = await lead.run("go")
+    entries = [json.loads(part.content) for part in result.messages[2].tool_results]
+    assert entries == [
+        [
+            {
+                "task": "a",
+                "error": prompts.SUBAGENT_STOPPED.format(name="plain", reason="content_filter"),
+            }
+        ],
+        [
+            {
+                "task": "b",
+                "error": prompts.SUBAGENT_STOPPED.format(name="typed", reason="content_filter"),
+            }
+        ],
+    ]
+
+
+async def test_a_worker_too_deep_is_reported_without_a_traceback(caplog):
+    worker_model = ScriptedModel([])
+    worker = Agent(worker_model, name="worker")
+    lead = Agent(
+        ScriptedModel([call("worker_parallel", tasks=["a"]), "ok"]),
+        tools=[fan_out(worker)],
+        limits=Limits(max_depth=0),
+    )
+    with caplog.at_level(logging.ERROR, logger="qagents"):
+        result = await lead.run("go")
+    (entry,) = fan_out_result(result)
+    assert entry["error"] == prompts.SUBAGENT_TOO_DEEP.format(name="worker", depth=1, limit=0)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert worker_model.requests == []
+
+
+async def test_route_reads_quotes_and_markdown_around_a_final_full_stop():
+    for answer in ['"billing".', "'billing'.", "**Billing**.", "`billing`."]:
+        triage = Agent(ScriptedModel([answer]), name="triage")
+        routed = await route(triage, specialists(), "hi")
+        assert routed.route == "billing" and routed.used_default is False
+
+
+async def test_route_says_when_it_took_the_default_and_can_journal_the_classifier():
+    triage = Agent(ScriptedModel(["I am not sure."]), name="triage")
+    routed = await route(triage, specialists(), "hi", default="technical")
+    assert routed.route == "technical" and routed.used_default is True
+
+    store = InMemoryStore()
+    triage = Agent(ScriptedModel(["billing"]), name="triage")
+    classifier_session = Session(store, id="triage-1")
+    routed = await route(triage, specialists(), "Invoice?", classifier_session=classifier_session)
+    assert routed.classification.session is classifier_session
+    assert [m.text for m in await classifier_session.messages()] == ["Invoice?", "billing"]

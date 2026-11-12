@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 import pytest
+from pydantic import BaseModel
 
 anthropic = pytest.importorskip("anthropic")
 httpx2 = pytest.importorskip("httpx2")
@@ -63,7 +65,15 @@ def message_start(
     input_tokens: int = 10,
     cache_read: int = 0,
     cache_write: int = 0,
+    usage_extra: dict | None = None,
 ) -> tuple[str, dict]:
+    usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": 1,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_write,
+        **(usage_extra or {}),
+    }
     return (
         "message_start",
         {
@@ -76,12 +86,7 @@ def message_start(
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 1,
-                    "cache_read_input_tokens": cache_read,
-                    "cache_creation_input_tokens": cache_write,
-                },
+                "usage": usage,
             },
         },
     )
@@ -111,8 +116,9 @@ def message_delta(
     output_tokens: int = 20,
     stop_details: dict | None = None,
     thinking_tokens: int | None = None,
+    usage_extra: dict | None = None,
 ) -> tuple[str, dict]:
-    usage: dict = {"output_tokens": output_tokens}
+    usage: dict = {"output_tokens": output_tokens, **(usage_extra or {})}
     if thinking_tokens is not None:
         usage["output_tokens_details"] = {"thinking_tokens": thinking_tokens}
     return (
@@ -390,16 +396,15 @@ async def test_fallbacks_default_only_goes_to_models_that_support_it():
     fake = FakeAnthropic(reply(text_events(0, "ok")), reply(text_events(0, "ok")))
     await make_model(fake, "claude-haiku-5-5").request(ModelRequest(messages=[Message.user("hi")]))
     assert "fallbacks" not in fake.body and "anthropic-beta" not in fake.requests[-1].headers
-    explicit = make_model(
-        fake,
-        "claude-haiku-4-5-20251001",
-        fallbacks=[{"model": "claude-opus-5"}],
-        thinking_display="updates",
-    )
+    explicit = make_model(fake, "claude-haiku-4-5-20251001", fallbacks=[{"model": "claude-opus-5"}])
     await explicit.request(ModelRequest(messages=[Message.user("hi")]))
     assert fake.body["fallbacks"] == [{"model": "claude-opus-5"}]
     assert fake.body["max_tokens"] == 64000  # Claude Haiku 4.5's maximum output
-    assert fake.requests[-1].headers["anthropic-beta"] == f"{THINKING_UPDATES_BETA},{FALLBACK_BETA}"
+    assert fake.requests[-1].headers["anthropic-beta"] == FALLBACK_BETA
+    updates = AnthropicModel("claude-sonnet-5-5", thinking_display="updates", fallbacks=None)
+    assert updates.build_params(ModelRequest(messages=[Message.user("hi")]))["betas"] == [
+        THINKING_UPDATES_BETA
+    ]
 
 
 async def test_settings_extra_reaches_the_request_and_wins():
@@ -536,12 +541,67 @@ def test_constructor_fails_early_on_bad_options():
         AnthropicModel(fallbacks="always")  # type: ignore[arg-type]
 
 
-def test_structured_output_on_a_model_without_it_says_what_to_do():
-    request = ModelRequest(
-        messages=[Message.user("hi")], output=OutputSpec(json_schema={"type": "object"})
+def test_structured_output_is_sent_to_the_4_x_models_too():
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    request = ModelRequest(messages=[Message.user("hi")], output=OutputSpec(json_schema=schema))
+    for model in (
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5-20250929",
+    ):
+        params = AnthropicModel(model).build_params(request)
+        assert params["output_config"]["format"] == {
+            "type": "json_schema",
+            "schema": {**schema, "additionalProperties": False},
+        }
+
+
+class Scores(BaseModel):
+    summary: str
+    per_language: dict[str, float]
+
+
+async def test_an_open_map_in_a_structured_schema_is_refused_before_sending():
+    fake = FakeAnthropic(reply(text_events(0, "{}")))
+    with pytest.raises(ModelBadRequestError, match=r"\$\.properties\.per_language"):
+        await Agent(make_model(fake), output_type=Scores).run("Score it.")
+    loose = ToolSpec(
+        name="configure",
+        strict=True,
+        parameters={
+            "type": "object",
+            "properties": {"options": {"type": "object", "additionalProperties": True}},
+        },
     )
-    with pytest.raises(ModelBadRequestError, match='output_mode="prompted"'):
-        AnthropicModel("claude-sonnet-4-6").build_params(request)
+    with pytest.raises(ModelBadRequestError, match="tool 'configure'"):
+        await make_model(fake).request(ModelRequest(messages=[Message.user("hi")], tools=[loose]))
+    assert fake.bodies == []
+    # an object with properties that only omits additionalProperties is closed, not refused
+    declared = {"type": "object", "properties": {"a": {"type": "string"}}}
+    closed = AnthropicModel().build_params(
+        ModelRequest(messages=[Message.user("hi")], output=OutputSpec(json_schema=declared))
+    )
+    assert closed["output_config"]["format"]["schema"]["additionalProperties"] is False
+
+
+def test_a_bare_object_in_a_structured_schema_is_an_open_map():
+    model = AnthropicModel()
+    with pytest.raises(ModelBadRequestError, match=r"open map at \$[^.]"):
+        model.build_params(
+            ModelRequest(
+                messages=[Message.user("hi")], output=OutputSpec(json_schema={"type": "object"})
+            )
+        )
+    nested = ToolSpec(
+        name="configure",
+        strict=True,
+        parameters={"type": "object", "properties": {"options": {"type": ["object", "null"]}}},
+    )
+    with pytest.raises(ModelBadRequestError, match=r"\$\.properties\.options"):
+        model.build_params(ModelRequest(messages=[Message.user("hi")], tools=[nested]))
+    empty = ToolSpec(name="ping", strict=True, parameters={"type": "object", "properties": {}})
+    model.build_params(ModelRequest(messages=[Message.user("hi")], tools=[empty]))  # no args: ok
 
 
 async def test_capabilities_come_from_the_table():
@@ -682,6 +742,19 @@ async def test_invalid_tool_arguments_are_reported_not_guessed():
     (call,) = response.message.tool_calls
     assert call.parse_error and call.arguments == {} and call.raw_arguments == '{"city": "Ath'
     assert response.finish_reason == "length"
+
+
+async def test_a_cut_off_tool_call_is_described_by_the_prompt_constant(monkeypatch):
+    from qagents import prompts
+
+    monkeypatch.setattr(prompts, "TOOL_CALL_TRUNCATED", "cut off here")
+    fake = FakeAnthropic(
+        reply(tool_events(0, "toolu_1", "get_weather", '{"city": "Ath'), stop_reason="max_tokens")
+    )
+    _, response = await collect(
+        make_model(fake), ModelRequest(messages=[Message.user("hi")], tools=[WEATHER])
+    )
+    assert response.message.tool_calls[0].parse_error == "cut off here"
 
 
 async def test_stop_reasons_map_to_finish_reasons():
@@ -1046,3 +1119,522 @@ def test_eager_input_streaming_is_off_behind_a_custom_base_url():
         ]["eager_input_streaming"]
         is True
     )
+
+
+# --- regressions from the 0.2 review -------------------------------------------------------------
+
+
+def server_tool_events(
+    index: int, call_id: str, kind: str, raw_input: str
+) -> list[tuple[str, dict]]:
+    """A server-side tool call as the API streams it: ``input: {}``, then input_json_delta."""
+    start = {"type": kind, "id": call_id, "name": "web_search", "input": {}}
+    if kind == "mcp_tool_use":
+        start["server_name"] = "docs"
+    return [
+        block_start(index, start),
+        delta(index, {"type": "input_json_delta", "partial_json": raw_input}),
+        block_stop(index),
+    ]
+
+
+async def test_a_failed_continuation_is_not_retried_from_scratch():
+    fake = FakeAnthropic(
+        reply(
+            server_tool_events(0, "srvtoolu_1", "server_tool_use", "{}"), stop_reason="pause_turn"
+        ),
+        error_response(429, "rate_limit_error", headers={"retry-after": "0"}),
+    )
+    with pytest.raises(ModelRateLimitError) as caught:
+        await Agent(make_model(fake)).run("Research this.")
+    # the billed first segment emitted nothing, yet the model request is not repeated
+    assert caught.value.ambiguous and len(fake.bodies) == 2
+
+
+async def test_server_tool_input_streamed_as_json_deltas_is_kept_and_replayed():
+    fake = FakeAnthropic(
+        reply(
+            text_events(0, "Searching. "),
+            server_tool_events(1, "srvtoolu_1", "server_tool_use", '{"query": "athens weather"}'),
+            stop_reason="pause_turn",
+        ),
+        reply(text_events(0, "Done.")),
+    )
+    events, response = await collect(make_model(fake), ModelRequest(messages=[Message.user("hi")]))
+    assert not any(isinstance(event, ToolCallDelta) for event in events)
+    sent = fake.bodies[1]["messages"][-1]["content"][1]
+    assert sent["type"] == "server_tool_use" and sent["input"] == {"query": "athens weather"}
+    journaled = response.message.parts[1].opaque["block"]
+    assert journaled["input"] == {"query": "athens weather"} and response.message.tool_calls == []
+
+    broken = FakeAnthropic(reply(server_tool_events(0, "mcptoolu_1", "mcp_tool_use", '{"q": ')))
+    with pytest.raises(ModelResponseError) as caught:
+        await make_model(broken).request(ModelRequest(messages=[Message.user("hi")]))
+    assert caught.value.ambiguous
+
+
+def iteration(kind: str, model: str | None, input_tokens: int, output_tokens: int) -> dict:
+    entry = {
+        "type": kind,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    if model is not None:
+        entry["model"] = model
+    return entry
+
+
+async def test_usage_and_cost_come_from_the_iterations_when_reported():
+    fallback = {
+        "type": "fallback",
+        "from": {"model": "claude-opus-5-5"},
+        "to": {"model": "claude-opus-5"},
+        "trigger": {"type": "refusal"},
+    }
+    declined = iteration("message", "claude-opus-5-5", 50_000, 2000)
+    served = iteration("fallback_message", "claude-opus-5", 50_000, 300)
+    fake = FakeAnthropic(
+        reply(
+            text_events(0, "Partial "),
+            [block_start(1, fallback), block_stop(1)],
+            text_events(2, "answer."),
+            start=message_start(input_tokens=50_000),
+            output_tokens=300,
+            usage_extra={"input_tokens": 50_000, "iterations": [declined, served]},
+        ),
+        reply(
+            text_events(0, "ok"),
+            start=message_start(input_tokens=10_000),
+            output_tokens=100,
+            usage_extra={
+                "iterations": [
+                    iteration("compaction", None, 160_000, 4000),
+                    iteration("message", "claude-opus-5-5", 10_000, 100),
+                ]
+            },
+        ),
+    )
+    model = make_model(fake)
+    response = await model.request(ModelRequest(messages=[Message.user("hi")]))
+    # the declined attempt at Claude Opus 5.5 prices, the serving one at Claude Opus 5 prices
+    expected = (50_000 * 4.0 + 2000 * 20.0 + 50_000 * 5.0 + 300 * 25.0) / 1_000_000
+    assert response.usage.cost_usd == pytest.approx(expected)
+    assert (response.usage.input_tokens, response.usage.output_tokens) == (100_000, 2300)
+    assert response.message.metadata["anthropic"]["context_tokens"] == 50_300
+
+    compacted = await model.request(ModelRequest(messages=[Message.user("hi")]))
+    expected = (160_000 * 4.0 + 4000 * 20.0 + 10_000 * 4.0 + 100 * 20.0) / 1_000_000
+    assert compacted.usage.cost_usd == pytest.approx(expected)
+    assert compacted.usage.input_tokens == 170_000
+    # the compaction entry is not the size of the conversation
+    assert compacted.message.metadata["anthropic"]["context_tokens"] == 10_100
+    # and compactors read the size, not the billed sum (F151)
+    from qagents.context import next_request_tokens
+
+    assert compacted.context_tokens == 10_100 and response.context_tokens == 50_300
+    assert next_request_tokens([Message.user("hi"), compacted.message], compacted) == 10_100
+    assert next_request_tokens([Message.user("hi"), response.message], response) == 50_300
+
+
+@pytest.mark.parametrize(("ttl", "price"), [("5m", 5.0), ("1h", 8.0)])
+async def test_cache_writes_beyond_the_message_start_breakdown_are_priced(ttl, price):
+    breakdown = {"ephemeral_5m_input_tokens": 1000, "ephemeral_1h_input_tokens": 0}
+    fake = FakeAnthropic(
+        reply(
+            text_events(0, "ok"),
+            start=message_start(cache_write=1000, usage_extra={"cache_creation": breakdown}),
+            usage_extra={"cache_creation_input_tokens": 1_000_000},
+        )
+    )
+    response = await make_model(fake, cache_ttl=ttl).request(
+        ModelRequest(messages=[Message.user("hi")])
+    )
+    expected = (10 * 4.0 + 1000 * 5.0 + 999_000 * price + 20 * 20.0) / 1_000_000
+    assert response.usage.cost_usd == pytest.approx(expected)
+
+
+async def test_context_tokens_report_the_last_segment_not_the_sum():
+    fake = FakeAnthropic(
+        reply(
+            server_tool_events(0, "srvtoolu_1", "server_tool_use", "{}"), stop_reason="pause_turn"
+        ),
+        reply(text_events(0, "Done."), start=message_start(input_tokens=30)),
+    )
+    response = await make_model(fake).request(ModelRequest(messages=[Message.user("hi")]))
+    assert response.usage.input_tokens == 40  # billed: both segments
+    assert response.message.metadata["anthropic"]["context_tokens"] == 50  # 30 in + 20 out
+    from qagents.context import next_request_tokens
+
+    assert next_request_tokens([Message.user("hi"), response.message], response) == 50
+
+
+def test_eager_input_streaming_follows_the_base_url_from_the_environment(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.internal/anthropic")
+    model = AnthropicModel(api_key="test-key")
+    request = ModelRequest(messages=[Message.user("hi")], tools=[WEATHER])
+    first = model.build_params(request)["tools"]
+    assert "eager_input_streaming" not in first[0]
+    assert model.build_params(request)["tools"] == first
+
+
+async def test_thinking_after_a_pause_is_replayed_with_the_tool_result():
+    search_result = {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []}
+    fake = FakeAnthropic(
+        reply(
+            thinking_events(0, "search first", "SIG-A"),
+            server_tool_events(1, "srvtoolu_1", "server_tool_use", '{"query": "q"}'),
+            stop_reason="pause_turn",
+        ),
+        reply(
+            [block_start(0, search_result), block_stop(0)],
+            thinking_events(1, "now the weather", "SIG-B"),
+            tool_events(2, "toolu_1", "get_weather", '{"city": "Athens"}'),
+            stop_reason="tool_use",
+        ),
+        reply(text_events(0, "Sunny.")),
+    )
+    result = await Agent(make_model(fake), instructions="Be brief.", tools=[get_weather]).run("hi")
+    assert result.output == "Sunny."
+    sent = [block.get("signature") for block in fake.bodies[2]["messages"][1]["content"]]
+    assert "SIG-A" in sent and "SIG-B" in sent
+
+
+async def test_an_exhausted_pause_is_incomplete_and_its_server_calls_are_not_replayed():
+    fake = FakeAnthropic(
+        reply(
+            text_events(0, "Let me search more. "),
+            server_tool_events(1, "srvtoolu_1", "server_tool_use", "{}"),
+            stop_reason="pause_turn",
+        ),
+        reply(
+            text_events(0, "Let me search more. "),
+            server_tool_events(1, "srvtoolu_2", "server_tool_use", "{}"),
+            stop_reason="pause_turn",
+        ),
+        reply(text_events(0, "ok")),
+    )
+    model = make_model(fake, max_continuations=1)
+    response = await model.request(ModelRequest(messages=[Message.user("hi")]))
+    assert response.finish_reason == "length"
+    assert response.message.metadata["anthropic"]["incomplete"] == "max_continuations"
+    history = [Message.user("hi"), response.message, Message.user("Go on.")]
+    await model.request(ModelRequest(messages=history))
+    assert [block["type"] for block in fake.body["messages"][1]["content"]] == ["text", "text"]
+
+
+async def test_a_refusal_after_an_mcp_call_leaves_no_unpaired_call_in_history():
+    fake = FakeAnthropic(
+        reply(
+            text_events(0, "Let me look. "),
+            server_tool_events(1, "mcptoolu_1", "mcp_tool_use", '{"q": "x"}'),
+            stop_reason="refusal",
+        ),
+        reply(text_events(0, "ok")),
+    )
+    model = make_model(fake)
+    response = await model.request(ModelRequest(messages=[Message.user("hi")]))
+    history = [Message.user("hi"), response.message, Message.user("Something else, then.")]
+    await model.request(ModelRequest(messages=history))
+    assert fake.body["messages"][1]["content"] == [{"type": "text", "text": "Let me look. "}]
+    # a refusal can cut the call's input off mid-JSON: still a refusal, not an error
+    cut = FakeAnthropic(
+        reply(server_tool_events(0, "mcptoolu_2", "mcp_tool_use", '{"q": '), stop_reason="refusal")
+    )
+    refused = await make_model(cut).request(ModelRequest(messages=[Message.user("hi")]))
+    assert refused.finish_reason == "content_filter"
+
+
+def test_a_fallbacks_list_fails_early_on_a_model_without_server_side_fallback():
+    with pytest.raises(ConfigurationError, match="no server-side fallback"):
+        AnthropicModel("claude-haiku-5-5", fallbacks=[{"model": "claude-opus-5"}])
+    model = AnthropicModel("claude-haiku-5-5")
+    with pytest.raises(ModelBadRequestError, match="no server-side fallback"):
+        Agent(model, settings=ModelSettings(extra={"fallbacks": [{"model": "claude-opus-5"}]}))
+    model.validate_settings(ModelSettings(extra={"fallbacks": None}))
+
+
+async def test_a_cut_off_tool_call_without_input_is_never_run():
+    ran: list[str] = []
+
+    @tool(read_only=True)
+    def purge(scope: str = "everything") -> str:
+        """Purge data."""
+        ran.append(scope)
+        return "purged"
+
+    fake = FakeAnthropic(
+        reply(
+            text_events(0, "Purging only the temp table."),
+            tool_events(1, "toolu_1", "purge"),
+            stop_reason="max_tokens",
+        ),
+        reply(text_events(0, "Stopped.")),
+    )
+    result = await Agent(make_model(fake), tools=[purge]).run("Purge the temp table.")
+    assert ran == []
+    answer = fake.bodies[1]["messages"][-1]["content"][0]
+    assert answer["type"] == "tool_result" and answer.get("is_error") is True
+    assert "max_tokens" in answer["content"] and result.output == "Stopped."
+
+
+def test_tool_call_ids_from_other_providers_are_made_valid_and_stay_paired():
+    search = ToolSpec(name="search", parameters={"type": "object", "properties": {}})
+    history = [
+        Message.user("Find it."),
+        Message.assistant(tool_calls=[ToolCallPart(id="functions.search:0", name="search")]),
+        Message(
+            role="tool",
+            parts=[ToolResultPart(tool_call_id="functions.search:0", name="search", content="r")],
+        ),
+    ]
+    params = AnthropicModel().build_params(ModelRequest(messages=history, tools=[search]))
+    call_id = params["messages"][1]["content"][0]["id"]
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", call_id)
+    assert params["messages"][2]["content"][0]["tool_use_id"] == call_id
+    again = AnthropicModel().build_params(ModelRequest(messages=history, tools=[search]))
+    assert again["messages"][1]["content"][0]["id"] == call_id  # stable across requests
+    valid = [
+        Message.user("x"),
+        Message.assistant(tool_calls=[ToolCallPart(id="toolu_1", name="search")]),
+    ]
+    kept = AnthropicModel().build_params(ModelRequest(messages=valid, tools=[search]))
+    assert kept["messages"][1]["content"][0]["id"] == "toolu_1"
+
+
+async def test_thinking_is_replayed_unchanged_on_models_without_the_history_check():
+    manual = ModelSettings(extra={"thinking": {"type": "enabled", "budget_tokens": 2000}})
+    fake = FakeAnthropic(
+        reply(
+            thinking_events(0, "call step2", "sig-1"),
+            tool_events(1, "toolu_1", "step2", "{}"),
+            stop_reason="tool_use",
+            start=message_start(model="claude-haiku-4-5"),
+        ),
+        reply(text_events(0, "ok"), start=message_start(model="claude-haiku-4-5")),
+    )
+    model = make_model(fake, "claude-haiku-4-5")
+    step = ToolSpec(name="step2", parameters={"type": "object", "properties": {}})
+    first = [Message.system("Steps so far: 0"), Message.user("go")]
+    response = await model.request(ModelRequest(messages=first, tools=[step], settings=manual))
+    result = Message(
+        role="tool", parts=[ToolResultPart(tool_call_id="toolu_1", name="step2", content="done")]
+    )
+    changed = [Message.system("Steps so far: 1"), Message.user("go"), response.message, result]
+    await model.request(ModelRequest(messages=changed, tools=[step], settings=manual))
+    # the open tool round still starts with its thinking block, as manual thinking requires
+    assert fake.body["messages"][1]["content"][0]["signature"] == "sig-1"
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize("model_id", ["claude-sonnet-4-5", "claude-opus-4-1"])
+async def test_manual_thinking_keeps_its_blocks_on_models_not_in_the_table(model_id):
+    manual = ModelSettings(extra={"thinking": {"type": "enabled", "budget_tokens": 2000}})
+    fake = FakeAnthropic(
+        reply(
+            thinking_events(0, "call step2", "sig-1"),
+            tool_events(1, "toolu_1", "step2", "{}"),
+            stop_reason="tool_use",
+        ),
+        reply(text_events(0, "ok")),
+    )
+    model = make_model(fake, model_id)
+    step = ToolSpec(name="step2", parameters={"type": "object", "properties": {}})
+    first = [Message.system("Steps so far: 0"), Message.user("go")]
+    response = await model.request(ModelRequest(messages=first, tools=[step], settings=manual))
+    result = Message(
+        role="tool", parts=[ToolResultPart(tool_call_id="toolu_1", name="step2", content="done")]
+    )
+    changed = [Message.system("Steps so far: 1"), Message.user("go"), response.message, result]
+    await model.request(ModelRequest(messages=changed, tools=[step], settings=manual))
+    assert [block["type"] for block in fake.body["messages"][1]["content"]] == [
+        "thinking",
+        "tool_use",
+    ]
+    # without manual thinking an unknown id still fails closed and drops the stale block
+    adaptive = make_model(FakeAnthropic(reply(text_events(0, "ok"))), model_id)
+    params = adaptive.build_params(ModelRequest(messages=changed, tools=[step]))
+    assert [block["type"] for block in params["messages"][1]["content"]] == ["tool_use"]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_a_rejected_block_under_manual_thinking_is_not_stripped_and_resent():
+    rejected = error_response(
+        400,
+        "invalid_request_error",
+        "messages.1.content.0: Invalid `signature` in `thinking` block.",
+    )
+    fake = FakeAnthropic(rejected, reply(text_events(0, "ok")))
+    model = make_model(fake, "claude-sonnet-4-5")
+    block = {"type": "thinking", "thinking": "t", "signature": "sig-bad"}
+    history = [
+        Message.user("one"),
+        Message(
+            role="assistant",
+            parts=[
+                ReasoningPart(
+                    provider="anthropic", opaque={"provider": "anthropic", "block": block}
+                ),
+                ToolCallPart(id="toolu_1", name="step2"),
+            ],
+        ),
+        Message(
+            role="tool", parts=[ToolResultPart(tool_call_id="toolu_1", name="step2", content="d")]
+        ),
+    ]
+    step = ToolSpec(name="step2", parameters={"type": "object", "properties": {}})
+    manual = ModelSettings(extra={"thinking": {"type": "enabled", "budget_tokens": 2000}})
+    with pytest.raises(ModelBadRequestError, match="signature"):
+        await model.request(ModelRequest(messages=history, tools=[step], settings=manual))
+    assert len(fake.bodies) == 1 and model._rejected_signatures == set()
+
+
+async def test_a_rejected_block_under_manual_thinking_is_stripped_outside_a_tool_round():
+    rejected = error_response(
+        400,
+        "invalid_request_error",
+        "messages.1.content.0: Invalid `signature` in `thinking` block.",
+    )
+    fake = FakeAnthropic(rejected, reply(text_events(0, "ok")))
+    model = make_model(fake, "claude-haiku-4-5")
+    block = {"type": "thinking", "thinking": "t", "signature": "sig-bad"}
+    history = [
+        Message.user("one"),
+        Message(
+            role="assistant",
+            parts=[
+                ReasoningPart(
+                    provider="anthropic", opaque={"provider": "anthropic", "block": block}
+                ),
+                TextPart(text="first answer"),
+            ],
+        ),
+        Message.user("two"),
+    ]
+    manual = ModelSettings(extra={"thinking": {"type": "enabled", "budget_tokens": 2000}})
+    response = await model.request(ModelRequest(messages=history, settings=manual))
+    assert response.message.text == "ok" and len(fake.bodies) == 2
+    resent = [b["type"] for m in fake.bodies[1]["messages"] for b in m["content"]]
+    assert "thinking" not in resent and model._rejected_signatures
+
+
+def test_repeated_tool_call_ids_get_unique_wire_ids_that_stay_paired():
+    search = ToolSpec(name="search", parameters={"type": "object", "properties": {}})
+
+    def turn(question: str, content: str) -> list[Message]:
+        return [
+            Message.user(question),
+            Message.assistant(tool_calls=[ToolCallPart(id="functions.search:0", name="search")]),
+            Message(
+                role="tool",
+                parts=[
+                    ToolResultPart(
+                        tool_call_id="functions.search:0", name="search", content=content
+                    )
+                ],
+            ),
+            Message.assistant("Found."),
+        ]
+
+    history = [*turn("one", "r1"), *turn("two", "r2")]
+    params = AnthropicModel().build_params(ModelRequest(messages=history, tools=[search]))
+    calls = [
+        block
+        for message in params["messages"]
+        for block in message["content"]
+        if block.get("type") == "tool_use"
+    ]
+    results = {
+        block["content"]: block["tool_use_id"]
+        for message in params["messages"]
+        for block in message["content"]
+        if block.get("type") == "tool_result"
+    }
+    first, second = calls[0]["id"], calls[1]["id"]
+    assert first != second and all(re.fullmatch(r"[A-Za-z0-9_-]+", i) for i in (first, second))
+    assert results == {"r1": first, "r2": second}
+    again = AnthropicModel().build_params(ModelRequest(messages=history, tools=[search]))
+    assert [m["content"] for m in again["messages"]] == [m["content"] for m in params["messages"]]
+
+
+def test_thinking_display_updates_fails_on_a_known_model_without_it():
+    with pytest.raises(ConfigurationError, match="updates"):
+        AnthropicModel("claude-sonnet-5", thinking_display="updates")
+    AnthropicModel("claude-opus-5-5", thinking_display="updates")
+    AnthropicModel("claude-future-9", thinking_display="updates")  # unknown: unchecked
+
+
+async def test_an_anthropic_beta_in_extra_headers_is_merged_with_the_adapters_betas():
+    fake = FakeAnthropic(reply(text_events(0, "ok")))
+    headers = {"Anthropic-Beta": "context-management-2025-06-27", "x-trace": "t"}
+    model = make_model(fake, request_options={"extra_headers": headers})
+    await model.request(ModelRequest(messages=[Message.user("hi")]))
+    sent = fake.requests[0].headers
+    assert sent["anthropic-beta"] == f"context-management-2025-06-27,{FALLBACK_BETA}"
+    assert sent["x-trace"] == "t" and fake.body["fallbacks"] == "default"
+
+
+def test_options_a_known_model_rejects_fail_when_it_is_built():
+    for options, needle in [
+        ({"effort": "low"}, "no effort"),
+        ({"thinking_display": "summarized"}, "no adaptive thinking"),
+        ({"max_tokens": 100_000}, "between 1 and 64000"),
+    ]:
+        with pytest.raises(ConfigurationError, match=needle):
+            AnthropicModel("claude-haiku-4-5", **options)
+    with pytest.raises(ConfigurationError, match="xhigh"):
+        AnthropicModel("claude-opus-4-6", effort="xhigh")
+    haiku = AnthropicModel("claude-haiku-4-5")
+    for extra, needle in [
+        ({"output_config": {"effort": "high"}}, "no effort"),
+        ({"thinking": {"type": "adaptive"}}, "no adaptive thinking"),
+    ]:
+        with pytest.raises(ModelBadRequestError, match=needle):
+            Agent(haiku, settings=ModelSettings(extra=extra))
+    AnthropicModel("claude-future-9", effort="xhigh", max_tokens=500_000)  # unknown: unchecked
+
+
+def test_thread_and_mcp_servers_are_refused_with_a_reason():
+    model = AnthropicModel()
+    with pytest.raises(ModelBadRequestError, match="cannot be continued"):
+        model.validate_settings(ModelSettings(extra={"thread": {"type": "create"}}))
+    with pytest.raises(ModelBadRequestError, match="MCPToolkit"):
+        model.validate_settings(ModelSettings(extra={"mcp_servers": []}))
+    with pytest.raises(ConfigurationError, match="cannot be continued"):
+        AnthropicModel(request_options={"thread": {"type": "create"}})
+
+
+async def test_a_continuation_after_a_stripped_retry_builds_on_what_was_sent():
+    rejected = error_response(
+        400,
+        "invalid_request_error",
+        "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to "
+        "a different conversation.",
+    )
+    fake = FakeAnthropic(
+        rejected,
+        reply(
+            thinking_events(0, "fresh", "sig-new"),
+            text_events(1, "Looking. "),
+            server_tool_events(2, "srvtoolu_1", "server_tool_use", "{}"),
+            stop_reason="pause_turn",
+        ),
+        reply(text_events(0, "done")),
+    )
+    model = make_model(fake)
+    stale = {"type": "thinking", "thinking": "t", "signature": "sig-bad"}
+    opaque = {"provider": "anthropic", "block": stale}
+    history = [
+        Message.user("one"),
+        Message(
+            role="assistant",
+            parts=[ReasoningPart(provider="anthropic", opaque=opaque), TextPart(text="A")],
+        ),
+        Message.user("two"),
+    ]
+    response = await model.request(ModelRequest(messages=history))
+    assert response.message.text == "Looking. done" and len(fake.bodies) == 3
+    continued = json.dumps(fake.bodies[2]["messages"])
+    assert "sig-bad" not in continued and "sig-new" in continued
+    assert model._rejected_signatures == {"sig-bad"}

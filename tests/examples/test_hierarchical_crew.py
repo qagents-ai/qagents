@@ -9,7 +9,14 @@ import sys
 
 import pytest
 
-from examples.harness import final_answer, last_text, main, scripted_context, tool_names
+from examples.harness import (
+    final_answer,
+    last_text,
+    main,
+    scripted_context,
+    structured_answer,
+    tool_names,
+)
 from examples.patterns import hierarchical_crew
 from examples.patterns.hierarchical_crew import LaunchReport, run
 from qagents.models.testing import FunctionModel, call
@@ -39,13 +46,6 @@ REPORT = {
 }  # fmt: skip
 
 
-def answer(request, **fields):
-    """A structured answer in either output mode: a final_answer call, or JSON text (native)."""
-    if "final_answer" in tool_names(request):
-        return final_answer(**fields)
-    return json.dumps(fields)
-
-
 def is_manager(request) -> bool:
     return "ask_market" in tool_names(request)
 
@@ -55,7 +55,7 @@ def policy(request, report=REPORT):
     if is_manager(request):
         if request.messages[-1].role == "user":
             return [call(name, tasks=tasks) for name, tasks in QUESTIONS.items()]
-        return answer(request, **report)
+        return structured_answer(request, **report)
     (data,) = tool_names(request) & set(SPECIALIST_CALLS)
     if request.messages[-1].role == "user":
         return SPECIALIST_CALLS[data]
@@ -123,7 +123,7 @@ async def test_a_report_without_an_area_fails(tmp_path):
 async def test_a_manager_that_does_not_delegate_fails(tmp_path):
     def lazy(request):
         if is_manager(request):
-            return answer(request, **REPORT)
+            return structured_answer(request, **REPORT)
         raise AssertionError("no specialist should run")
 
     outcome = await run(scripted_context(lazy, tmp_path))

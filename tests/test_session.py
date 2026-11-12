@@ -18,6 +18,7 @@ from qagents import (
 from qagents.errors import ConfigurationError, ModelServerError
 from qagents.messages import Message
 from qagents.models.testing import ScriptedModel, call
+from qagents.session import Entry
 
 
 async def test_sqlite_session_survives_a_restart(tmp_path):
@@ -241,3 +242,104 @@ async def test_compaction_replaces_old_messages_and_is_journaled():
     assert result.usage.requests == 5  # three agent requests and two summaries are all counted
     assert "compaction" in [entry.kind for entry in await session.entries()]
     assert (await session.messages())[0].text.startswith("Summary of the earlier conversation:")
+
+
+# -- SQLiteStore (F99, F102, F144, L14) --------------------------------------------------
+
+
+async def test_sqlite_writes_do_not_wait_for_the_default_thread_pool(tmp_path):
+    import concurrent.futures
+    import threading
+
+    loop = asyncio.get_running_loop()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(pool)
+    release = threading.Event()
+    hung = loop.run_in_executor(None, release.wait)  # a sync tool that timed out, still running
+    try:
+        async with SQLiteStore(tmp_path / "s.db") as store:
+            entry = Entry(kind="message", data={"message": Message.user("hi").model_dump()})
+            await asyncio.wait_for(store.append("s", [entry]), 5)
+            assert len(await asyncio.wait_for(store.load("s"), 5)) == 1
+    finally:
+        release.set()
+        await hung
+
+
+async def test_sqlite_syncs_every_commit(tmp_path):
+    store = SQLiteStore(tmp_path / "s.db")
+    await store.append("s", [Entry(kind="workflow_step", data={})])
+    assert store._connection is not None
+    (level,) = store._connection.execute("PRAGMA synchronous").fetchone()
+    assert level >= 2  # FULL: a committed entry survives an OS crash or a power loss
+    await store.aclose()
+
+
+async def test_sqlite_keeps_text_with_a_lone_surrogate(tmp_path):
+    @tool(read_only=True)
+    def title() -> dict:
+        """The title, as another service truncated it."""
+        return {"title": "Party \ud83d"}
+
+    async with SQLiteStore(tmp_path / "s.db") as store:
+        session = Session(store, id="s")
+        model = ScriptedModel([call("title"), "Got it."])
+        result = await Agent(model, tools=[title]).run("title?", session=session)
+        assert result.status == "completed"
+        stored = (await session.messages())[2].tool_results[0].content
+        assert "\ud83d" in stored  # the same string comes back
+
+
+class AuditedMemory(InMemoryStore):
+    """A store subclass that mirrors every write (an audit log) by overriding only append."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[str] = []
+
+    async def append(self, session_id, entries):
+        self.seen.extend(entry.kind for entry in entries)
+        await super().append(session_id, entries)
+
+
+class AuditedSQLite(SQLiteStore):
+    async def append(self, session_id, entries):
+        self.seen.extend(entry.kind for entry in entries)
+        await super().append(session_id, entries)
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_a_store_that_overrides_only_append_sees_every_entry_of_a_plain_run(
+    backend, tmp_path
+):
+    if backend == "memory":
+        store = AuditedMemory()
+    else:
+        store = AuditedSQLite(tmp_path / "s.db")
+        store.seen = []
+    async with store:
+        await Agent(ScriptedModel(["hi"])).run("hello", session=Session(store, id="s"))
+        assert store.seen == ["run_started", "message", "message", "run_finished"]
+        assert [entry.kind for entry in await store.load("s")] == store.seen
+
+
+async def test_a_store_that_overrides_only_append_still_runs_one_run_at_a_time():
+    store = AuditedMemory()
+    session = Session(store, id="s")
+    gate, entered = asyncio.Event(), asyncio.Event()
+
+    @tool(read_only=True)
+    async def wait() -> str:
+        """Wait."""
+        entered.set()
+        await gate.wait()
+        return "done"
+
+    first = asyncio.create_task(
+        Agent(ScriptedModel([call("wait"), "ok"]), tools=[wait]).run("one", session=session)
+    )
+    await entered.wait()
+    with pytest.raises(SessionError, match="already has a run in progress"):
+        await Agent(ScriptedModel(["two"])).run("two", session=session)
+    gate.set()
+    assert (await first).status == "completed"

@@ -17,22 +17,45 @@ validated against the signature before your code runs:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextvars
+import functools
 import inspect
 import json
+import logging
+import os
 import re
+import threading
 import typing
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from pydantic_core import to_jsonable_python
 
-from .errors import ConfigurationError, ToolArgumentError
+from . import prompts
+from .errors import ConfigurationError, ToolArgumentError, ToolError
 from .messages import Message, Usage
 from .models.base import ToolSpec
 
+if TYPE_CHECKING:
+    from .agent import Limits
+
 DepsT = TypeVar("DepsT")
+
+logger = logging.getLogger("qagents")
+
+TOOL_THREADS = min(32, (os.cpu_count() or 1) + 4)
+"""Worker threads that run sync tool functions. They belong to qagents, apart from
+the event loop's default executor, so tools that hang cannot starve DNS lookups or
+other libraries. Set it before the first sync tool runs.
+
+A thread cannot be killed: a sync call given up after its timeout (or when its run
+is cancelled) keeps its thread until the function returns. ``asyncio.run`` does not
+wait for it, but the interpreter does at exit, as for every ``concurrent.futures``
+thread: a sync tool that hangs for good keeps the process from exiting. Give sync
+clients their own socket timeouts, or write the tool as an ``async`` function."""
 
 _NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -53,10 +76,14 @@ class RunContext(Generic[DepsT]):
     agent_name: str = ""
     turn: int = 0
     tool_call_id: str | None = None
+    """The tool call this context belongs to; set for every tool call, ``None``
+    for hooks and instructions that run outside one."""
     operation_id: str | None = None
     """Identifies this tool call for good: it is the same when the call is
     repeated after a crash and a resume. Pass it as the idempotency key to
-    the system the tool talks to (a payment API, a queue, a database)."""
+    the system the tool talks to (a payment API, a queue, a database).
+    Always set inside a tool call; ``None`` only outside one (hooks such as
+    ``before_model``, instructions functions)."""
     usage: Usage = field(default_factory=Usage)
     messages: Sequence[Message] = ()
     state: dict[str, Any] = field(default_factory=dict)
@@ -91,14 +118,48 @@ class RunContext(Generic[DepsT]):
     """The run this context belongs to; a child run reads its remaining limits."""
 
     def emit(self, event: Any) -> None:
-        """Put a custom event on the run's event stream (from inside a tool)."""
+        """Put a custom event on the run's event stream (from inside a tool).
+
+        Safe to call from the worker thread of a sync tool: the event is
+        delivered at once, before the tool's ``tool_call_finished``.
+        """
         if self._emit is not None:
             self._emit(event)
 
     def add_usage(self, usage: Usage) -> None:
-        """Count model usage a tool caused (a sub-agent, an embedding call) in the run total."""
+        """Count model usage a tool caused (an embedding call, a model request) in the run total.
+
+        The usage of a child run (``parent=ctx``, as an agent used as a tool
+        starts) is added for you when the child ends; passing its
+        ``result.usage`` here again is recognised and not counted twice.
+        Safe to call from the worker thread of a sync tool.
+        """
         if self._add_usage is not None:
             self._add_usage(usage)
+
+    @property
+    def limits(self) -> Limits | None:
+        """The limits this run stops at; ``None`` for a context that belongs to no run.
+
+        A child run's are already capped by what remained of its parents'
+        budgets when it started, and its ``max_depth`` is the lowest along the
+        chain of parent runs.
+        """
+        return getattr(self._run, "limits", None)
+
+    def remaining_budget(self) -> dict[str, Any]:
+        """What is left right now of the run's ``max_total_tokens``, ``max_cost_usd``
+        and ``timeout_s``, keyed by those names (``None``: no limit).
+
+        It counts the live usage of every run that shares the budget: the
+        parent runs, and child runs that are still working (siblings started in
+        parallel included). A cost total that includes requests without a known
+        cost counts the whole cost budget as spent.
+        """
+        remaining = getattr(self._run, "_remaining", None)
+        if remaining is None:
+            return {"max_total_tokens": None, "max_cost_usd": None, "timeout_s": None}
+        return dict(remaining())
 
 
 class Tool:
@@ -136,7 +197,11 @@ class Tool:
         """Running it twice has the same effect as once, so it is safe to
         repeat after a crash."""
         self.timeout = timeout
-        """Seconds before the call is abandoned; ``None`` uses the run's limit."""
+        """Seconds before the call is given up; ``None`` uses the run's limit.
+        An async function is cancelled at its current ``await``; a sync function
+        cannot be stopped: its thread is abandoned and keeps running (and may
+        still complete its work), and the model is told the outcome is unknown.
+        The interpreter still waits for that thread at exit (`TOOL_THREADS`)."""
         self.strict = strict
         self.deferred = deferred
         """The loop never calls the function: each call pauses the run as a
@@ -164,22 +229,122 @@ class Tool:
     async def run(
         self, ctx: RunContext[Any], arguments: dict[str, Any], *, timeout: float | None = None
     ) -> Any:
-        """Validate ``arguments`` and call the function. Raises what the function raises."""
+        """Validate ``arguments`` and call the function. Raises what the function raises.
+
+        A sync function runs on a worker thread of qagents (`TOOL_THREADS`).
+        The timeout (the tool's own, else ``timeout``) covers the whole call,
+        including an awaitable that a sync function returns. When it expires,
+        `ToolTimeout` is raised; a ``TimeoutError`` raised by the function
+        itself passes through unchanged.
+        """
         kwargs = self.validate(arguments)
         args = (ctx,) if self.takes_context else ()
-        if _is_async_callable(self.function):
-            pending = self.function(*args, **kwargs)
-        else:
-            # A thread cannot be stopped: on timeout the call is abandoned, not killed.
-            pending = asyncio.to_thread(self.function, *args, **kwargs)
         limit = self.timeout if self.timeout is not None else timeout
-        result = await (asyncio.wait_for(pending, limit) if limit else pending)
-        if inspect.isawaitable(result):
-            result = await result
+        thread: concurrent.futures.Future[Any] | None = None
+        try:
+            async with asyncio.timeout(limit or None) as scope:  # None: no deadline
+                if _is_async_callable(self.function):
+                    result = await self.function(*args, **kwargs)
+                else:
+                    # A thread cannot be stopped: on timeout the call is abandoned, not killed.
+                    thread = _run_in_thread(self.name, self.function, args, kwargs)
+                    result = await asyncio.wrap_future(thread)
+                if inspect.isawaitable(result):  # a sync wrapper around a coroutine function
+                    result = await result
+        except TimeoutError:
+            if not scope.expired():
+                raise  # the function's own timeout, not this one
+            started = thread is None or not thread.cancelled()
+            running = thread is not None and started and not thread.done()
+            if running:
+                assert thread is not None
+                _abandon(self.name, thread, "timed out")
+            raise ToolTimeout(
+                limit or 0, started=started, running=running, thread=thread if running else None
+            ) from None
+        except asyncio.CancelledError:
+            # The run was cancelled or timed out: a thread that already runs goes on alone.
+            if thread is not None and not thread.done():  # a queued call was cancelled: done
+                _abandon(self.name, thread, "was cancelled")
+            raise
         return result
 
     def __repr__(self) -> str:
         return f"Tool({self.name!r})"
+
+
+class ToolTimeout(TimeoutError):
+    """A tool call took longer than its timeout (raised by `Tool.run`).
+
+    Args:
+        seconds: The timeout that expired.
+        started: The function had started (``False``: a sync tool that waited
+            for a free worker thread the whole time, and never ran).
+        running: A sync function that could not be stopped and still runs in
+            its abandoned thread.
+        thread: The future of that abandoned thread, while ``running``; done
+            when the function returns at last.
+    """
+
+    def __init__(
+        self,
+        seconds: float,
+        *,
+        started: bool = True,
+        running: bool = False,
+        thread: concurrent.futures.Future[Any] | None = None,
+    ) -> None:
+        super().__init__(f"the tool call did not finish within {seconds:g} seconds")
+        self.seconds = seconds
+        self.started = started
+        self.running = running
+        self.thread = thread
+
+
+_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+_EXECUTOR_SIZE = 0
+_ABANDONED: set[concurrent.futures.Future[Any]] = set()
+"""Calls of sync tools that were given up (timed out, or their run was cancelled or
+timed out) and still hold a worker thread."""
+_LOCK = threading.Lock()
+
+
+def _run_in_thread(
+    name: str, function: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> concurrent.futures.Future[Any]:
+    """Start ``function`` on a worker thread, with the caller's context variables."""
+    global _EXECUTOR, _EXECUTOR_SIZE
+    with _LOCK:
+        if _EXECUTOR is None:
+            _EXECUTOR_SIZE = max(1, TOOL_THREADS)
+            _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_EXECUTOR_SIZE, thread_name_prefix="qagents-tool"
+            )
+        stuck = len(_ABANDONED)
+        if stuck >= _EXECUTOR_SIZE:
+            # A new call would only queue behind threads that may never return: refuse it.
+            raise ToolError(prompts.TOOL_THREADS_EXHAUSTED.format(name=name, count=stuck))
+        context = contextvars.copy_context()
+        return _EXECUTOR.submit(context.run, functools.partial(function, *args, **kwargs))
+
+
+def _abandon(name: str, thread: concurrent.futures.Future[Any], why: str) -> None:
+    with _LOCK:
+        _ABANDONED.add(thread)
+        stuck = len(_ABANDONED)
+    thread.add_done_callback(_release)
+    logger.warning(
+        "Sync tool %s %s; its thread keeps running (%d of %d worker threads abandoned)",
+        name,
+        why,
+        stuck,
+        _EXECUTOR_SIZE,
+    )
+
+
+def _release(thread: concurrent.futures.Future[Any]) -> None:
+    with _LOCK:
+        _ABANDONED.discard(thread)
 
 
 class Toolkit:
@@ -222,10 +387,16 @@ def tool(
             other read-only calls. It must not change ``ctx.state`` either.
         idempotent: Running it twice has the same effect as once, so it is
             safe to repeat after a crash.
-        timeout: Seconds before a call is abandoned; ``None`` uses the run's limit.
+        timeout: Seconds before a call is given up; ``None`` uses the run's
+            limit. An async function is cancelled; a sync function cannot be
+            stopped, so its thread is abandoned and may still finish its work
+            (the model is told the outcome is unknown), and the interpreter
+            waits for it at exit (`TOOL_THREADS`). Give sync clients their own
+            socket timeouts.
         strict: Ask the provider to enforce the schema exactly, where supported.
-        deferred: Never run the function. After the permission check, each
-            call pauses the run as a `PendingInput`; its result comes from
+        deferred: Never run the function. The arguments are validated against
+            the signature, then after the permission check each call pauses
+            the run as a `PendingInput`; its result comes from
             ``agent.resume(session, results={tool_call_id: value})``. Use it for
             work done outside the process: a human's answer, an external job.
     """

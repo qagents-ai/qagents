@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from examples.harness import final_answer, main, scripted_context, tool_names
+from examples.harness import main, scripted_context, structured_answer
 from examples.patterns import agentic_rag
 from examples.patterns.agentic_rag import (
     INDEX,
@@ -34,13 +34,6 @@ ANSWER = (
 )
 
 
-def answer(request, **fields):
-    """A structured answer: a final_answer call in tool mode, JSON text in native mode."""
-    if "final_answer" in tool_names(request):
-        return final_answer(**fields)
-    return json.dumps(fields)
-
-
 def policy(request):
     """Plays the model: search, read the top hit, search again, read, then answer.
 
@@ -64,8 +57,8 @@ def policy(request):
         and (any(c.name == "final_answer" for c in m.tool_calls) or (m.text and not m.tool_calls))
     ]
     if not answered:
-        return answer(request, answer=ANSWER, sources=[*reads, "KB-111"])
-    return answer(request, answer=ANSWER, sources=[source.lower() for source in reads])
+        return structured_answer(request, answer=ANSWER, sources=[*reads, "KB-111"])
+    return structured_answer(request, answer=ANSWER, sources=[source.lower() for source in reads])
 
 
 @pytest.mark.parametrize("output_mode", ["tool", "native"])
@@ -88,7 +81,7 @@ async def test_a_wrong_citation_is_not_ok(tmp_path):
     def cites_a_neighbour(request):  # cites the door sensor, which it did retrieve
         reply = policy(request)
         if isinstance(reply, str) or reply.name == "final_answer":
-            return answer(request, answer=ANSWER, sources=["KB-104", "KB-106"])
+            return structured_answer(request, answer=ANSWER, sources=["KB-104", "KB-106"])
         return reply
 
     outcome = await run(scripted_context(cites_a_neighbour, tmp_path))
@@ -127,7 +120,7 @@ def test_the_validator_accepts_only_retrieved_ids():
 
 async def test_a_model_that_keeps_citing_unretrieved_documents_runs_out_of_retries(tmp_path):
     def stubborn(request):  # never searches, always cites a document it has not seen
-        return answer(request, answer=ANSWER, sources=["KB-104"])
+        return structured_answer(request, answer=ANSWER, sources=["KB-104"])
 
     with pytest.raises(OutputValidationError, match="rejected by an output validator"):
         await run(scripted_context(stubborn, tmp_path))

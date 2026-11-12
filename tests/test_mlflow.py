@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import uuid
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 mlflow = pytest.importorskip("mlflow")
 pytest.importorskip("sqlalchemy")
@@ -18,12 +20,24 @@ from mlflow.entities import SpanStatusCode, SpanType  # noqa: E402
 from mlflow.tracing.constant import SpanAttributeKey, TraceMetadataKey  # noqa: E402
 from mlflow.types.chat import ChatMessage  # noqa: E402
 
-from qagents import Agent, Hooks, Limits, Message, Session, ToolError, Usage, tool  # noqa: E402
+from qagents import (  # noqa: E402
+    Agent,
+    Hooks,
+    Limits,
+    Message,
+    Session,
+    SummarizingCompactor,
+    ToolError,
+    Usage,
+    tool,
+)
 from qagents.errors import (  # noqa: E402
     ConfigurationError,
     DeferToolCall,
     GuardrailTripped,
+    ModelBadRequestError,
     ModelServerError,
+    OutputValidationError,
 )
 from qagents.integrations.mlflow import (  # noqa: E402
     TOOL_FAILED,
@@ -548,3 +562,113 @@ async def test_cache_writes_reported_by_the_provider_reach_the_usage(experiment)
     usage = chat.attributes[SpanAttributeKey.CHAT_USAGE]
     assert usage["cache_creation_input_tokens"] == 30
     assert chat.attributes[SpanAttributeKey.MODEL] == "claude-x"
+
+
+# -- no content in traces unless asked ----------------------------------------------------
+
+SECRET = "patient John Doe, SSN 123-45-6789"
+
+
+class Refund(BaseModel):
+    amount: int
+
+
+def failing_runs(hooks: MLflowHooks) -> list[tuple[Agent, type[Exception]]]:
+    """A run that fails on the model's answer, and one whose provider error echoes the input."""
+    invalid = Agent(
+        ScriptedModel([f'{{"amount": "{SECRET}"}}']),
+        output_type=Refund,
+        output_mode="prompted",
+        limits=Limits(output_retries=0),
+        hooks=[hooks],
+    )
+    echoing = Agent(
+        ScriptedModel([ModelBadRequestError(f"invalid request: {SECRET}")]), hooks=[hooks]
+    )
+    return [(invalid, OutputValidationError), (echoing, ModelBadRequestError)]
+
+
+async def test_without_record_content_exception_text_stays_out_of_the_trace(experiment):
+    hooks = MLflowHooks()
+    for agent, expected in failing_runs(hooks):
+        with pytest.raises(expected):
+            await agent.run("refund me")
+        trace = read_trace(hooks)
+        assert "123-45-6789" not in trace.to_json()
+        assert trace.info.tags["qagents.status"] == "failed"
+        failed = [span for span in trace.data.spans if span.events]
+        assert failed  # the run span, and the chat span of a failed request
+        for span in failed:
+            assert span.status.status_code == SpanStatusCode.ERROR
+            assert span.status.description == expected.__name__
+            (event,) = span.events
+            assert (event.name, event.attributes) == (
+                "exception",
+                {"exception.type": expected.__name__},
+            )
+
+
+async def test_with_record_content_exception_text_is_recorded(experiment):
+    hooks = MLflowHooks(record_content=True)
+    for agent, expected in failing_runs(hooks):
+        with pytest.raises(expected):
+            await agent.run("refund me")
+        (root,) = by_name(read_trace(hooks))["invoke_agent agent"]
+        assert "123-45-6789" in root.events[0].attributes["exception.message"]
+
+
+async def test_a_text_answer_given_with_the_final_answer_tool_is_the_run_output(experiment):
+    hooks = MLflowHooks(record_content=True)
+    model = ScriptedModel([call("final_answer", value="It is sunny in Athens.")])
+    result = await Agent(model, output_mode="tool", hooks=[hooks]).run("Weather?")
+    assert result.output == "It is sunny in Athens." and result.text == ""
+    (root,) = by_name(read_trace(hooks))["invoke_agent agent"]
+    assert root.outputs["choices"][0]["message"]["content"] == "It is sunny in Athens."
+
+
+@pytest.mark.parametrize("record_content", [False, True])
+async def test_a_summary_request_is_traced_and_counted(experiment, record_content):
+    hooks = MLflowHooks(record_content=record_content)
+    summarizer = ScriptedModel(["Earlier: two questions."], name="summarizer", usage=USAGE)
+    agent = Agent(
+        ScriptedModel(["Third answer."], usage=USAGE),
+        compactor=SummarizingCompactor(trigger_tokens=0, keep_last=1, model=summarizer),
+        hooks=[hooks],
+    )
+    history = [
+        Message.user("q1"),
+        Message.assistant("a1"),
+        Message.user("q2"),
+        Message.assistant("a2"),
+    ]
+    await agent.run("q3", history=history)
+    trace = read_trace(hooks)
+    chats = [span for span in trace.data.spans if span.span_type == SpanType.CHAT_MODEL]
+    assert sorted(span.attributes[SpanAttributeKey.MODEL] for span in chats) == [
+        "scripted", "summarizer",
+    ]  # fmt: skip
+    # Each span is named after the model the request went to, not the agent's model.
+    assert [span.name for span in chats] == ["chat summarizer", "chat scripted"]
+    if record_content:
+        assert [span.inputs["model"] for span in chats] == ["summarizer", "scripted"]
+    assert trace.info.token_usage["input_tokens"] == 40  # both requests
+
+
+def test_data_url_images_are_replaced_by_a_placeholder():
+    payload = "A" * 5_000
+    converted = chat_messages(
+        [
+            Message.user(
+                [
+                    TextPart(text="What is this?"),
+                    ImagePart(url=f"data:image/png;base64,{payload}"),
+                    ImagePart(url="DATA:image/svg+xml,<svg></svg>"),
+                ]
+            )
+        ]
+    )
+    assert converted[0]["content"][1:] == [
+        {"type": "text", "text": "[image/png, 5000 base64 characters]"},
+        {"type": "text", "text": "[image/svg+xml, 11 characters]"},
+    ]
+    assert payload not in json.dumps(converted)

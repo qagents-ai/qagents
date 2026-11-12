@@ -62,7 +62,10 @@ async def test_native_mode_sends_the_route_names_as_the_output_schema(tmp_path):
     def native(request):
         if "Classify the user's question" in system_text(request):
             assert not request.tools
-            assert request.output.json_schema == {"enum": ["simple", "complex"], "type": "string"}
+            # Native mode wraps a schema whose root is not an object as {"value": ...}.
+            schema = request.output.json_schema
+            assert schema["properties"]["value"]["enum"] == ["simple", "complex"]
+            assert schema["required"] == ["value"]
             return json.dumps(label(last_text(request)))
         return policy(request)
 

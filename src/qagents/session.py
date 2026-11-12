@@ -11,22 +11,42 @@ Entry kinds:
 
 | Kind | Meaning (data) |
 |---|---|
-| `run_started` | a run began (`agent`) |
-| `message` | a message joined the conversation (`message`) |
+| `run_started` | a run began (`agent`; `limits` when given to the run) |
+| `message` | a message joined the conversation (`message`; see below) |
 | `tool_started` | a tool call began executing (`tool_call_id`, `name`) |
-| `tool_result` | a tool call finished (`result`) |
+| `tool_result` | a tool call finished (`result`; see below) |
 | `tool_deferred` | a tool call waits for a result from outside the run (`input`) |
+| `approval_decided` | an approval was applied to a call, before it ran (see below) |
 | `state_updated` | the session state changed; the full new values (`values`) |
 | `agent_switched` | a handoff changed the active agent (`agent`) |
 | `run_paused` | the run waits for approvals and inputs (`pending`, `inputs`) |
-| `run_finished` | the run ended (`status`, `stop_reason`) |
-| `run_failed` | the run raised and stays open for a resume (`error`) |
+| `guardrail_tripped` | a guardrail blocked the prompt or the answer (`name`, `reason`, `stage`) |
+| `run_finished` | the run ended (`status`, `stop_reason`, `output`, `text`) |
+| `run_failed` | the run raised and stays open for a resume (see below) |
 | `compaction` | the history was replaced by a shorter one (`messages`) |
 | `workflow_step` | a workflow step completed (`name`, `result`) |
 
+Details:
+
+* A `message` from a model response also has the response's `usage`, the
+  `model` and `provider` that answered, and the run's `turn`; a resume adds
+  them up, so limits and `RunResult.usage` cover the whole run.
+* A `tool_result` has `counted` when the call counts toward
+  ``Limits.max_tool_calls``. A call waiting for approval counts only once an
+  approval lets it run (its `tool_started`).
+* Usage added through ``ctx.add_usage`` (a sub-agent, a compactor's summary
+  request) is written as `added_usage` on the run's next `message`,
+  `tool_result`, `run_paused`, `run_failed` or `run_finished` entry.
+* `approval_decided` has `tool_call_id`, `name`, `approved`, `reason`,
+  `arguments_changed`, and `arguments` when the approver changed them.
+* `run_failed` has `error_type`, `message` (the exception's text, shortened),
+  `retryable`, `ambiguous`, and `error` (type and message joined).
+
 Readers must ignore kinds they do not know: new ones may be added. A
 `run_paused` entry written before 0.2 has no ``inputs``; it loads as a pause
-with no pending inputs.
+with no pending inputs. Entries a run writes after its own `run_finished`
+(a run that was abandoned while it still ran) are ignored by `derive_state`,
+so the conversation stays well-formed.
 
 Run status and leases (0.2) are optional store capabilities that
 `qagents.runtime.AgentRuntime` builds on. A store that has them keeps one
@@ -42,6 +62,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import json
 import sqlite3
 import threading
@@ -49,13 +70,14 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Literal, Self, get_args
 
 from pydantic import BaseModel, Field
 
 from .errors import LeaseError, SessionError
-from .messages import Message, ToolResultPart
+from .messages import Message, ToolResultPart, Usage
 
 
 class Entry(BaseModel):
@@ -106,7 +128,8 @@ class SessionState(BaseModel):
     open_run_id: str | None = None
     """Id of a run that started and has not finished (running, paused or crashed)."""
     agent: str | None = None
-    """Agent that was active in the open run."""
+    """Agent that was active in the open run: the one that started it, or the
+    target of its last handoff. ``None`` when no run is open."""
     tool_results: dict[str, ToolResultPart] = Field(default_factory=dict)
     """Results already recorded for tool calls of the last assistant message."""
     started_tools: list[str] = Field(default_factory=list)
@@ -119,6 +142,19 @@ class SessionState(BaseModel):
     """The session state that tools and hooks see as ``ctx.state``, as last journaled."""
     run_messages: int = 0
     """How many messages the latest run has written to the journal."""
+    run_usage: Usage = Field(default_factory=Usage)
+    """Usage the latest run has journaled: its model responses and the usage
+    added through ``ctx.add_usage`` (by tools, sub-agents or a compactor). A
+    resume continues from it, so limits cover the whole run."""
+    run_turns: int = 0
+    """Model requests of the latest run that produced a journaled response."""
+    run_tool_call_ids: list[str] = Field(default_factory=list)
+    """Tool calls of the latest run that count toward ``Limits.max_tool_calls``."""
+
+    @property
+    def run_tool_calls(self) -> int:
+        """How many tool calls of the latest run count toward ``Limits.max_tool_calls``."""
+        return len(self.run_tool_call_ids)
 
     @property
     def unresolved_tool_calls(self) -> bool:
@@ -142,8 +178,14 @@ def derive_state(entries: list[Entry]) -> SessionState:
     started: dict[str, None] = {}
     inputs: dict[str, PendingInput] = {}
     values: dict[str, Any] = {}
+    counted: dict[str, None] = {}
+    finished: set[str] = set()
+    """Runs closed by ``run_finished``. What such a run writes later (it was
+    abandoned while it still ran) is ignored, so the conversation stays valid."""
     for entry in entries:
         kind, data = entry.kind, entry.data
+        if entry.run_id is not None and entry.run_id in finished and kind != "run_finished":
+            continue
         if kind == "message":
             state.messages.append(Message.model_validate(data["message"]))
             state.run_messages += 1
@@ -151,8 +193,12 @@ def derive_state(entries: list[Entry]) -> SessionState:
             state.pending_approvals = []
             started = {}
             inputs = {}
+            if entry.run_id is not None and entry.run_id == state.open_run_id:
+                _count_usage(state, data)
+                state.run_turns = max(state.run_turns, int(data.get("turn") or 0))
         elif kind == "tool_started":
             started[data["tool_call_id"]] = None
+            counted[data["tool_call_id"]] = None
         elif kind == "tool_result":
             result = ToolResultPart.model_validate(data["result"])
             state.tool_results[result.tool_call_id] = result
@@ -161,36 +207,72 @@ def derive_state(entries: list[Entry]) -> SessionState:
             state.pending_approvals = [
                 item for item in state.pending_approvals if item.tool_call_id != result.tool_call_id
             ]
+            if data.get("counted"):
+                counted[result.tool_call_id] = None
+            if entry.run_id is not None and entry.run_id == state.open_run_id:
+                _count_usage(state, data)
         elif kind == "tool_deferred":
             waiting = PendingInput.model_validate(data["input"])
             started.pop(waiting.tool_call_id, None)
             inputs[waiting.tool_call_id] = waiting
+            counted[waiting.tool_call_id] = None
         elif kind == "state_updated":
             values = data.get("values", {})
         elif kind == "run_started":
             state.open_run_id = entry.run_id
             state.agent = data.get("agent")
             state.run_messages = 0
+            state.run_usage = Usage()
+            state.run_turns = 0
+            counted = {}
         elif kind == "agent_switched":
             state.agent = data.get("agent")
         elif kind == "run_paused":
+            if entry.run_id is not None and entry.run_id == state.open_run_id:
+                _count_usage(state, data)
             state.pending_approvals = [
                 PendingApproval.model_validate(item) for item in data.get("pending", [])
             ]
             if "inputs" in data:  # absent in journals written before 0.2
                 listed = [PendingInput.model_validate(item) for item in data["inputs"]]
                 inputs = {item.tool_call_id: item for item in listed}
+        elif kind == "run_failed":
+            if entry.run_id is not None and entry.run_id == state.open_run_id:
+                _count_usage(state, data)
         elif kind == "run_finished":
+            if entry.run_id is not None:
+                finished.add(entry.run_id)
             if entry.run_id == state.open_run_id:
                 state.open_run_id = None
+                state.agent = None
                 state.pending_approvals = []
                 inputs = {}
         elif kind == "compaction":
             state.messages = [Message.model_validate(item) for item in data["messages"]]
+        elif kind == "guardrail_tripped" and data.get("stage") == "output":
+            _mark_blocked(state.messages)
     state.started_tools = list(started)
     state.pending_inputs = list(inputs.values())
+    state.run_tool_call_ids = list(counted)
     state.values = copy.deepcopy(values)
     return state
+
+
+def _mark_blocked(messages: list[Message]) -> None:
+    """Mark the last assistant message, an answer an output guardrail blocked."""
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].role == "assistant":
+            blocked = {**messages[index].metadata, "blocked": True}
+            messages[index] = messages[index].model_copy(update={"metadata": blocked})
+            return
+
+
+def _count_usage(state: SessionState, data: dict[str, Any]) -> None:
+    """Add an entry's usage: a model response's ``usage``, and ``added_usage``
+    (from ``ctx.add_usage``: a compactor's summary request, a sub-agent)."""
+    for key in ("usage", "added_usage"):
+        if usage := data.get(key):
+            state.run_usage = state.run_usage.add(Usage.model_validate(usage))
 
 
 SessionRunStatus = Literal["idle", "running", "paused", "failed"]
@@ -295,7 +377,14 @@ class SessionStore(ABC):
 
     @abstractmethod
     async def append(self, session_id: str, entries: list[Entry]) -> None:
-        """Durably add ``entries`` to the end of the session, in order."""
+        """Durably add ``entries`` to the end of the session, in order.
+
+        One call is all or nothing: it writes every entry or, when it raises,
+        none of them. The agent relies on this to journal related entries
+        together (the start of a run, an answer with its turn, a handoff with
+        its switch), so a crash never leaves half of them. A store that writes
+        entries one at a time must wrap a call in one transaction.
+        """
 
     @abstractmethod
     async def load(self, session_id: str) -> list[Entry]:
@@ -307,6 +396,13 @@ class SessionStore(ABC):
 
     async def aclose(self) -> None:  # noqa: B027 - optional to override
         """Release what the store holds."""
+
+    async def __aenter__(self) -> Self:
+        """``async with SQLiteStore("agents.db") as store:`` closes the store at the end."""
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        await self.aclose()
 
     # -- optional: run status --------------------------------------------------------
 
@@ -368,7 +464,16 @@ class SessionStore(ABC):
 
         The lease check and the write happen in one transaction, so a worker
         whose lease was taken over can no longer write to the journal (the
-        lease acts as a fencing token).
+        lease acts as a fencing token). Like `append`, one call writes all of
+        its entries or none.
+
+        On a store with leases, a plain `Agent.run` or `Agent.resume` also
+        writes every entry through this method, not through `append`. The
+        built-in stores do not call `append` from here, so a subclass that
+        customizes writes (to mirror, encrypt or audit them) must override
+        both. A subclass that overrides `append` alone keeps getting every
+        entry of a plain run through `append`; such a run then takes no lease
+        (only runs in the same process are kept apart).
 
         Raises:
             LeaseError: ``owner`` does not hold the lease. Nothing was written.
@@ -515,7 +620,12 @@ _SQLITE_STATUS_COLUMNS = (
 class SQLiteStore(SessionStore):
     """Journals in one SQLite file (WAL mode). Good for a single host.
 
-    Calls run on worker threads, so the event loop is never blocked on disk.
+    Calls run on the store's own worker thread, so the event loop is never
+    blocked on disk, and tools that hang in the loop's default thread pool
+    cannot hold up journal writes or lease renewals. Every append is synced
+    to disk before it returns (``PRAGMA synchronous=FULL``), so an entry
+    survives an OS crash or a power loss, as "record first, act second" needs.
+    Close the store with ``await store.aclose()`` or ``async with``.
 
     Run status and leases are kept in a ``sessions`` table next to the
     ``entries`` table. A database written by qagents 0.1 is migrated in place
@@ -528,13 +638,18 @@ class SQLiteStore(SessionStore):
         self.path = str(path)
         self._lock = threading.Lock()
         self._connection: sqlite3.Connection | None = None
+        self._executor: ThreadPoolExecutor | None = None
 
     def _connect(self) -> sqlite3.Connection:
         if self._connection is None:
             connection = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
             try:
                 _enable_wal(connection)
-                connection.execute("PRAGMA synchronous=NORMAL")
+                # FULL syncs the WAL at every commit: a committed tool_started survives a
+                # power loss. NORMAL would only sync at checkpoints.
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute("PRAGMA fullfsync=ON")  # macOS: flush the drive cache too
+                connection.execute("PRAGMA checkpoint_fullfsync=ON")
                 self._migrate(connection)
             except BaseException:
                 connection.close()
@@ -639,7 +754,7 @@ class SQLiteStore(SessionStore):
                             entry.ts,
                             entry.run_id,
                             entry.kind,
-                            json.dumps(entry.data, ensure_ascii=False),
+                            _entry_json(entry),
                         )
                     )
                     advance_status(status, entry)
@@ -764,20 +879,20 @@ class SQLiteStore(SessionStore):
 
     async def append(self, session_id: str, entries: list[Entry]) -> None:
         if entries:
-            await asyncio.to_thread(self._append, session_id, entries)
+            await self._call(self._append, session_id, entries)
 
     async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
         if entries:
-            await asyncio.to_thread(self._append, session_id, entries, owner)
+            await self._call(self._append, session_id, entries, owner)
 
     async def load(self, session_id: str) -> list[Entry]:
-        return await asyncio.to_thread(self._load, session_id)
+        return await self._call(self._load, session_id)
 
     async def delete(self, session_id: str) -> None:
-        await asyncio.to_thread(self._delete, session_id)
+        await self._call(self._delete, session_id)
 
     async def status(self, session_id: str) -> SessionStatus:
-        return await asyncio.to_thread(self._status, session_id)
+        return await self._call(self._status, session_id)
 
     async def list_sessions(
         self,
@@ -787,22 +902,48 @@ class SQLiteStore(SessionStore):
     ) -> list[SessionStatus]:
         wanted = _status_filter(status)
         _check_limit(limit)
-        rows = await asyncio.to_thread(self._list, wanted, prefix, limit)
+        rows = await self._call(self._list, wanted, prefix, limit)
         return [_status_row(row) for row in rows]
 
     async def acquire_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
         _check_ttl(ttl_s)
-        return await asyncio.to_thread(self._acquire, session_id, owner, ttl_s)
+        return await self._call(self._acquire, session_id, owner, ttl_s)
 
     async def renew_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
         _check_ttl(ttl_s)
-        return await asyncio.to_thread(self._renew, session_id, owner, ttl_s)
+        return await self._call(self._renew, session_id, owner, ttl_s)
 
     async def release_lease(self, session_id: str, owner: str) -> None:
-        await asyncio.to_thread(self._release, session_id, owner)
+        await self._call(self._release, session_id, owner)
 
     async def aclose(self) -> None:
-        await asyncio.to_thread(self._close)
+        if self._executor is None:
+            return
+        await self._call(self._close)
+        executor, self._executor = self._executor, None
+        executor.shutdown(wait=False)
+
+    async def _call(self, function: Any, *args: Any) -> Any:
+        """Run ``function`` on the store's own thread; one is enough, as ``_lock`` serialises."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qagents-sqlite")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, functools.partial(function, *args))
+
+
+def _entry_json(entry: Entry) -> str:
+    """The JSON of an entry's data, with non-ASCII text kept as it is.
+
+    A string with a lone surrogate (half of an emoji cut by another service)
+    cannot be encoded as UTF-8, so such an entry is written with ASCII escapes,
+    which bring the same string back when it is read.
+    """
+    text = json.dumps(entry.data, ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = json.dumps(entry.data, ensure_ascii=True)
+    return text
 
 
 def _enable_wal(connection: sqlite3.Connection, timeout_s: float = 5.0) -> None:
@@ -864,6 +1005,10 @@ class Session:
 
     async def append(self, kind: str, data: dict[str, Any], *, run_id: str | None = None) -> None:
         await self.store.append(self.id, [Entry(kind=kind, data=data, run_id=run_id)])
+
+    async def append_entries(self, entries: list[Entry]) -> None:
+        """Append several entries in one store call, which every store writes atomically."""
+        await self.store.append(self.id, entries)
 
     async def clear(self) -> None:
         await self.store.delete(self.id)

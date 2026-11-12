@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from pydantic import BaseModel, Field
 
-from qagents import Agent, Session, Usage, prompts, tool
+from qagents import Agent, Hooks, Session, Usage, prompts, tool
 from qagents.context import (
     Compactor,
     CompactorChain,
@@ -15,8 +16,15 @@ from qagents.context import (
     next_request_tokens,
     unpaired_tool_calls,
 )
-from qagents.errors import ConfigurationError
-from qagents.messages import ImagePart, Message, TextPart, ToolCallPart, ToolResultPart
+from qagents.errors import ConfigurationError, ModelResponseError
+from qagents.messages import (
+    ImagePart,
+    Message,
+    ReasoningPart,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+)
 from qagents.models.base import (
     ModelCapabilities,
     ModelRequest,
@@ -24,7 +32,7 @@ from qagents.models.base import (
     OutputSpec,
     ToolSpec,
 )
-from qagents.models.testing import ScriptedModel, call
+from qagents.models.testing import FunctionModel, ScriptedModel, call
 from qagents.prompts import SUMMARY_PREFIX
 from qagents.tools import RunContext
 
@@ -479,33 +487,31 @@ async def test_summarizing_keeps_leading_system_messages():
 
 
 class Recording(Compactor):
-    def __init__(self, name: str, log: list[str], replacement: list[Message] | None) -> None:
+    def __init__(self, name: str, log: list[Any], replacement: list[Message] | None) -> None:
         self.name = name
         self.log = log
         self.replacement = replacement
 
     async def compact(self, ctx, messages, last_response, model):
-        self.log.append(self.name)
+        self.log.append((self.name, [message.text for message in messages]))
         return self.replacement
 
 
-async def test_chain_tries_compactors_in_order_and_the_first_history_wins():
-    log: list[str] = []
+async def test_chain_asks_every_compactor_in_order_each_on_the_previous_result():
+    log: list[Any] = []
     shorter = [Message.user("short")]
+    other = [Message.user("other")]
     chain = CompactorChain(
-        [
-            Recording("a", log, None),
-            Recording("b", log, shorter),
-            Recording("c", log, [Message.user("other")]),
-        ]
+        [Recording("a", log, None), Recording("b", log, shorter), Recording("c", log, other)]
     )
-    assert await chain.compact(RunContext(), [], response(), ScriptedModel([])) == shorter
-    assert log == ["a", "b"]
+    original = [Message.user("long")]
+    assert await chain.compact(RunContext(), original, response(), ScriptedModel([])) == other
+    assert log == [("a", ["long"]), ("b", ["long"]), ("c", ["short"])]
 
     log.clear()
     nothing = CompactorChain([Recording("a", log, None), Recording("b", log, None)])
-    assert await nothing.compact(RunContext(), [], response(), ScriptedModel([])) is None
-    assert log == ["a", "b"]
+    assert await nothing.compact(RunContext(), original, response(), ScriptedModel([])) is None
+    assert [name for name, _ in log] == ["a", "b"]
 
     with pytest.raises(ValueError, match="at least one"):
         CompactorChain([])
@@ -513,21 +519,321 @@ async def test_chain_tries_compactors_in_order_and_the_first_history_wins():
         CompactorChain([Recording("a", log, None), "summarise"])  # type: ignore[list-item]
 
 
-async def test_chain_clears_first_and_summarises_when_nothing_is_left_to_clear():
+async def test_chain_summarises_only_when_clearing_was_not_enough():
+    messages = conversation("a" * 4_000, "b" * 4_000, "c" * 400)
+    cleared_size = estimate_tokens(
+        await ToolResultClearing(trigger_tokens=0, keep_last=0).compact(
+            RunContext(), messages, response(), ScriptedModel([])
+        )
+        or []
+    )
+    assert cleared_size < estimate_tokens(messages) - 1_500
+
+    # Clearing brings the request under the summarizer's trigger: no summary request.
     summarizer = ScriptedModel(["Summary of the pages."])
     chain = CompactorChain(
         [
             ToolResultClearing(trigger_tokens=0, keep_last=0),
-            SummarizingCompactor(trigger_tokens=0, keep_last=2, model=summarizer),
+            SummarizingCompactor(trigger_tokens=cleared_size + 50, keep_last=2, model=summarizer),
         ]
     )
-    messages = conversation("a" * 400, "b" * 400)
     first = await chain.compact(RunContext(), messages, response(), ScriptedModel([]))
-    assert first is not None and contents(first) == [cleared(), "b" * 400]
+    assert first is not None and contents(first) == [cleared(), cleared(), "c" * 400]
     assert summarizer.requests == []
 
-    second = await chain.compact(RunContext(), first, response(), ScriptedModel([]))
+    # Still over it after clearing: the cleared history is summarised in the same step.
+    chain.compactors[1] = SummarizingCompactor(
+        trigger_tokens=cleared_size - 50, keep_last=2, model=summarizer
+    )
+    second = await chain.compact(RunContext(), messages, response(), ScriptedModel([]))
     assert second is not None
     assert second[0].text == SUMMARY_PREFIX + "Summary of the pages."
-    assert contents(second) == ["b" * 400] and unpaired_tool_calls(second) == []
+    assert contents(second) == ["c" * 400] and unpaired_tool_calls(second) == []
+    (request,) = summarizer.requests
+    assert cleared() in request.messages[0].text  # it summarised what clearing left
+
+
+async def test_chain_gives_later_compactors_the_size_of_the_shortened_request():
+    messages = conversation("a" * 4_000, "b" * 4_000, "c" * 400)
+    last = response(input_tokens=5_000, output_tokens=100)
+    seen: list[int] = []
+
+    class Probe(Compactor):
+        async def compact(self, ctx, messages, last_response, model):
+            seen.append(next_request_tokens(messages, last_response))
+            return None
+
+    clearing = ToolResultClearing(trigger_tokens=0, keep_last=0)
+    replaced = await CompactorChain([clearing, Probe()]).compact(
+        RunContext(), messages, last, ScriptedModel([])
+    )
+    assert replaced is not None
+    saved = estimate_tokens(messages) - estimate_tokens(replaced)
+    # The reported size (system message and tool definitions included) less what was saved.
+    assert seen == [next_request_tokens(messages, last) - saved]
+
+
+async def test_the_documented_chain_keeps_a_tool_heavy_run_inside_the_window():
+    @tool(read_only=True)
+    def fetch(page: int) -> str:
+        """Fetch a page."""
+        return "r" * 4_000  # about 1,000 tokens
+
+    replies: list[Any] = [
+        Message.assistant("x" * 2_000, tool_calls=[call("fetch", page=page)]) for page in range(20)
+    ]
+    model = WindowedModel([*replies, "done"], context_length=10_000)
+    summarizer = ScriptedModel(["Summary of the pages so far."] * 20)
+    chain = CompactorChain(
+        [
+            ToolResultClearing(trigger_fraction=0.6, keep_last=2),
+            SummarizingCompactor(trigger_fraction=0.8, keep_last=4, model=summarizer),
+        ]
+    )
+    result = await Agent(model, tools=[fetch], compactor=chain).run("Read every page.")
+
+    assert result.output == "done"
+    sizes = [estimate_request_tokens(request) for request in model.requests]
+    assert max(sizes) < 10_000  # without a summary it grows past the window
+    assert summarizer.requests  # once clearing was not enough, it summarised
+    assert all(unpaired_tool_calls(request.messages) == [] for request in model.requests)
+
+
+# --- summary requests --------------------------------------------------------------------
+
+
+def history_to_summarise() -> list[Message]:
+    return [
+        Message.user("My e-mail is jane@example.com; migrate the billing DB."),
+        Message.assistant("Decided: use logical replication."),
+        Message.user("And then?"),
+        Message.assistant("Then switch over."),
+    ]
+
+
+def summary_response(text: str, finish_reason: str) -> ModelResponse:
+    return ModelResponse(
+        message=Message.assistant(text),
+        finish_reason=finish_reason,  # type: ignore[arg-type]
+        usage=Usage(requests=1, input_tokens=500, output_tokens=2_000),
+    )
+
+
+@pytest.mark.parametrize(
+    ("reply", "match"),
+    [
+        (summary_response("The user wants to migrate the billing DB. Decided: use", "length"),
+         "cut off at the token limit"),
+        (summary_response("I cannot help with that.", "content_filter"), "refused"),
+        (summary_response("  ", "stop"), "was empty"),
+    ],
+)  # fmt: skip
+async def test_a_summary_that_was_cut_off_or_refused_never_replaces_the_history(reply, match):
+    summarizer = ScriptedModel([reply])
+    compactor = SummarizingCompactor(trigger_tokens=0, keep_last=1, model=summarizer)
+    usage: list[Usage] = []
+    ctx = RunContext(_add_usage=usage.append)
+    with pytest.raises(ModelResponseError, match=match) as raised:
+        await compactor.compact(ctx, history_to_summarise(), response(), ScriptedModel([]))
+    assert "The history was not replaced" in str(raised.value)
+    assert usage == [reply.usage]  # the request was billed all the same
+
+    # Through a run: the run fails, and the journal records no compaction.
+    session = Session()
+    agent = Agent(
+        ScriptedModel(["unused"]),
+        compactor=SummarizingCompactor(trigger_tokens=0, keep_last=1, model=ScriptedModel([reply])),
+    )
+    with pytest.raises(ModelResponseError, match=match):
+        await agent.run("Next?", history=history_to_summarise(), session=session)
+    assert "compaction" not in [entry.kind for entry in await session.entries()]
+
+
+async def test_the_summary_request_leaves_max_tokens_to_the_model_by_default():
+    summarizer = ScriptedModel(["Summary.", "Summary."])
+    for compactor, expected in (
+        (SummarizingCompactor(trigger_tokens=0, keep_last=1, model=summarizer), None),
+        (SummarizingCompactor(trigger_tokens=0, keep_last=1, model=summarizer,
+                              max_summary_tokens=8_000), 8_000),
+    ):  # fmt: skip
+        await compactor.compact(RunContext(), history_to_summarise(), response(), summarizer)
+        assert summarizer.requests[-1].settings.max_tokens == expected
+    with pytest.raises(ValueError, match="max_summary_tokens"):
+        SummarizingCompactor(trigger_tokens=0, max_summary_tokens=0)
+
+
+async def test_the_summary_request_goes_through_the_run_s_hooks():
+    seen: list[str] = []
+
+    class Redact(Hooks):
+        async def before_model(self, ctx, request):
+            seen.append(f"before {len(request.messages)}")
+            redacted = [
+                message.model_copy(
+                    update={
+                        "parts": [
+                            TextPart(text=message.text.replace("jane@example.com", "<email>"))
+                        ]
+                    }
+                )
+                if message.role == "user"
+                else message
+                for message in request.messages
+            ]
+            return request.model_copy(update={"messages": redacted})
+
+        async def after_model(self, ctx, response):
+            seen.append(f"after {response.model}")
+
+    summarizer = ScriptedModel(["The user wants a billing DB migration."], name="summarizer")
+    model = ScriptedModel(["Switch over at night."])
+    agent = Agent(
+        model,
+        compactor=SummarizingCompactor(trigger_tokens=0, keep_last=1, model=summarizer),
+        hooks=[Redact()],
+    )
+    result = await agent.run("Next?", history=history_to_summarise())
+
+    assert result.output == "Switch over at night."
+    assert seen == ["before 1", "after summarizer", "before 2", "after scripted"]
+    (sent,) = summarizer.requests
+    assert "jane@example.com" not in sent.messages[0].text and "<email>" in sent.messages[0].text
+    assert result.usage.requests == 2  # the summary request is counted in the run
+
+
+# --- reasoning that is not sent back -----------------------------------------------------
+
+
+def test_reasoning_counts_only_when_it_is_sent_back():
+    thought = "t" * 8_000
+    plain = [Message.user("q"), Message(role="assistant", parts=[TextPart(text="ok")])]
+    dropped = [
+        Message.user("q"),
+        Message(role="assistant", parts=[ReasoningPart(text=thought), TextPart(text="ok")]),
+    ]
+    replayed = [
+        Message.user("q"),
+        Message(
+            role="assistant",
+            parts=[
+                ReasoningPart(text=thought, provider="anthropic", opaque={"provider": "anthropic"}),
+                TextPart(text="ok"),
+            ],
+        ),
+    ]
+    assert estimate_tokens(dropped) == estimate_tokens(plain)
+    assert estimate_tokens(replayed) == estimate_tokens(plain) + 2_000
+
+    # The reasoning tokens of the last response count only when its reasoning is replayed.
+    usage = Usage(requests=1, input_tokens=1_000, output_tokens=2_500, reasoning_tokens=2_000)
+    last = ModelResponse(message=dropped[1], usage=usage)
+    assert next_request_tokens(dropped, last) == 1_500
+    last = ModelResponse(message=replayed[1], usage=usage)
+    assert next_request_tokens(replayed, last) == 3_500
+
+
+async def test_reasoning_that_is_never_sent_back_does_not_trigger_a_summary():
+    def reply(request: ModelRequest) -> Message:
+        return Message(
+            role="assistant", parts=[ReasoningPart(text="t" * 8_000), TextPart(text="ok")]
+        )
+
+    summarizer = ScriptedModel([])
+    agent = Agent(
+        FunctionModel(reply),
+        compactor=SummarizingCompactor(trigger_tokens=6_000, keep_last=2, model=summarizer),
+    )
+    session = Session()
+    for prompt in ("one", "two", "three", "four"):
+        await agent.run(prompt, session=session)
+    assert summarizer.requests == []  # the history actually sent stays tiny
+
+
+# --- the first request of a run --------------------------------------------------------
+
+
+def wide_tool(index: int) -> Any:
+    """A tool with a long description: about 360 tokens of definition."""
+
+    @tool(name=f"tool_{index}", description="Look up a key. " + "detail " * 200, read_only=True)
+    def lookup(key: str) -> str:
+        return key
+
+    return lookup
+
+
+@pytest.mark.parametrize("heavy", ["instructions", "tools"])
+async def test_the_first_request_of_a_run_counts_the_system_prompt_and_tools(heavy):
+    # About 6,000 tokens of system prompt or tool definitions, and a short history: before
+    # the first request there is no reported usage, and the whole request must count.
+    options: dict[str, Any] = (
+        {"instructions": "rule " * 5_000}
+        if heavy == "instructions"
+        else {"tools": [wide_tool(index) for index in range(16)]}
+    )
+    summarizer = ScriptedModel(["Earlier: two questions."])
+    model = ScriptedModel(["Third answer."])
+    agent = Agent(
+        model,
+        compactor=SummarizingCompactor(trigger_tokens=3_000, keep_last=1, model=summarizer),
+        **options,
+    )
+    history = [Message.user("q1"), Message.assistant("a1"), Message.user("q2")]
+    history.append(Message.assistant("a2"))
+    await agent.run("q3", history=history)
     assert len(summarizer.requests) == 1
+    assert model.requests[0].messages[-2].text == SUMMARY_PREFIX + "Earlier: two questions."
+
+
+async def test_the_first_request_of_a_run_counts_the_output_schema_in_a_chain():
+    class Report(BaseModel):
+        summary: str = Field(description="detail " * 3_000)
+
+    clearing = ToolResultClearing(trigger_tokens=4_000, keep_last=0)
+    summarizer = ScriptedModel(["Earlier: a lookup."])
+    chain = CompactorChain(
+        [clearing, SummarizingCompactor(trigger_tokens=4_000, keep_last=1, model=summarizer)]
+    )
+    model = ScriptedModel(['{"summary": "done"}'])
+    agent = Agent(model, output_type=Report, compactor=chain)
+    history = conversation("short result", "another short result")
+    history.append(Message.assistant("Read both."))
+    await agent.run("Report.", history=history)
+    assert estimate_tokens(history) < 100  # the schema alone reaches the triggers
+    assert len(summarizer.requests) == 1  # clearing freed too little; the summary was needed
+
+
+async def test_a_reported_usage_is_not_estimated_again():
+    # After the first request the reported usage already includes the system prompt and the
+    # tools, so the request is not rebuilt to estimate them.
+    summarizer = ScriptedModel([])
+    rendered: list[int] = []
+
+    def instructions(ctx: RunContext[Any]) -> str:
+        rendered.append(ctx.turn)
+        return "rule " * 5_000
+
+    model = ScriptedModel([call("tool_0", key="a"), "Done."], usage=Usage(input_tokens=100))
+    agent = Agent(
+        model,
+        instructions=instructions,
+        tools=[wide_tool(0)],
+        compactor=SummarizingCompactor(trigger_tokens=3_000, keep_last=1, model=summarizer),
+    )
+    await agent.run("Look up a")
+    assert summarizer.requests == []  # the provider said the requests were small
+    assert len(rendered) == 3  # once to size the first request, then once per request
+
+
+async def test_a_system_message_in_the_history_is_counted_once_before_the_first_request():
+    summarizer = ScriptedModel(["Earlier: q1."] * 2)
+    model = ScriptedModel(["ok"])
+    agent = Agent(
+        model,
+        instructions="rule " * 2_000,
+        compactor=SummarizingCompactor(trigger_tokens=8_000, keep_last=1, model=summarizer),
+    )
+    history = [Message.system("policy " * 2_000), Message.user("q1"), Message.assistant("a1")]
+    await agent.run("q2", history=history)
+    assert estimate_request_tokens(model.requests[0]) < 8_000
+    assert summarizer.requests == []  # under the trigger: no billed summary

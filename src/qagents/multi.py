@@ -15,9 +15,10 @@ their own task, and the orchestrator reads one short answer per task:
     result = await lead.run("Compare the solar markets of Spain, Greece and Italy.")
 
 Every worker is a child run of the calling tool call (``parent=ctx``), like an
-agent used as a tool: it stops at the caller's remaining token, cost and time
+agent used as a tool: it shares the caller's remaining token, cost and time
 budget, uses the caller's propagating hooks (tracers) and ``on_ask``, and
-counts toward ``Limits.max_depth``. Its usage is added to the caller's run.
+counts toward ``Limits.max_depth``. Its usage is added to the caller's run
+however it ends (answered, failed, cancelled).
 
 **Routing.** `route` asks a classifier agent which agent should handle a
 prompt, then runs that agent on the same prompt. It is a plain function, so
@@ -26,7 +27,7 @@ the choice stays visible in your code:
     triage = Agent(model, name="triage", instructions="Classify the request.",
                    output_type=Literal["billing", "technical"])
     routed = await route(triage, {"billing": billing, "technical": support}, prompt)
-    print(routed.route, routed.result.output)
+    print(routed.route, routed.used_default, routed.result.output)
 
 The strings this module sends to a model are the module-level constants below.
 """
@@ -45,7 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from . import prompts
 from .agent import Agent, Prompt
-from .errors import ConfigurationError, OutputValidationError
+from .errors import ConfigurationError, MaxDepthExceeded, OutputValidationError
 from .events import RunFinished, RunStarted, SubagentEvent
 from .messages import Usage
 from .results import RunResult
@@ -55,6 +56,10 @@ from .tools import RunContext, Tool
 logger = logging.getLogger("qagents")
 
 
+FAN_OUT_TIMEOUT_S = 600.0
+"""Default ``timeout`` of a `fan_out` call: seconds for all of its tasks together."""
+
+
 def fan_out(
     agent: Agent,
     *,
@@ -62,8 +67,8 @@ def fan_out(
     description: str | None = None,
     max_parallel: int = 4,
     max_tasks: int | None = 8,
-    read_only: bool = True,
-    timeout: float | None = None,
+    read_only: bool = False,
+    timeout: float | None = FAN_OUT_TIMEOUT_S,
 ) -> Tool:
     """Make a tool that runs ``agent`` on several tasks in parallel.
 
@@ -72,16 +77,17 @@ def fan_out(
     conversation, at most ``max_parallel`` at a time. The tool returns a JSON
     list in task order with ``{"task", "answer"}`` for a task the agent
     finished, or ``{"task", "error"}`` for one that stopped early (a limit, a
-    pause, a guardrail) or raised. One failed task does not stop the others.
+    pause, a guardrail, a refusal by the provider), raised, or would nest
+    deeper than ``Limits.max_depth``. One failed task does not stop the others.
 
     The child runs inherit from the calling run: the remaining token, cost
-    and time budget (each child takes a snapshot when it starts, so children
-    running together can overshoot the caller's budget by up to
-    ``max_parallel`` runs), the hooks with ``propagate = True``, the
-    ``on_ask`` handler, and the nesting depth. Their usage is added to the
-    caller's run as each one finishes, and their events reach the caller's
-    stream as `SubagentEvent`, with ``agent`` set to ``"<name>[<index>]"`` so
-    the tasks can be told apart.
+    and time budget (shared live, so children running together cannot spend
+    more than the caller has left), the hooks with ``propagate = True``, the
+    ``on_ask`` handler, and the nesting depth. Each child's usage is added to
+    the caller's run when the child ends, however it ends (also when it
+    raised or was cancelled), and their events reach the caller's stream as
+    `SubagentEvent`, with ``agent`` set to ``"<name>[<index>]"`` so the tasks
+    can be told apart.
 
     If the calling run is cancelled or times out, the tool call is cancelled
     and so are the child runs that are still working.
@@ -94,11 +100,17 @@ def fan_out(
         max_parallel: How many child runs may work at once.
         max_tasks: How many tasks one call may give; a call with more gets an
             error result asking for fewer. ``None`` removes the limit.
-        read_only: Declare the tool free of side effects, so it may run in
-            parallel with other read-only calls. Set it to ``False`` when the
-            agent's tools change things.
-        timeout: Seconds for the whole call, all tasks included; ``None`` uses
-            ``Limits.tool_timeout_s``, which is often too short for agents.
+        read_only: Declare the whole fan-out free of side effects. Only for
+            workers whose tools change nothing. It has three effects: the call
+            may run in parallel with other read-only calls; it is allowed
+            under ``Permissions(mode="read_only")``; and when the calling run
+            is interrupted while the call works (a crash, a cancel, a
+            deploy), a resume runs the whole call again: every task and every
+            worker model request, nothing reused. With the default
+            ``False``, a resume tells the model the call's outcome is unknown.
+        timeout: Seconds for the whole call, all tasks included. Defaults to
+            `FAN_OUT_TIMEOUT_S` (10 minutes), since agents need far longer
+            than one tool call; ``None`` uses ``Limits.tool_timeout_s``.
 
     Raises:
         ConfigurationError: ``max_parallel`` or ``max_tasks`` is below 1.
@@ -153,13 +165,22 @@ def fan_out(
 
 
 async def _run_task(agent: Agent, ctx: RunContext[Any], label: str, task: str) -> dict[str, Any]:
-    """Run one task as a child run of ``ctx`` and describe how it ended."""
+    """Run one task as a child run of ``ctx`` and describe how it ended.
+
+    The child's usage reaches the caller's run when the child ends, however it
+    ends (the child run hands it over itself), so nothing is added here.
+    """
     try:
         stream = agent.stream(task, deps=ctx.deps, parent=ctx)
         async with stream:
             async for event in stream:
                 if not isinstance(event, RunStarted | RunFinished):
                     ctx.emit(SubagentEvent(agent=label, tool_call_id=ctx.tool_call_id, event=event))
+    except MaxDepthExceeded as error:  # expected in recursive setups: no traceback
+        too_deep = prompts.SUBAGENT_TOO_DEEP.format(
+            name=agent.name, depth=error.depth, limit=error.limit
+        )
+        return {"task": task, "error": too_deep}
     except Exception as error:  # one broken task must not take the others down
         logger.exception("Child run %s of tool call %s raised", label, ctx.tool_call_id)
         problem = f"{type(error).__name__}: {error}"
@@ -169,13 +190,15 @@ async def _run_task(agent: Agent, ctx: RunContext[Any], label: str, task: str) -
         }
     result = stream.result
     assert result is not None
-    ctx.add_usage(result.usage)
-    if result.status != "completed":
+    if result.status != "completed" or result.stop_reason == "content_filter":
+        # A refusal is not an answer, even though the run ended "completed".
         stopped = prompts.SUBAGENT_STOPPED.format(
             name=agent.name, reason=result.stop_reason or result.status
         )
         return {"task": task, "error": stopped}
-    return {"task": task, "answer": result.output if result.output is not None else result.text}
+    if result.output is None and agent.output_type is None:
+        return {"task": task, "answer": result.text}
+    return {"task": task, "answer": result.output}
 
 
 class RouteResult(BaseModel):
@@ -184,6 +207,8 @@ class RouteResult(BaseModel):
     route: str | None
     """The route that handled the prompt; ``None`` when the classifier did not
     finish (it paused, hit a limit, was blocked or refused) and no route ran."""
+    used_default: bool = False
+    """The classifier's answer named no route, so ``default=`` was taken."""
     result: RunResult
     """The run of the chosen agent. When no route ran, the classifier's run,
     so ``result.status`` says why."""
@@ -208,6 +233,7 @@ async def route(
     session: Session | None = None,
     state: Mapping[str, Any] | None = None,
     parent: RunContext[Any] | None = None,
+    classifier_session: Session | None = None,
 ) -> RouteResult:
     """Ask ``classifier`` which agent should handle ``prompt``, then run that agent on it.
 
@@ -221,9 +247,13 @@ async def route(
     the model to correct it. With a plain-text classifier, the answer must be
     a route name, give or take case, spaces, quotes and a final full stop.
 
-    The classifier runs in a fresh conversation of its own and sees only
-    ``prompt``. The chosen agent runs on ``session`` (a new in-memory one if
-    you leave it out), so it continues that conversation.
+    The classifier runs in a fresh in-memory conversation of its own and sees
+    only ``prompt``, unless you pass ``classifier_session``: then it runs on
+    that session, which journals the classification (for example
+    ``wf.session("triage")`` inside a workflow) and which it continues. The
+    chosen agent runs on ``session`` (a new in-memory one if you leave it
+    out), so it continues that conversation. ``RouteResult.used_default``
+    says when ``default`` was taken.
 
     Args:
         classifier: The agent that picks the route.
@@ -235,7 +265,10 @@ async def route(
         session: The chosen agent's session.
         state: Merged into the chosen agent's session state.
         parent: The calling run's context, when called from a tool: both
-            runs become its child runs, and their usage is added to it.
+            runs become its child runs, and their usage is added to it
+            (also when one of them raises).
+        classifier_session: The classifier's session; a new in-memory one
+            when left out.
 
     Returns:
         The route taken, the chosen agent's run, and the classifier's run.
@@ -248,12 +281,13 @@ async def route(
             there is no ``default``.
     """
     _check_routes(classifier, routes, default)
-    classification = await classifier.run(prompt, deps=deps, parent=parent)
-    if parent is not None:
-        parent.add_usage(classification.usage)
+    classification = await classifier.run(
+        prompt, deps=deps, session=classifier_session, parent=parent
+    )
     if classification.status != "completed" or classification.stop_reason == "content_filter":
         return RouteResult(route=None, result=classification, classification=classification)
     chosen = _match_route(classification.output, routes)
+    used_default = chosen is None
     if chosen is None:
         if default is None:
             raise OutputValidationError(
@@ -266,9 +300,9 @@ async def route(
     result = await routes[chosen].run(
         prompt, deps=deps, session=session, state=state, parent=parent
     )
-    if parent is not None:
-        parent.add_usage(result.usage)
-    return RouteResult(route=chosen, result=result, classification=classification)
+    return RouteResult(
+        route=chosen, result=result, classification=classification, used_default=used_default
+    )
 
 
 def _check_routes(classifier: Agent, routes: Mapping[str, Agent], default: str | None) -> None:
@@ -310,7 +344,10 @@ def _match_route(answer: Any, routes: Mapping[str, Agent]) -> str | None:
         return None
     if answer in routes:
         return answer
-    cleaned = answer.strip().strip("\"'`*").rstrip(".").strip()
+    cleaned, previous = answer, None
+    while cleaned != previous:  # in any order: '"billing".', '**Billing**.', "'billing'."
+        previous = cleaned
+        cleaned = cleaned.strip().rstrip(".").strip().strip("\"'`*")
     folded = {key.casefold(): key for key in routes}
     return folded.get(cleaned.casefold())
 

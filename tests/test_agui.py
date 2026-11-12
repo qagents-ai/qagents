@@ -11,12 +11,21 @@ import pytest
 from pydantic import BaseModel
 
 from qagents import Agent, Hooks, Message, RunContext, Session, prompts, tool
-from qagents.errors import ConfigurationError, ModelServerError, SessionError, ToolError
+from qagents.errors import (
+    ApprovalTokenError,
+    ConfigurationError,
+    GuardrailTripped,
+    ModelConnectionError,
+    ModelServerError,
+    SessionError,
+    ToolError,
+)
 from qagents.integrations.agui import (
     APPROVAL_RESPONSE_SCHEMA,
     CUSTOM_EVENTS,
     RUN_ERROR_MESSAGE,
     STREAM_ENDED_MESSAGE,
+    TOOL_ERROR_MESSAGE,
     AGUIProjector,
     agui_resume,
     agui_sse,
@@ -36,7 +45,7 @@ from qagents.models.base import (
     ToolCallDelta,
 )
 from qagents.models.testing import ScriptedModel, call
-from qagents.permissions import Approval
+from qagents.permissions import Approval, Permissions
 
 
 @tool(read_only=True)
@@ -268,6 +277,75 @@ async def test_tool_calls_streamed_without_ids_are_announced_with_the_final_id()
     assert [e["delta"] for e in text] == ["Both sunny."]
 
 
+async def test_interleaved_tool_call_deltas_reach_the_client_whole():
+    first = ToolCallPart(id="c0", name="get_weather", arguments={"city": "a"})
+    second = ToolCallPart(id="c1", name="get_weather", arguments={"city": "b"})
+    model = StreamingModel(
+        [
+            ToolCallDelta(index=0, id="c0", name="get_weather", arguments_delta='{"ci'),
+            ToolCallDelta(index=1, id="c1", name="get_weather", arguments_delta='{"city"'),
+            ToolCallDelta(index=0, id="c0", name="get_weather", arguments_delta='ty": "a"}'),
+            ToolCallDelta(index=1, id="c1", name="get_weather", arguments_delta=': "b"}'),
+            done(Message(role="assistant", parts=[first, second])),
+        ],
+        [done(Message.assistant("Both sunny."))],
+    )
+
+    events = await collect(Agent(model, tools=[get_weather]).stream("Weather?"))
+
+    sent: dict[str, str] = {}
+    for event in events:
+        if event["type"] == "TOOL_CALL_ARGS":
+            sent[event["toolCallId"]] = sent.get(event["toolCallId"], "") + event["delta"]
+    assert {key: json.loads(value) for key, value in sent.items()} == {
+        "c0": {"city": "a"},
+        "c1": {"city": "b"},
+    }
+
+
+async def test_a_streamed_call_id_the_provider_repeats_is_started_once():
+    # An OpenAI-compatible server gave two calls one id; the response renames the second.
+    first = ToolCallPart(id="call_0", name="get_weather", arguments={"city": "Rome"})
+    second = ToolCallPart(id="call_x", name="get_weather", arguments={"city": "Nice"})
+    model = StreamingModel(
+        [
+            ToolCallDelta(
+                index=0, id="call_0", name="get_weather", arguments_delta='{"city": "Rome"}'
+            ),
+            ToolCallDelta(
+                index=1, id="call_0", name="get_weather", arguments_delta='{"city": "Nice"}'
+            ),
+            done(Message(role="assistant", parts=[first, second])),
+        ],
+        [done(Message.assistant("Both sunny."))],
+    )
+
+    events = await collect(Agent(model, tools=[get_weather]).stream("Weather?"))
+
+    starts = [e["toolCallId"] for e in events if e["type"] == "TOOL_CALL_START"]
+    results = [e["toolCallId"] for e in events if e["type"] == "TOOL_CALL_RESULT"]
+    assert starts == ["call_0", "call_x"] and sorted(results) == ["call_0", "call_x"]
+    nice = [e["delta"] for e in events if e.get("toolCallId") == "call_x" and "delta" in e]
+    assert nice == ['{"city": "Nice"}']
+
+
+async def test_events_fed_as_dicts_are_projected_like_the_event_models():
+    weather = call("get_weather", city="Athens")
+    agent = Agent(ScriptedModel([weather, "It is sunny."]), tools=[get_weather])
+    events = [event async for event in agent.stream("Weather?")]
+
+    def project(items: list) -> list[dict]:
+        projector = AGUIProjector(thread_id="t", run_id="r", messages_snapshot=True)
+        return [out for item in items for out in projector.feed(item)]
+
+    as_models = project(events)
+    as_dicts = project([event.model_dump(mode="json") for event in events])
+
+    assert as_dicts == as_models
+    kinds = [event["type"] for event in as_dicts]
+    assert {"TOOL_CALL_START", "TEXT_MESSAGE_CONTENT", "MESSAGES_SNAPSHOT"} <= set(kinds)
+
+
 async def test_reasoning_is_forwarded_and_can_be_left_out():
     def model() -> StreamingModel:
         answer = Message(
@@ -336,10 +414,79 @@ async def test_a_model_error_ends_with_run_error(caplog):
     ]
     assert events[-1] == {
         "type": "RUN_ERROR",
-        "message": "upstream failed",
+        "message": "The model request failed.",
         "code": "ModelServerError",
     }
-    assert "RUN_ERROR" in caplog.text
+    assert "RUN_ERROR" in caplog.text and "upstream failed" in caplog.text
+
+
+async def test_qagents_error_text_is_not_shown_to_the_client_unless_asked():
+    def stream():
+        url = "http://svc:Pa55w0rd@10.0.0.7:9/internal-vllm/v1"
+        failure = ModelConnectionError(f"Could not connect to {url}: refused", provider="test")
+        return Agent(StreamingModel([failure])).stream("Hi")
+
+    hidden = await collect(stream())
+    assert hidden[-1] == {
+        "type": "RUN_ERROR",
+        "message": "The model provider could not be reached.",
+        "code": "ModelConnectionError",
+    }
+    assert "Pa55w0rd" not in json.dumps(hidden)
+
+    shown = await collect(stream(), expose_errors=True)
+    assert "internal-vllm" in shown[-1]["message"]
+
+
+async def test_a_sub_agent_error_does_not_show_the_error_text_either():
+    projector = AGUIProjector(run_id="r", subagents="native")
+    projector.feed({"type": "run_started", "run_id": "r", "session_id": "t"})
+    projector.feed({"type": "subagent_event", "agent": "a", "tool_call_id": "c", "event": {}})
+
+    events = projector.fail(SessionError("database /srv/secret/app.db is locked"))
+
+    assert [e["type"] for e in events] == ["SUBAGENT_ERROR", "RUN_ERROR"]
+    assert "/srv/secret" not in json.dumps(events)
+    assert events[-1]["code"] == "SessionError"
+
+
+@tool
+def lookup(key: str) -> str:
+    """Look up a key."""
+    raise RuntimeError("cannot open /srv/secret/keys.db")
+
+
+async def test_the_text_of_an_exception_a_tool_raised_is_not_shown_unless_asked():
+    url = "http://svc:Pa55w0rd@10.0.0.7:9/v1"
+
+    def lead() -> Agent:
+        # An agent used as a tool whose model cannot be reached: the tool raises.
+        failure = ModelConnectionError(f"Could not connect to {url}: refused", provider="test")
+        inner = Agent(StreamingModel([failure]), name="inner", description="Inner.")
+        return Agent(ScriptedModel([call("inner", task="t"), "Done."]), name="lead", tools=[inner])
+
+    for mode in ("custom", "native"):
+        events = await collect(lead().stream("Go"), subagents=mode, messages_snapshot=True)
+        assert "Pa55w0rd" not in json.dumps(events)
+        result = next(e for e in events if e["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == TOOL_ERROR_MESSAGE.format(name="inner")
+    error = next(e for e in events if e["type"] == "SUBAGENT_ERROR")
+    assert error["message"] == TOOL_ERROR_MESSAGE.format(name="inner")
+
+    # A tool of a sub-agent raises: its result is in the sub-agent's events.
+    researcher = Agent(
+        ScriptedModel([call("lookup", key="k"), "No luck."]),
+        name="researcher",
+        description="Finds facts.",
+        tools=[lookup],
+    )
+    nested = Agent(ScriptedModel([call("researcher", task="t"), "Done."]), tools=[researcher])
+    events = await collect(nested.stream("Go"))
+    assert "/srv/secret" not in json.dumps(events)
+    assert TOOL_ERROR_MESSAGE.format(name="lookup") in json.dumps(events)
+
+    shown = await collect(lead().stream("Go"), expose_errors=True)
+    assert "Pa55w0rd" in next(e for e in shown if e["type"] == "TOOL_CALL_RESULT")["content"]
 
 
 async def test_other_exceptions_are_not_shown_to_the_client_unless_asked():
@@ -363,7 +510,9 @@ async def test_an_error_before_the_run_starts_is_the_only_event():
 
     assert len(events) == 1 and events[0]["type"] == "RUN_ERROR"
     assert events[0]["code"] == SessionError.__name__
-    assert "no unfinished run" in events[0]["message"]
+    assert events[0]["message"] == "The conversation could not be loaded, resumed or saved."
+    shown = await collect(agent.resume_stream(Session()), expose_errors=True)
+    assert "no unfinished run" in shown[0]["message"]
 
 
 async def test_a_stream_that_stops_early_ends_with_run_error():
@@ -579,6 +728,36 @@ async def test_subagent_events_are_custom_events_by_default():
     assert not [e for e in ignored if e["type"] == "CUSTOM"]
 
 
+async def test_subagent_events_carry_no_usage_or_replay_data_and_no_reasoning_unless_asked():
+    def lead() -> Agent:
+        answer = Message(
+            role="assistant",
+            parts=[
+                ReasoningPart(text="SECRET CHAIN", opaque={"signature": "SIGNED-BLOB"}),
+                TextPart(text="Athens is sunny."),
+            ],
+        )
+        billed = Usage(requests=1, input_tokens=7, output_tokens=3, cost_usd=0.5)
+        reply = ResponseDone(response=ModelResponse(message=answer, usage=billed))
+        researcher = Agent(
+            StreamingModel([ReasoningDelta(text="SECRET CHAIN"), TextDelta(text="Athens."), reply]),
+            name="researcher",
+            description="Finds facts.",
+        )
+        delegate = call("researcher", task="weather")
+        return Agent(ScriptedModel([delegate, "Sunny."]), name="lead", tools=[researcher])
+
+    hidden = await collect(lead().stream("Weather?"), reasoning=False)
+    inner = [e["value"]["event"]["type"] for e in hidden if e["type"] == "CUSTOM"]
+    assert "text_delta" in inner and "reasoning_delta" not in inner
+    assert "SECRET" not in json.dumps(hidden)
+
+    shown = await collect(lead().stream("Weather?"))
+    assert "SECRET CHAIN" in json.dumps(shown)
+    for text in ("SIGNED-BLOB", "input_tokens", "cost_usd"):
+        assert text not in json.dumps(shown), text
+
+
 async def test_subagents_can_use_the_native_events():
     lead, delegate = subagent_setup()
     events = await collect(lead.stream("Weather?"), run_id="r", subagents="native")
@@ -615,11 +794,171 @@ async def test_a_handoff_call_gets_its_result():
     assert result["content"] == prompts.HANDOFF_RESULT.format(name="billing")
     switched = next(e for e in events if e["type"] == "CUSTOM")
     assert switched["name"] == "agent_switched"
-    assert switched["value"] == {"from_agent": "triage", "to_agent": "billing"}
+    assert switched["value"]["from_agent"] == "triage"
+    assert switched["value"]["to_agent"] == "billing"
     assert [e["stepName"] for e in events if e["type"] == "STEP_STARTED"] == [
         "triage: turn 1",
         "billing: turn 2",
     ]
+
+
+def test_a_handoff_call_the_event_names_gets_its_result_in_a_resumed_run():
+    # A resumed projection never saw the response with the handoff call.
+    projector = AGUIProjector(thread_id="t", run_id="r2", steps=False, custom_events=())
+    projector.feed({"type": "run_started", "run_id": "r", "session_id": "t", "resumed": True})
+
+    events = projector.feed(
+        {
+            "type": "agent_switched",
+            "from_agent": "triage",
+            "to_agent": "billing",
+            "tool_call_id": "call_handoff",
+        }
+    )
+
+    assert events == [
+        {
+            "type": "TOOL_CALL_RESULT",
+            "messageId": "r2-result-1",
+            "toolCallId": "call_handoff",
+            "content": prompts.HANDOFF_RESULT.format(name="billing"),
+            "role": "tool",
+        }
+    ]
+
+
+async def test_a_handoff_call_recorded_after_a_pause_gets_its_result():
+    # The turn holds a call that needs approval and a handoff. The handoff is
+    # made by the resumed run, whose projection never saw that response.
+    billing = Agent(ScriptedModel(["Billing here."]), name="billing", description="Billing.")
+    triage = Agent(
+        ScriptedModel([[call("refund", order_id="A"), call("transfer_to_billing")]]),
+        name="triage",
+        tools=[refund],
+        handoffs=[billing],
+    )
+    session = Session()
+    first = await collect(triage.stream("Refund A", session=session))
+    transfer = next(
+        e["toolCallId"]
+        for e in first
+        if e["type"] == "TOOL_CALL_START" and e["toolCallName"] == "transfer_to_billing"
+    )
+    interrupts = first[-1]["outcome"]["interrupts"]
+    answers = [{"interruptId": i["id"], "status": "resolved", "payload": True} for i in interrupts]
+
+    second = await collect(triage.resume_stream(session, **agui_resume(answers)))
+
+    results = [e for e in second if e["type"] == "TOOL_CALL_RESULT"]
+    assert [e["toolCallId"] for e in results].count(transfer) == 1
+    handoff = next(e for e in results if e["toolCallId"] == transfer)
+    assert handoff["content"] == prompts.HANDOFF_RESULT.format(name="billing")
+
+
+async def test_an_answer_blocked_by_an_output_guardrail_is_taken_back():
+    def no_secrets(ctx, answer):
+        if "hunter2" in str(answer):
+            raise GuardrailTripped("the answer contains the password hunter2")
+
+    def stream():
+        model = ScriptedModel(["The admin password is hunter2."])
+        return Agent(model, output_guardrails=[no_secrets]).stream("pw?")
+
+    events = await collect(stream(), thread_id="t")
+
+    tripped = next(e for e in events if e["type"] == "CUSTOM" and e["name"] == "guardrail_tripped")
+    assert tripped["value"]["stage"] == "output" and "reason" not in tripped["value"]
+    assert events[-2] == {
+        "type": "MESSAGES_SNAPSHOT",
+        "messages": [{"id": "t-msg-0", "role": "user", "content": "pw?"}],
+    }
+    assert events[-1]["result"]["status"] == "blocked"
+    after_trip = events[events.index(tripped) :]
+    assert "hunter2" not in json.dumps(after_trip)
+
+    shown = await collect(stream(), guardrail_reasons=True)
+    tripped = next(e for e in shown if e["type"] == "CUSTOM" and e["name"] == "guardrail_tripped")
+    assert "hunter2" in tripped["value"]["reason"]
+
+
+async def test_hold_final_answer_never_sends_an_answer_an_output_guardrail_blocks():
+    class Secret(BaseModel):
+        secret: str
+
+    def no_secrets(ctx, answer):
+        if "hunter2" in str(answer):
+            raise GuardrailTripped("the answer contains the password hunter2")
+
+    text = Agent(ScriptedModel(["The admin password is hunter2."]), output_guardrails=[no_secrets])
+    answer_tool = Agent(
+        ScriptedModel([call("final_answer", secret="hunter2")]),
+        output_type=Secret,
+        output_mode="tool",
+        output_guardrails=[no_secrets],
+    )
+    researcher = Agent(
+        ScriptedModel(["The admin password is hunter2."]),
+        name="researcher",
+        description="Finds facts.",
+        output_guardrails=[no_secrets],
+    )
+    lead = Agent(ScriptedModel([call("researcher", task="pw"), "Sorry."]), tools=[researcher])
+    for agent, options in ((text, {}), (answer_tool, {}), (lead, {"subagents": "native"})):
+        events = await collect(agent.stream("pw?"), hold_final_answer=True, **options)
+        assert "hunter2" not in json.dumps(events)
+        tripped = [e for e in events if e.get("name") == "guardrail_tripped"]
+        assert tripped and tripped[0]["value"]["stage"] == "output"
+    assert events[-1]["result"]["status"] == "completed"  # the lead answered "Sorry."
+
+
+async def test_hold_final_answer_sends_what_passes_in_the_same_order():
+    weather = call("get_weather", city="Athens")
+
+    def stream():
+        return Agent(ScriptedModel([weather, "Sunny."]), tools=[get_weather]).stream("Weather?")
+
+    held = await collect(stream(), thread_id="t", run_id="r", hold_final_answer=True)
+    assert held == await collect(stream(), thread_id="t", run_id="r")
+
+
+def test_hold_final_answer_sends_a_response_once_the_run_goes_on():
+    projector = AGUIProjector(thread_id="t", run_id="r", steps=False, hold_final_answer=True)
+    projector.feed({"type": "run_started", "run_id": "r", "session_id": "t"})
+
+    def respond(*parts) -> list[dict]:
+        message = Message(role="assistant", parts=list(parts)).model_dump(mode="json")
+        return projector.feed({"type": "model_responded", "response": {"message": message}})
+
+    weather = ToolCallPart(id="c1", name="get_weather", arguments={"city": "Athens"})
+    assert projector.feed({"type": "text_delta", "text": "Checking."}) == []
+    assert respond(TextPart(text="Checking."), weather) == []
+    started = projector.feed({"type": "tool_call_started", "call": weather.model_dump()})
+    assert [e["type"] for e in started] == [
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+    ]
+
+    assert projector.feed({"type": "text_delta", "text": "Sunny."}) == []
+    assert respond(TextPart(text="Sunny.")) == []
+    state = projector.feed({"type": "state_updated", "values": {"city": "Athens"}})
+    assert [e["type"] for e in state] == ["STATE_SNAPSHOT", "CUSTOM"]  # not held
+    finished = projector.feed({"type": "run_finished", "result": {"status": "completed"}})
+    assert [e["type"] for e in finished] == [
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "RUN_FINISHED",
+    ]
+
+    # A run that raises drops what waits, and ends nothing it never started.
+    failing = AGUIProjector(thread_id="t", run_id="r", steps=False, hold_final_answer=True)
+    failing.feed({"type": "run_started", "run_id": "r", "session_id": "t"})
+    assert failing.feed({"type": "text_delta", "text": "Partial"}) == []
+    assert [e["type"] for e in failing.fail(RuntimeError("down"))] == ["RUN_ERROR"]
 
 
 # --- encoding, messages and resume -------------------------------------------------------
@@ -645,6 +984,7 @@ async def test_messages_snapshot_before_run_finished():
     events = await collect(agent.stream("Weather?"), thread_id="t", messages_snapshot=True)
 
     assert events[-2]["type"] == "MESSAGES_SNAPSHOT"
+    assert [e["type"] for e in events].count("MESSAGES_SNAPSHOT") == 1
     assert events[-2]["messages"] == [
         {"id": "t-msg-0", "role": "user", "content": "Weather?"},
         {
@@ -704,7 +1044,8 @@ def test_agui_resume_reads_approvals_and_results():
             {"interruptId": "approval:c3", "status": "cancelled"},
             {"interruptId": "input:c4", "status": "resolved", "payload": {"city": "Athens"}},
             {"interruptId": "input:c5", "status": "cancelled"},
-        ]
+        ],
+        allow_argument_edits=True,
     )
 
     assert resumed["approvals"] == {
@@ -715,6 +1056,90 @@ def test_agui_resume_reads_approvals_and_results():
     assert resumed["results"]["c4"] == {"city": "Athens"}
     cancelled = resumed["results"]["c5"]
     assert isinstance(cancelled, ToolError) and str(cancelled) == prompts.INPUT_CANCELLED
+
+
+async def test_a_client_cannot_change_the_arguments_of_an_approved_call():
+    refunds: list[int] = []
+
+    @tool
+    def pay_back(order: str, amount: int) -> str:
+        """Refund an order."""
+        refunds.append(amount)
+        return f"refunded {amount}"
+
+    def policy(ctx, tool, call):
+        amount = call.arguments.get("amount", 0)
+        return "deny" if amount > 100 else "ask" if amount > 10 else "allow"
+
+    agent = Agent(
+        ScriptedModel([call("pay_back", order="A-1", amount=50), "done"]),
+        tools=[pay_back],
+        permissions=Permissions(can_use_tool=policy, approval_secret="k" * 32),
+    )
+    session = Session()
+    events = await collect(agent.stream("refund A-1", session=session))
+    (interrupt,) = events[-1]["outcome"]["interrupts"]
+    assert "arguments" not in interrupt["responseSchema"]["properties"]
+    assert "arguments" not in APPROVAL_RESPONSE_SCHEMA["properties"]
+
+    payload = {
+        "approved": True,
+        "token": interrupt["metadata"]["token"],
+        "arguments": {"order": "A-1", "amount": 100_000},
+    }
+    entry = {"interruptId": interrupt["id"], "status": "resolved", "payload": payload}
+    with pytest.raises(ValueError, match="allow_argument_edits=True"):
+        agui_resume([entry])
+    assert refunds == []
+
+
+async def test_cancelled_interrupts_carry_the_token_of_a_signed_pause():
+    refunds: list[str] = []
+
+    @tool(requires_approval=True)
+    def refund_order(order: str) -> str:
+        """Refund an order."""
+        refunds.append(order)
+        return "refunded"
+
+    @tool(deferred=True)
+    def fetch_report(report_id: str) -> str:
+        """Fetch a report another system produces."""
+        raise AssertionError("never runs")
+
+    def agent() -> Agent:
+        calls = [call("refund_order", order="A-1"), call("fetch_report", report_id="r")]
+        return Agent(
+            ScriptedModel([calls, "ok"]),
+            tools=[refund_order, fetch_report],
+            permissions=Permissions(approval_secret="s3cret-for-tests-only-0123456789"),
+        )
+
+    async def cancel_all(with_token: bool) -> Session:
+        session = Session()
+        first = agent()
+        events = await collect(first.stream("go", session=session))
+        answers = [
+            {
+                "interruptId": interrupt["id"],
+                "status": "cancelled",
+                "payload": {"token": interrupt["metadata"]["token"]} if with_token else None,
+            }
+            for interrupt in events[-1]["outcome"]["interrupts"]
+        ]
+        result = await first.resume(session, **agui_resume(answers))
+        assert result.status == "completed"
+        return session
+
+    session = await cancel_all(with_token=True)
+    assert refunds == []
+    results = [part for message in await session.messages() for part in message.tool_results]
+    contents = sorted(result.content for result in results)
+    assert prompts.INPUT_CANCELLED in contents and all(result.is_error for result in results)
+
+    with pytest.raises(ApprovalTokenError):
+        await cancel_all(with_token=False)
+    assert refunds == []
 
 
 @pytest.mark.parametrize(
@@ -744,3 +1169,39 @@ def test_usage_is_not_sent_to_the_client():
 
     assert finished["result"] == {"status": "completed", "stop_reason": None, "output": "x"}
     assert projector.finished and projector.feed({"type": "text_delta", "text": "late"}) == []
+
+
+async def test_a_later_snapshot_never_brings_back_an_earlier_blocked_answer():
+    def no_secrets(ctx, answer):
+        if "hunter" in str(answer):
+            raise GuardrailTripped("blocked")
+
+    for hold in (False, True):
+        model = ScriptedModel(["The password is hunter2.", "Fine: hunter3."])
+        agent = Agent(model, output_guardrails=[no_secrets])
+        session = Session()
+        await collect(agent.stream("pw?", session=session), hold_final_answer=hold)
+        second = await collect(agent.stream("again?", session=session), hold_final_answer=hold)
+        assert "hunter2" not in json.dumps(second), hold
+    state = await session.state()
+    assert [m.metadata.get("blocked") for m in state.messages if m.role == "assistant"] == [
+        True,
+        True,
+    ]
+
+
+async def test_hold_final_answer_sends_the_answer_of_a_native_sub_agent_that_passed():
+    from qagents.multi import fan_out
+
+    for kind in ("as_tool", "fan_out"):
+        child = Agent(ScriptedModel(["Athens has 3 million people."]), name="researcher")
+        built = child.as_tool() if kind == "as_tool" else fan_out(child)
+        arguments = {"task": "pop"} if kind == "as_tool" else {"tasks": ["pop"]}
+        lead = Agent(ScriptedModel([call(built.name, **arguments), "Done."]), tools=[built])
+        events = await collect(lead.stream("q"), subagents="native", hold_final_answer=True)
+        text = "".join(
+            e["delta"]
+            for e in events
+            if e["type"] == "TEXT_MESSAGE_CONTENT" and e.get("subagentRunId")
+        )
+        assert text == "Athens has 3 million people.", kind

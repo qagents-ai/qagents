@@ -10,10 +10,10 @@ import sys
 import pytest
 
 from examples.harness import (
-    final_answer,
     last_text,
     main,
     scripted_context,
+    structured_answer,
     system_text,
     tool_names,
 )
@@ -58,13 +58,6 @@ MESSY = [  # three days, a day without a hotel, no food, a wrong price, an unlis
 ]  # fmt: skip
 
 
-def answer(request, **fields):
-    """A structured answer in either output mode: a final_answer call, or JSON text (native)."""
-    if "final_answer" in tool_names(request):
-        return final_answer(**fields)
-    return json.dumps(fields)
-
-
 def task_of(request) -> str:
     """Which agent and task sent ``request``: its role, plus the task line for the concierge."""
     system, prompt = system_text(request), request.messages[1].text
@@ -83,18 +76,20 @@ def policy(request, plans=(PLAN,), city="Lisbon"):
         if last.role == "user":
             return [call(tool, city=name) for name in ("Lisbon", "Porto", "Seville")
                     for tool in ("weather", "daily_cost")]  # fmt: skip
-        return answer(request, city=city, reason="23 °C and only 5 rainy days.")
+        return structured_answer(request, city=city, reason="23 °C and only 5 rainy days.")
     if task == "local expert":
         if last.role == "user":
             return call("attractions", city=city)
-        return answer(request, **GUIDE)
+        return structured_answer(request, **GUIDE)
     if task == "lodging":
         if last.role == "user":
             return [call("hotels", city=city), call("daily_cost", city=city)]
-        return answer(request, **LODGING)
+        return structured_answer(request, **LODGING)
     attempt = sum(message.role == "assistant" for message in request.messages)
     plan = plans[min(attempt, len(plans) - 1)]
-    return answer(request, days=plan, total_cost_eur=1.0)  # a wrong total, recomputed by code
+    return structured_answer(
+        request, days=plan, total_cost_eur=1.0
+    )  # a wrong total, recomputed by code
 
 
 def planner_requests(ctx):

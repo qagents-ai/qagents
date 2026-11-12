@@ -19,6 +19,7 @@ import os
 import sys
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import pytest
 
@@ -398,3 +399,169 @@ def test_the_windows_proactor_loop_is_refused_with_the_fix():
 
     with asyncio.Runner(loop_factory=asyncio.ProactorEventLoop) as runner:
         runner.run(check())
+
+
+# -- fixes ----------------------------------------------------------------------------------
+
+
+def postgres_check(check: Callable[[Any, str], Awaitable[None]]) -> None:
+    """Run ``check(store, schema)`` on a fresh schema, then drop it."""
+    from qagents.stores.postgres import PostgresStore
+
+    schema = new_schema()
+
+    async def main() -> None:
+        store = PostgresStore(DSN, schema=schema, pool_size=4)
+        try:
+            await check(store, schema)
+        finally:
+            await store.aclose()
+
+    try:
+        run(main())
+    finally:
+        drop_schemas(schema)
+
+
+async def connect() -> Any:
+    import psycopg
+
+    return await psycopg.AsyncConnection.connect(DSN, autocommit=True)
+
+
+@needs_postgres
+def test_a_delete_that_races_an_append_leaves_nothing_behind():
+    async def check(store: Any, schema: str) -> None:
+        await store.append("chat-1", [Entry(kind="note", data={"n": n}) for n in range(3)])
+        async with await connect() as other:
+            async with other.transaction():  # an append in flight, past its row lock
+                await other.execute(
+                    f'SELECT 1 FROM "{schema}".sessions WHERE session_id = %s FOR UPDATE',
+                    ("chat-1",),
+                )
+                await other.execute(
+                    f'INSERT INTO "{schema}".entries (session_id, seq, ts, run_id, kind, data)'
+                    " VALUES ('chat-1', 4, 0, NULL, 'note', '{\"n\": 3}'),"
+                    " ('chat-1', 5, 0, NULL, 'note', '{\"n\": 4}')"
+                )
+                await other.execute(
+                    f'UPDATE "{schema}".sessions SET last_seq = 5 WHERE session_id = %s',
+                    ("chat-1",),
+                )
+                deleting = asyncio.create_task(store.delete("chat-1"))
+                await asyncio.sleep(0.3)
+                assert not deleting.done()  # it waits for the append
+            await deleting
+        assert await store.load("chat-1") == []
+        for n in range(5):
+            await store.append("chat-1", [Entry(kind="note", data={"new": n})])
+        assert [entry.seq for entry in await store.load("chat-1")] == [1, 2, 3, 4, 5]
+
+    postgres_check(check)
+
+
+@needs_postgres
+def test_an_append_that_waits_while_the_session_is_deleted_starts_it_anew():
+    async def check(store: Any, schema: str) -> None:
+        await store.append("s1", [Entry(kind="note", data={"old": True})])
+        async with await connect() as other:
+            async with other.transaction():  # a delete in progress holds the row
+                await other.execute(
+                    f'SELECT 1 FROM "{schema}".sessions WHERE session_id = %s FOR UPDATE', ("s1",)
+                )
+                appending = asyncio.create_task(store.append("s1", [Entry(kind="note")]))
+                await asyncio.sleep(0.3)
+                await other.execute(
+                    f'DELETE FROM "{schema}".sessions WHERE session_id = %s', ("s1",)
+                )
+                await other.execute(
+                    f'DELETE FROM "{schema}".entries WHERE session_id = %s', ("s1",)
+                )
+            await appending  # no AssertionError: the session starts again at seq 1
+        (entry,) = await store.load("s1")
+        assert (entry.seq, entry.data) == (1, {})
+
+    postgres_check(check)
+
+
+@needs_postgres
+def test_values_jsonb_cannot_hold_are_refused_with_advice_and_nothing_is_written():
+    async def check(store: Any, schema: str) -> None:
+        await store.append("v", [Entry(kind="note", data={"ok": True})])
+        with pytest.raises(SessionError, match=r"NaN or an infinity.*workflow_step.*None"):
+            await store.append("v", [Entry(kind="workflow_step", data={"p": float("nan")})])
+        with pytest.raises(SessionError, match="NaN or an infinity"):
+            await store.append("v", [Entry(kind="note", data={"p": float("inf")})])
+        with pytest.raises(SessionError, match=r"lone surrogate.*tool_result"):
+            await store.append("v", [Entry(kind="tool_result", data={"text": "cut \ud83d"})])
+        assert [entry.data for entry in await store.load("v")] == [{"ok": True}]
+
+    postgres_check(check)
+
+
+@needs_postgres
+def test_a_signed_pause_with_a_large_float_resumes_from_postgres():
+    from qagents import Approval, Permissions
+
+    async def check(store: Any, schema: str) -> None:
+        moved: list[float] = []
+
+        @tool(requires_approval=True)
+        def transfer(amount: float) -> str:
+            """Move money."""
+            moved.append(amount)
+            return "moved"
+
+        agent = Agent(
+            ScriptedModel([call("transfer", amount=2e16), "Moved."]),
+            tools=[transfer],
+            permissions=Permissions(approval_secret="test-secret-for-a-local-postgres!"),
+        )
+        paused = await agent.run("Move it", session=Session(store, id="t"))
+        (pending,) = paused.pending_approvals
+        done = await agent.resume(
+            Session(store, id="t"), approvals={pending.tool_call_id: Approval.for_call(pending)}
+        )
+        assert done.status == "completed" and moved == [2e16]
+
+    postgres_check(check)
+
+
+@needs_postgres
+def test_a_role_with_only_table_privileges_uses_an_existing_schema():
+    from urllib.parse import urlsplit, urlunsplit
+
+    from qagents.stores.postgres import PostgresStore
+
+    role = f"qagents_app_{uuid.uuid4().hex[:8]}"
+    password = uuid.uuid4().hex  # a throwaway test role on the test server
+    parts = urlsplit(DSN)
+    netloc = f"{role}:{password}@{parts.hostname}:{parts.port}"
+    app_dsn = urlunsplit(parts._replace(netloc=netloc))
+
+    async def check(store: Any, schema: str) -> None:
+        await store.load("x")  # the owner creates the schema
+        async with await connect() as admin:
+            await admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
+            await admin.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO {role}')
+            await admin.execute(
+                f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "{schema}" TO {role}'
+            )
+        try:
+            app = PostgresStore(app_dsn, schema=schema, connect_timeout_s=5)
+            try:
+                await app.append("s", [Entry(kind="note", data={"by": "app"})])
+                assert [entry.data for entry in await app.load("s")] == [{"by": "app"}]
+            finally:
+                await app.aclose()
+            missing = PostgresStore(app_dsn, schema=new_schema(), connect_timeout_s=5)
+            with pytest.raises(SessionError, match="USAGE on the schema and SELECT"):
+                await missing.load("s")
+            await missing.aclose()
+        finally:
+            async with await connect() as admin:
+                await admin.execute(f'REVOKE ALL ON ALL TABLES IN SCHEMA "{schema}" FROM {role}')
+                await admin.execute(f'REVOKE ALL ON SCHEMA "{schema}" FROM {role}')
+                await admin.execute(f"DROP ROLE {role}")
+
+    postgres_check(check)

@@ -15,9 +15,12 @@ application shows it to the user, and the answer goes back with
 The pause is journaled like any other, so the answer can arrive minutes or
 days later, in another process.
 
-The tool's description is `qagents.prompts.ASK_USER_DESCRIPTION`, read when
-this module is imported. To word it differently, set
-``ask_user.description`` or build your own tool with ``tool(deferred=True)``.
+The arguments are validated before the run pauses, so ``question`` is always
+there. The tool's description is `qagents.prompts.ASK_USER_DESCRIPTION`, and
+its parameters are described by ``ASK_USER_QUESTION_DESCRIPTION`` and
+``ASK_USER_CHOICES_DESCRIPTION``; all three are read when this module is
+imported. To word them differently, set ``ask_user.description`` and
+``ask_user.parameters``, or build your own tool with ``tool(deferred=True)``.
 """
 
 from __future__ import annotations
@@ -30,11 +33,13 @@ from ..tools import tool
 def ask_user(question: str, choices: list[str] | None = None) -> str:
     """Ask the user a question and wait for the answer.
 
-    Args:
-        question: The question, complete and self-contained.
-        choices: The answers to offer, when they are known in advance.
+    The parameter descriptions the model sees are in `qagents.prompts`.
     """
     raise AssertionError("ask_user is deferred: the agent loop never calls it")
+
+
+ask_user.parameters["properties"]["question"]["description"] = prompts.ASK_USER_QUESTION_DESCRIPTION
+ask_user.parameters["properties"]["choices"]["description"] = prompts.ASK_USER_CHOICES_DESCRIPTION
 
 
 __all__ = ["ask_user"]

@@ -12,8 +12,10 @@ keeps sight of its plan even after the conversation was compacted:
 
     agent = Agent("qcloud:<model-id>", instructions=instructions, tools=[todo_tools()])
 
-The tool descriptions and the rendering are in `qagents.prompts`
-(``WRITE_TODOS_DESCRIPTION``, ``READ_TODOS_DESCRIPTION``, ``TODOS_HEADER``,
+The tool and parameter descriptions and the rendering are in `qagents.prompts`
+(``WRITE_TODOS_DESCRIPTION``, ``WRITE_TODOS_TODOS_DESCRIPTION``,
+``TODO_ITEM_DESCRIPTION``, ``TODO_CONTENT_DESCRIPTION``,
+``TODO_STATUS_DESCRIPTION``, ``READ_TODOS_DESCRIPTION``, ``TODOS_HEADER``,
 ``TODO_LINE``, ``TODOS_EMPTY``, ``TODOS_SAVED``,
 ``TODOS_TOO_MANY_IN_PROGRESS``); they are read when the tools are made or used.
 """
@@ -23,7 +25,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from .. import prompts
 from ..errors import SessionError, ToolError
@@ -33,14 +35,13 @@ TodoStatus = Literal["pending", "in_progress", "completed"]
 
 
 class TodoItem(BaseModel):
-    """One step of the plan."""
+    """One item of a todo list: ``content`` and ``status``.
 
-    model_config = ConfigDict(use_attribute_docstrings=True)
+    The descriptions the model sees are in `qagents.prompts`.
+    """
 
     content: str
-    """What to do, as a short imperative sentence."""
     status: TodoStatus
-    """pending (not started), in_progress (being worked on) or completed."""
 
 
 _TODO_LIST = TypeAdapter(list[TodoItem])
@@ -61,11 +62,7 @@ def todo_tools(key: str = "todos") -> list[Tool]:
 
     @tool(idempotent=True, description=prompts.WRITE_TODOS_DESCRIPTION)
     def write_todos(ctx: RunContext[Any], todos: list[TodoItem]) -> str:
-        """Replace the todo list.
-
-        Args:
-            todos: The complete list, in the order the work should be done.
-        """
+        """Replace the todo list."""
         counts = {status: 0 for status in ("pending", "in_progress", "completed")}
         for item in todos:
             counts[item.status] += 1
@@ -73,6 +70,13 @@ def todo_tools(key: str = "todos") -> list[Tool]:
             raise ToolError(prompts.TODOS_TOO_MANY_IN_PROGRESS.format(count=counts["in_progress"]))
         ctx.state[key] = [item.model_dump(mode="json") for item in todos]
         return prompts.TODOS_SAVED.format(total=len(todos), **counts)
+
+    parameters = write_todos.parameters
+    parameters["properties"]["todos"]["description"] = prompts.WRITE_TODOS_TODOS_DESCRIPTION
+    item = parameters["$defs"]["TodoItem"]
+    item["description"] = prompts.TODO_ITEM_DESCRIPTION
+    item["properties"]["content"]["description"] = prompts.TODO_CONTENT_DESCRIPTION
+    item["properties"]["status"]["description"] = prompts.TODO_STATUS_DESCRIPTION
 
     @tool(read_only=True, description=prompts.READ_TODOS_DESCRIPTION)
     def read_todos(ctx: RunContext[Any]) -> str:

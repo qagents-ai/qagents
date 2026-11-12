@@ -8,7 +8,13 @@ import sys
 
 import pytest
 
-from examples.harness import final_answer, main, scripted_context, system_text, tool_names
+from examples.harness import (
+    main,
+    scripted_context,
+    structured_answer,
+    system_text,
+    tool_names,
+)
 from examples.patterns import research_crew
 from examples.patterns.research_crew import ResearchNotes, run, search
 from qagents.models.testing import FunctionModel, call
@@ -25,13 +31,6 @@ BODY = (
 )
 
 
-def answer(request, **fields):
-    """A structured answer in either output mode: a final_answer call, or JSON text (native)."""
-    if "final_answer" in tool_names(request):
-        return final_answer(**fields)
-    return json.dumps(fields)
-
-
 def policy(request, facts=FACTS):
     """Plays the three crew members; each is recognised by its role in the instructions."""
     system = system_text(request)
@@ -41,11 +40,13 @@ def policy(request, facts=FACTS):
             return call("search", query="Aegean Green Ferry programme")
         if searches == 1:
             return call("search", query="ferry route ships")
-        return answer(request, facts=facts)
+        return structured_answer(request, facts=facts)
     if "Science and technology writer" in system:
-        return answer(request, title="Greece goes electric at sea", body=BODY.replace("388", "380"))
+        return structured_answer(
+            request, title="Greece goes electric at sea", body=BODY.replace("388", "380")
+        )
     if "Managing editor" in system:
-        return answer(
+        return structured_answer(
             request, title="Greece's ferries go electric", body=BODY, changes=["380 -> 388"]
         )
     raise AssertionError(f"unexpected request: {system[:80]!r}")
@@ -114,7 +115,9 @@ async def test_facts_without_an_on_topic_source_do_not_count(tmp_path):
 async def test_an_article_that_drops_a_researched_figure_fails(tmp_path):
     def sloppy(request):
         if "Managing editor" in system_text(request):
-            return answer(request, title="Ferries", body=BODY.replace(" 436", ""), changes=[])
+            return structured_answer(
+                request, title="Ferries", body=BODY.replace(" 436", ""), changes=[]
+            )
         return policy(request)
 
     outcome = await run(scripted_context(sloppy, tmp_path))

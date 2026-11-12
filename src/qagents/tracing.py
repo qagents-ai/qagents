@@ -36,7 +36,14 @@ are still marked "Development" upstream and may be renamed; the names used
 here are kept in one place (``ATTR``) so they can be adjusted.
 
 Message and tool content is left out of spans unless ``record_content=True``,
-because it often contains personal data. Approval tokens are never recorded.
+because it often contains personal data. That includes error text: a failed
+tool call gets the status description `TOOL_FAILED`, and a failed run records
+only the exception's type (no message, no stack trace), because exception
+messages often quote the model's answer or a tool's output. Approval tokens
+are never recorded.
+
+A compactor's own model request (the summary of `SummarizingCompactor`) goes
+through the run's hooks, so it has a ``chat`` span of its own.
 
 Every span a run opened is ended when the run ends, however it ends. A tool
 call that paused the run for input (``DeferToolCall``) ends its span without
@@ -85,11 +92,15 @@ ATTR = {
     "deferred": "qagents.tool.deferred",
     "pending_approvals": "qagents.pending_approvals",
     "pending_inputs": "qagents.pending_inputs",
+    "error_type": "error.type",
 }
 """Span attribute names, in one place so a renamed convention is a one-line change."""
 
 UNFINISHED = "the run ended before this finished"
 """Status description of a span that its run left open (a failure or a cancellation)."""
+
+TOOL_FAILED = "the tool reported an error"
+"""Status description of a failed tool call when content is not recorded."""
 
 
 @dataclass
@@ -110,7 +121,9 @@ class OTelHooks(Hooks):
         tracer: The tracer to use; defaults to ``trace.get_tracer("qagents")``
             from the globally configured tracer provider.
         record_content: Put messages, tool arguments and tool results on the
-            spans. Off by default because they often contain personal data.
+            spans, and the text of errors (a failed tool's result, the message
+            and stack trace of the exception that ended a run). Off by default
+            because they often contain personal data.
 
     Raises:
         ConfigurationError: OpenTelemetry is not installed.
@@ -221,7 +234,10 @@ class OTelHooks(Hooks):
         if span is None:
             return
         if result.is_error:
-            span.set_status(self._trace.StatusCode.ERROR, result.content[:200])
+            text = result.content[:200] if self._record_content else TOOL_FAILED
+            span.set_status(self._trace.StatusCode.ERROR, text)
+            if result.metadata.get("exception"):  # the exception's class name, not its message
+                span.set_attribute(ATTR["error_type"], str(result.metadata["exception"]))
         if self._record_content:
             span.set_attribute(ATTR["tool_result"], result.content)
         span.end()
@@ -266,9 +282,27 @@ class OTelHooks(Hooks):
                     ATTR["pending_inputs"], [item.tool_call_id for item in result.pending_inputs]
                 )
         if error is not None:
+            self._record_error(span, error)
+        span.end()
+
+    def _record_error(self, span: Any, error: BaseException) -> None:
+        """Mark ``span`` as failed by ``error``.
+
+        The message and the stack trace (which repeats the messages of chained exceptions)
+        are recorded only with ``record_content``: they often quote content, such as the
+        answer that failed validation. Otherwise the exception event has its type only.
+        """
+        kind = type(error)
+        name = kind.__qualname__
+        if kind.__module__ not in ("builtins", ""):
+            name = f"{kind.__module__}.{name}"
+        span.set_attribute(ATTR["error_type"], name)
+        if self._record_content:
             span.record_exception(error)
             span.set_status(self._trace.StatusCode.ERROR, str(error)[:200])
-        span.end()
+        else:
+            span.add_event("exception", {"exception.type": name})
+            span.set_status(self._trace.StatusCode.ERROR, kind.__name__)
 
     def _descendants(self, run_id: str) -> list[str]:
         """Open runs below ``run_id``, deepest first."""

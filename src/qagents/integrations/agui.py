@@ -34,13 +34,31 @@ The mapping:
 
 Events of other types are skipped, so a qagents release that adds event types
 never breaks a client. The ``value`` of a `CUSTOM` event is the qagents event
-as JSON, without its ``type``.
+as JSON, without its ``type``, and without what the client should not get: a
+guardrail's ``reason`` (unless ``guardrail_reasons=True``), the text of
+exceptions that tools raised (unless ``expose_errors=True``), and in the events
+of sub-agents their usage, provider replay data and, with ``reasoning=False``,
+their reasoning.
 
 Every start event gets its end event, and messages and tool calls are never
 interleaved: a text message ends before a tool call starts, which is what
 strict AG-UI clients check. Tool calls are announced when the model has
 finished writing them if the provider does not stream them. Message ids are
 made from the AG-UI run id and a counter.
+
+Output guardrails check the final answer after the model has written it, so
+its text has already been streamed to the client when a guardrail blocks it.
+A run blocked that way therefore ends with a ``MESSAGES_SNAPSHOT`` without the
+blocked answer, whatever ``messages_snapshot`` says: clients replace their
+messages with a snapshot, which takes the streamed text back. The text of
+sub-agents in ``"custom"`` and ``"native"`` mode is not taken back. With
+``hold_final_answer=True`` the answer is not streamed at all: each model
+response is sent once the run goes on past it, so a blocked answer never
+reaches the client. A blocked answer stays in the conversation
+(``RunResult.messages``); a later run of the session reads it back marked
+``metadata["blocked"]``, and its snapshots leave it out. A sub-agent in
+``"native"`` mode holds its answer too, and sends it when its tool call ends
+without an error.
 
 A run that pauses for approvals or for deferred tools ends with a
 ``RUN_FINISHED`` event whose ``outcome`` lists the interrupts. When the client
@@ -61,9 +79,17 @@ from pydantic import BaseModel, ValidationError
 from pydantic_core import to_jsonable_python
 
 from .. import prompts
-from ..errors import ConfigurationError, QAgentsError, ToolError
+from ..errors import (
+    ApprovalTokenError,
+    ConfigurationError,
+    ModelConnectionError,
+    ModelError,
+    ModelRateLimitError,
+    SessionError,
+    ToolError,
+)
 from ..messages import ImagePart, Message, ReasoningPart, TextPart
-from ..permissions import Approval
+from ..permissions import Approval, InputResult
 
 # The text sent to the model (INPUT_CANCELLED) is in qagents.prompts.
 
@@ -76,8 +102,28 @@ STEP_NAME = "{agent}: turn {turn}"
 """``stepName`` of the step events that frame one model request and its tool calls."""
 
 RUN_ERROR_MESSAGE = "The run failed. The server log has the details."
-"""``RUN_ERROR`` message for exceptions that are not qagents errors, unless
-``expose_errors=True``. Their text can contain internal details."""
+"""``RUN_ERROR`` message for an exception that has none in `RUN_ERROR_MESSAGES`,
+unless ``expose_errors=True``."""
+
+RUN_ERROR_MESSAGES: tuple[tuple[type[BaseException], str], ...] = (
+    (ModelRateLimitError, "The model is busy. Try again shortly."),
+    (ModelConnectionError, "The model provider could not be reached."),
+    (ModelError, "The model request failed."),
+    (ApprovalTokenError, "The answer to the paused run was refused."),
+    (SessionError, "The conversation could not be loaded, resumed or saved."),
+)
+"""``RUN_ERROR`` messages by exception class, first match wins, unless
+``expose_errors=True``. The text of the exception that ended the run is not
+sent by default: qagents errors included, it can name hosts, paths and
+provider responses. The exception's class name is sent as ``code``; the
+server log has the text. For a tool that raised, see `TOOL_ERROR_MESSAGE`."""
+
+TOOL_ERROR_MESSAGE = "{name!r} failed. The server log has the details."
+"""What the client gets, unless ``expose_errors=True``, as the result of a
+tool call that raised an exception (an agent used as a tool included): in
+``TOOL_CALL_RESULT``, ``SUBAGENT_ERROR``, ``MESSAGES_SNAPSHOT`` and ``CUSTOM``
+values. The model reads the exception's text, `prompts.TOOL_FAILED`; a
+`ToolError`'s text is written for the model and is sent as it is."""
 
 STREAM_ENDED_MESSAGE = "The event stream ended before the run finished."
 """``RUN_ERROR`` message when the qagents stream stops without ``run_finished``."""
@@ -94,7 +140,9 @@ INPUT_INTERRUPT_PREFIX = "input:"
 """Interrupt ids of pending inputs (deferred tool calls) are this prefix plus the tool call id."""
 
 APPROVAL_RESPONSE_SCHEMA: dict[str, Any] = Approval.model_json_schema()
-"""``responseSchema`` of an approval interrupt: the client answers with an `Approval`."""
+"""``responseSchema`` of an approval interrupt: the client answers with an
+`Approval`, without ``arguments`` (see `agui_resume`)."""
+APPROVAL_RESPONSE_SCHEMA["properties"].pop("arguments")
 
 SubagentMode = Literal["custom", "native", "ignore"]
 """How events of agents running as tools are projected; see `AGUIProjector`."""
@@ -102,6 +150,29 @@ SubagentMode = Literal["custom", "native", "ignore"]
 logger = logging.getLogger("qagents.agui")
 
 _LIFECYCLE = frozenset({"run_started", "run_finished", "subagent_event"})
+
+_HOLDERS = {"model_responded": "response", "run_finished": "result"}
+"""The field of an event that holds its usage and messages."""
+
+_HELD = frozenset(
+    {"text_delta", "reasoning_delta", "tool_call_delta", "model_responded", "tool_call_finished"}
+)
+"""With ``hold_final_answer``: events whose AG-UI events wait, a model response and the
+results recorded with it."""
+
+_GOES_ON = frozenset(
+    {
+        "turn_started",
+        "tool_call_started",
+        "approval_required",
+        "input_required",
+        "agent_switched",
+        "subagent_event",
+        "run_finished",
+    }
+)
+"""With ``hold_final_answer``: events after which what waits is sent, unless the run
+was blocked: the response was not the final answer, or the answer passed."""
 
 
 @dataclass
@@ -111,6 +182,9 @@ class _StreamedCall:
     id: str | None = None
     name: str = ""
     buffer: str = ""
+    """Arguments received before the call was started."""
+    sent: str = ""
+    """Arguments sent to the client."""
     started: bool = False
     ended: bool = False
 
@@ -139,13 +213,15 @@ class AGUIProjector:
             run, so a resumed run gets the qagents id plus a random suffix.
         steps: Frame each model request and its tool calls with
             ``STEP_STARTED`` and ``STEP_FINISHED``.
-        reasoning: Forward the reasoning text that models expose. Set it to
-            ``False`` to keep reasoning away from the client.
+        reasoning: Forward the reasoning text that models expose, sub-agents'
+            included. Set it to ``False`` to keep reasoning away from the client.
         state_snapshots: Send ``STATE_SNAPSHOT`` with the full session state
             after every ``state_updated``.
         messages_snapshot: Send ``MESSAGES_SNAPSHOT`` with the whole
             conversation before ``RUN_FINISHED``. Off by default: the
-            conversation can be large, and the client already has it.
+            conversation can be large, and the client already has it. A run
+            blocked by an output guardrail always gets one, without the
+            blocked answer.
         interrupts: Put the pending approvals and inputs of a paused run in the
             ``outcome`` of ``RUN_FINISHED``, as AG-UI interrupts.
         subagents: Events of an agent running as a tool become one ``CUSTOM``
@@ -156,9 +232,24 @@ class AGUIProjector:
         custom_events: qagents event types also sent as ``CUSTOM`` events,
             after any other mapping. Add the ``type`` of events your tools emit
             with ``ctx.emit``.
-        expose_errors: Put the text of any exception in ``RUN_ERROR``. By
-            default only qagents errors, which are written for developers and
-            carry no internals, are shown; others get `RUN_ERROR_MESSAGE`.
+        expose_errors: Send the text of exceptions: in ``RUN_ERROR``, and as
+            the result of a tool call that raised. Off by default, because
+            error text, qagents errors' included, can name hosts, paths and
+            provider responses: the client gets a fixed message from
+            `RUN_ERROR_MESSAGES` and the exception's class name, or
+            `TOOL_ERROR_MESSAGE` for a tool.
+        guardrail_reasons: Keep the ``reason`` in ``guardrail_tripped``
+            events. Off by default: the reason is meant for your code and
+            logs, and often quotes what was blocked.
+        hold_final_answer: Send the text, reasoning and tool calls of a model
+            response only once the run goes on past it (a tool starts, an
+            approval is asked, the next turn starts) or finishes without
+            being blocked. A final answer that an output guardrail blocks
+            then never reaches the client. Off by default, because the
+            client then sees the final answer only when the run ends. Turn it
+            on when the agent, or an agent it hands off to, has output
+            guardrails. A run that raises drops what waits. Sub-agents hold
+            their answers too in ``"native"`` mode, not in ``"custom"`` mode.
 
     Raises:
         ConfigurationError: ``subagents`` is not one of the modes above.
@@ -177,6 +268,8 @@ class AGUIProjector:
         subagents: SubagentMode = "custom",
         custom_events: Collection[str] = CUSTOM_EVENTS,
         expose_errors: bool = False,
+        guardrail_reasons: bool = False,
+        hold_final_answer: bool = False,
     ) -> None:
         if subagents not in ("custom", "native", "ignore"):
             raise ConfigurationError(
@@ -194,7 +287,11 @@ class AGUIProjector:
         self.subagents: SubagentMode = subagents
         self.custom_events = frozenset(custom_events)
         self.expose_errors = expose_errors
+        self.guardrail_reasons = guardrail_reasons
+        self.hold_final_answer = hold_final_answer
 
+        self._held: list[dict[str, Any]] | None = None
+        """AG-UI events that wait (``hold_final_answer``); ``None`` when nothing waits."""
         self._subagent_run_id: str | None = None
         """Set on the projector of an agent running as a tool (``subagents="native"``)."""
         self._started = False
@@ -212,6 +309,10 @@ class AGUIProjector:
         self._streamed_reasoning = False
         self._unresulted: dict[str, str] = {}
         """Tool calls of the last response without a result: id -> name."""
+        self._resulted: set[str] = set()
+        """Tool calls this projector sent a result for."""
+        self._unseen_handoffs: list[str] = []
+        """Agents handed off to by a call this projector never saw (a resumed run)."""
         self._children: dict[tuple[str, str], AGUIProjector] = {}
         """Open sub-agent projectors by (tool call id, agent): the parallel children of one
         ``fan_out`` call share the call id and differ by agent label."""
@@ -238,7 +339,8 @@ class AGUIProjector:
         """Project one qagents event.
 
         Args:
-            event: A qagents event (a pydantic model or a dict with a ``type``).
+            event: A qagents event: a pydantic model, or the same as a dict
+                with a ``type``, such as ``event.model_dump(mode="json")``.
                 Events of unknown types produce nothing, unless their type is
                 in ``custom_events``.
 
@@ -249,12 +351,14 @@ class AGUIProjector:
             return []
         kind = _event_type(event)
         out: list[dict[str, Any]] = []
+        target = self._hold(kind, event, out) if self.hold_final_answer else out
         handler = self._handlers.get(kind or "")
         if handler is not None:
-            handler(event, out)
+            handler(event, target)
         if kind in self.custom_events and kind not in _LIFECYCLE and not self._finished:
-            self._close_segments(out)
-            out.append(self._event("CUSTOM", name=kind, value=_dump(event)))
+            self._close_segments(target)
+            value = self._public(kind, _dump(event))
+            target.append(self._event("CUSTOM", name=kind, value=value))
         return out
 
     def fail(self, error: BaseException) -> list[dict[str, Any]]:
@@ -267,10 +371,13 @@ class AGUIProjector:
         if self._finished:
             return []
         out: list[dict[str, Any]] = []
-        if isinstance(error, QAgentsError) or self.expose_errors:
+        if self.expose_errors:
             message = str(error) or type(error).__name__
         else:
-            message = RUN_ERROR_MESSAGE
+            message = next(
+                (text for kind, text in RUN_ERROR_MESSAGES if isinstance(error, kind)),
+                RUN_ERROR_MESSAGE,
+            )
         self._close_all(out, error=message)
         out.append(self._event("RUN_ERROR", message=message, code=type(error).__name__))
         self._finished = True
@@ -311,6 +418,8 @@ class AGUIProjector:
     def _on_run_finished(self, event: Any, out: list[dict[str, Any]]) -> None:
         result = _field(event, "result")
         self._close_all(out)
+        messages = list(_field(result, "messages") or [])
+        self._send_unseen_handoffs(messages, out)
         summary = {
             "status": _field(result, "status"),
             "stop_reason": _field(result, "stop_reason"),
@@ -320,9 +429,13 @@ class AGUIProjector:
         if self._subagent_run_id is not None:
             out.append(self._event("SUBAGENT_FINISHED", result=summary))
             return
-        messages = _field(result, "messages")
-        if self.messages_snapshot and messages:
-            snapshot = to_agui_messages(messages, id_prefix=f"{self.thread_id}-msg")
+        blocked = _blocks_the_answer("run_finished", event)
+        if blocked:  # the snapshot replaces the client's messages: the streamed answer goes
+            messages = _before_last_answer(messages)
+        if messages and (self.messages_snapshot or blocked):
+            snapshot = to_agui_messages(
+                messages, id_prefix=f"{self.thread_id}-msg", expose_errors=self.expose_errors
+            )
             out.append(self._event("MESSAGES_SNAPSHOT", messages=snapshot))
         outcome = None
         if self.interrupts:
@@ -391,25 +504,37 @@ class AGUIProjector:
         call.name = _field(event, "name") or call.name
         fragment = _field(event, "arguments_delta") or ""
         if call.ended:
-            return  # another call started meanwhile; the final arguments are in the history
+            return  # ended early by text or reasoning, or left for model_responded
         if call.started:
             if fragment:
                 out.append(self._event("TOOL_CALL_ARGS", toolCallId=call.id, delta=fragment))
+                call.sent += fragment
             return
         call.buffer += fragment
         # Start once the id is known and the arguments begin, by which point
         # providers have sent the whole name. Without an id, wait for the response.
-        if call.id and call.name and call.buffer:
-            self._close_call(out)
-            self._start_call(out, call.id, call.name)
-            out.append(self._event("TOOL_CALL_ARGS", toolCallId=call.id, delta=call.buffer))
-            call.buffer = ""
-            call.started = True
-            self._open_call = call
+        if not (call.id and call.name and call.buffer):
+            return
+        if any(other is not call and other.id == call.id for other in self._calls.values()):
+            call.ended = True  # a repeated id: the response gives this call its own
+            return
+        if self._open_call is not None and not _is_json(self._open_call.sent):
+            return  # the open call's arguments are not complete: this call waits
+        self._close_call(out)
+        self._start_call(out, call.id, call.name)
+        out.append(self._event("TOOL_CALL_ARGS", toolCallId=call.id, delta=call.buffer))
+        call.sent, call.buffer = call.buffer, ""
+        call.started = True
+        self._open_call = call
 
     def _on_model_responded(self, event: Any, out: list[dict[str, Any]]) -> None:
         self._close_segments(out)
         message = _field(_field(event, "response"), "message")
+        if isinstance(message, Mapping):
+            try:
+                message = Message.model_validate(dict(message))
+            except ValidationError:
+                logger.warning("model_responded carries a message that is not one; skipped")
         if isinstance(message, Message):
             # What the provider did not stream is sent whole, in the message's order.
             streamed_text, streamed_reasoning = self._streamed_text, self._streamed_reasoning
@@ -441,27 +566,25 @@ class AGUIProjector:
         self._close_segments(out)
         result = _field(event, "result")
         call_id = _field(_field(event, "call"), "id") or _field(result, "tool_call_id")
+        content = _field(result, "content") or ""
+        if not self.expose_errors and _raised(result):
+            content = TOOL_ERROR_MESSAGE.format(name=_field(result, "name") or "tool")
         keys = [key for key in self._children if key[0] == str(call_id)]
         for key in keys:
             child = self._children.pop(key)
             if _field(result, "is_error"):
-                child._close_all(out, error=_field(result, "content"))
-                out.extend(child._end_subagent(error=_field(result, "content") or ""))
+                child._close_all(out, error=content)
+                out.extend(child._end_subagent(error=content))
             else:
                 # One child answers with the call's result; parallel children share one.
+                # Its run ended unblocked (a blocked answer was dropped when its
+                # guardrail tripped), so what it holds is sent before it closes.
+                child._release_held(out)
                 child._close_all(out)
-                output = _field(result, "content") if len(keys) == 1 else None
+                output = content if len(keys) == 1 else None
                 out.extend(child._end_subagent(output=output))
         self._unresulted.pop(call_id, None)
-        out.append(
-            self._event(
-                "TOOL_CALL_RESULT",
-                messageId=self._new_id("result"),
-                toolCallId=call_id,
-                content=_field(result, "content") or "",
-                role="tool",
-            )
-        )
+        self._send_result(out, call_id, content)
 
     def _on_state_updated(self, event: Any, out: list[dict[str, Any]]) -> None:
         values = _field(event, "values")
@@ -473,28 +596,60 @@ class AGUIProjector:
     def _on_agent_switched(self, event: Any, out: list[dict[str, Any]]) -> None:
         # The loop records the result of the accepted handoff call without an
         # event; every other call of that turn has had its tool_call_finished.
+        # The event names the call; without the name, it is the handoff call of
+        # the last response that has no result. A resumed run may not have seen
+        # that response: the result is then taken from the messages at the end.
         target = _field(event, "to_agent") or ""
-        for call_id, name in list(self._unresulted.items()):
-            if name.startswith("transfer_to_"):
-                self._close_segments(out)
-                out.append(
-                    self._event(
-                        "TOOL_CALL_RESULT",
-                        messageId=self._new_id("result"),
-                        toolCallId=call_id,
-                        content=prompts.HANDOFF_RESULT.format(name=target),
-                        role="tool",
-                    )
-                )
-                del self._unresulted[call_id]
-                break
+        call_id = _field(event, "tool_call_id") or next(
+            (id_ for id_, name in self._unresulted.items() if name.startswith("transfer_to_")),
+            None,
+        )
+        if call_id is None:
+            self._unseen_handoffs.append(target)
+            return
+        self._unresulted.pop(call_id, None)
+        self._close_segments(out)
+        self._send_result(out, call_id, prompts.HANDOFF_RESULT.format(name=target))
+
+    def _send_unseen_handoffs(self, messages: list[Any], out: list[dict[str, Any]]) -> None:
+        """``TOOL_CALL_RESULT`` for the handoff calls this projector never saw, from the
+        conversation: the latest result of a handoff to each agent that has none sent."""
+        for target in self._unseen_handoffs:
+            content = prompts.HANDOFF_RESULT.format(name=target)
+            found = (
+                str(_field(part, "tool_call_id"))
+                for message in reversed(messages)
+                for part in reversed(_field(message, "parts") or [])
+                if _field(part, "type") == "tool_result"
+                and _field(part, "content") == content
+                and not _field(part, "is_error")
+                and str(_field(part, "tool_call_id")) not in self._resulted
+            )
+            call_id = next(found, None)
+            if call_id is not None:
+                self._send_result(out, call_id, content)
+        self._unseen_handoffs = []
+
+    def _send_result(self, out: list[dict[str, Any]], call_id: Any, content: str) -> None:
+        self._resulted.add(str(call_id))
+        out.append(
+            self._event(
+                "TOOL_CALL_RESULT",
+                messageId=self._new_id("result"),
+                toolCallId=call_id,
+                content=content,
+                role="tool",
+            )
+        )
 
     def _on_subagent_event(self, event: Any, out: list[dict[str, Any]]) -> None:
         if self.subagents == "ignore":
             return
         if self.subagents == "custom":
-            self._close_segments(out)
-            out.append(self._event("CUSTOM", name="subagent_event", value=_dump(event)))
+            value = self._public("subagent_event", _dump(event))
+            if value is not None:
+                self._close_segments(out)
+                out.append(self._event("CUSTOM", name="subagent_event", value=value))
             return
         inner = _field(event, "event")
         agent = str(_field(event, "agent") or "agent")
@@ -515,6 +670,8 @@ class AGUIProjector:
                 subagents=self.subagents,
                 custom_events=self.custom_events,
                 expose_errors=self.expose_errors,
+                guardrail_reasons=self.guardrail_reasons,
+                hold_final_answer=self.hold_final_answer,
             )
             child._subagent_run_id = child_id
             child._started = True
@@ -545,6 +702,73 @@ class AGUIProjector:
         return [self._event("SUBAGENT_FINISHED", result=summary)]
 
     # -- plumbing -------------------------------------------------------------------------
+
+    def _hold(
+        self, kind: str | None, event: Any, out: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Where the AG-UI events of a ``kind`` event go with ``hold_final_answer``.
+
+        A model response, and the results recorded with it, wait. What waits is
+        dropped when an output guardrail blocks the run, and sent before an
+        event that shows the run went on, or finished unblocked. Other events
+        are sent at once, after the waiting messages and calls are ended.
+        """
+        if kind in _HELD and (self._held is not None or kind != "tool_call_finished"):
+            if self._held is None:
+                self._held = []
+            return self._held
+        if self._held is None:
+            return out
+        if _blocks_the_answer(kind, event):
+            self._drop_held()
+        elif kind in _GOES_ON:
+            out.extend(self._held)
+            self._held = None
+        else:
+            self._close_segments(self._held)
+        return out
+
+    def _release_held(self, out: list[dict[str, Any]]) -> None:
+        """Send what waits (``hold_final_answer``), its children's first."""
+        for child in self._children.values():
+            child._release_held(out)
+        if self._held is not None:
+            out.extend(self._held)
+            self._held = None
+
+    def _drop_held(self) -> None:
+        """Forget what waits; its open messages and calls were never started for the client."""
+        if self._held is not None:
+            self._close_segments([])
+            self._held = None
+
+    def _public(self, kind: str | None, value: Any) -> Any:
+        """The JSON ``value`` of a ``kind`` event as the client may see it; ``None``: nothing.
+
+        A guardrail's reason is left out unless ``guardrail_reasons``, and the
+        text of tool calls that raised unless ``expose_errors``. From the
+        events of sub-agents, at any depth, usage and provider replay data
+        (``opaque``) are left out, as the parent's own events never carry them,
+        and so is reasoning unless ``reasoning``.
+        """
+        if not isinstance(value, dict):
+            return value
+        if not self.expose_errors:
+            value = _without_exception_text(value)
+        if kind == "guardrail_tripped" and not self.guardrail_reasons:
+            return {key: item for key, item in value.items() if key != "reason"}
+        inner = value.get("event")
+        if kind != "subagent_event" or not isinstance(inner, dict):
+            return value
+        inner_kind = inner.get("type")
+        if inner_kind == "reasoning_delta" and not self.reasoning:
+            return None
+        holder = _HOLDERS.get(inner_kind or "")
+        if holder is not None and isinstance(inner.get(holder), dict):
+            data = {key: item for key, item in inner[holder].items() if key != "usage"}
+            inner = {**inner, holder: _without_reasoning(data, keep_text=self.reasoning)}
+        inner = self._public(inner_kind, inner)
+        return None if inner is None else {**value, "event": inner}
 
     def _event(self, type_: str, **fields: Any) -> dict[str, Any]:
         event: dict[str, Any] = {"type": type_}
@@ -597,7 +821,12 @@ class AGUIProjector:
             self._step = None
 
     def _close_all(self, out: list[dict[str, Any]], *, error: str | None = None) -> None:
-        """End every open message, tool call, step and subagent, children first."""
+        """End every open message, tool call, step and subagent, children first.
+
+        What waits (``hold_final_answer``) is dropped: the run ended without
+        showing that it went on past it.
+        """
+        self._drop_held()
         self._close_segments(out)
         for child in self._children.values():
             child._close_all(out, error=error)
@@ -699,32 +928,53 @@ async def agui_sse(stream: AsyncIterable[Any], **options: Any) -> AsyncGenerator
 
 
 def to_agui_messages(
-    messages: Iterable[Message], *, id_prefix: str = "msg"
+    messages: Iterable[Message | Mapping[str, Any]],
+    *,
+    id_prefix: str = "msg",
+    expose_errors: bool = False,
 ) -> list[dict[str, Any]]:
     """Convert a conversation into AG-UI messages, as sent in ``MESSAGES_SNAPSHOT``.
 
     qagents messages have no ids, so ids are ``<id_prefix>-<position>``; tool
     results become one ``tool`` message each, ``<id_prefix>-<position>-<n>``.
     Reasoning is left out, and an assistant message with neither text nor tool
-    calls is skipped.
+    calls is skipped, and so is an answer an output guardrail blocked
+    (``metadata["blocked"]``, set when the session is read back) with the
+    results of its tool calls.
 
     Args:
-        messages: The conversation, for example ``result.messages``.
+        messages: The conversation, for example ``result.messages``, as
+            `Message` objects or their JSON dicts.
         id_prefix: Start of every message id. Use something unique to the thread.
+        expose_errors: Keep the text of the exception in the result of a tool
+            call that raised. Off by default: it becomes `TOOL_ERROR_MESSAGE`.
 
     Returns:
         AG-UI message dicts with camelCase field names.
+
+    Raises:
+        pydantic.ValidationError: A dict is not a message.
     """
     converted: list[dict[str, Any]] = []
-    for index, message in enumerate(messages):
+    hidden: set[str] = set()  # calls of answers an output guardrail blocked
+    for index, item in enumerate(messages):
+        message = item if isinstance(item, Message) else Message.model_validate(dict(item))
         base = f"{id_prefix}-{index}"
+        if message.role == "assistant" and message.metadata.get("blocked"):
+            hidden.update(call.id for call in message.tool_calls)
+            continue
         if message.role == "tool":
             for position, result in enumerate(message.tool_results):
+                if result.tool_call_id in hidden:
+                    continue
+                content = result.content
+                if not expose_errors and _raised(result):
+                    content = TOOL_ERROR_MESSAGE.format(name=result.name)
                 converted.append(
                     {
                         "id": f"{base}-{position}",
                         "role": "tool",
-                        "content": result.content,
+                        "content": content,
                         "toolCallId": result.tool_call_id,
                     }
                 )
@@ -762,7 +1012,9 @@ def to_agui_messages(
     return converted
 
 
-def agui_resume(resume: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+def agui_resume(
+    resume: Iterable[Mapping[str, Any]], *, allow_argument_edits: bool = False
+) -> dict[str, dict[str, Any]]:
     """Turn the ``resume`` entries of an AG-UI ``RunAgentInput`` into resume arguments.
 
         await agent.resume(session, **agui_resume(body["resume"]))
@@ -771,7 +1023,7 @@ def agui_resume(resume: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]
 
     * ``approval:<tool call id>``: the payload is an `Approval` as a dict
       (``{"approved": false, "reason": "..."}``) or a bare boolean. A
-      ``cancelled`` entry declines the call.
+      ``cancelled`` entry declines the call, whatever its payload says.
     * ``input:<tool call id>``: the payload is the tool's result. A
       ``cancelled`` entry gives the call an error result, `prompts.INPUT_CANCELLED`.
 
@@ -779,18 +1031,27 @@ def agui_resume(resume: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]
     back the ``token`` it received in the interrupt's metadata:
     ``{"approved": true, "token": "..."}`` for an approval and
     ``{"token": "...", "value": ...}`` for an input. Both pass through
-    unchanged, and ``agent.resume`` checks them.
+    unchanged, and ``agent.resume`` checks them. A ``cancelled`` entry needs
+    the token too, as its payload ``{"token": "..."}``; without it
+    ``agent.resume`` raises `ApprovalTokenError` and nothing runs.
 
     Args:
         resume: The entries, each with ``interruptId``, ``status``
             (``"resolved"`` or ``"cancelled"``) and an optional ``payload``.
+        allow_argument_edits: Accept ``arguments`` in an approval, which runs
+            the tool with the client's arguments instead of the model's. Off
+            by default, because the client would choose what runs, and a
+            pause's token signs the model's arguments, not the client's. Turn
+            it on only for clients you trust to do that, and advertise your own
+            ``responseSchema``: `APPROVAL_RESPONSE_SCHEMA` has no ``arguments``.
 
     Returns:
         ``{"approvals": {...}, "results": {...}}``, keyed by tool call id.
 
     Raises:
-        ValueError: An entry has an unknown interrupt id or status, or an
-            approval payload that is not an `Approval`.
+        ValueError: An entry has an unknown interrupt id or status, an
+            approval payload that is not an `Approval`, or ``arguments``
+            without ``allow_argument_edits``.
     """
     approvals: dict[str, Approval] = {}
     results: dict[str, Any] = {}
@@ -805,12 +1066,24 @@ def agui_resume(resume: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]
         payload = entry.get("payload")
         if interrupt_id.startswith(APPROVAL_INTERRUPT_PREFIX):
             call_id = interrupt_id.removeprefix(APPROVAL_INTERRUPT_PREFIX)
-            approvals[call_id] = _as_approval(interrupt_id, status, payload)
+            approval = _as_approval(interrupt_id, status, payload)
+            if approval.arguments is not None and not allow_argument_edits:
+                raise ValueError(
+                    f"The payload for {interrupt_id!r} changes the call's arguments. That "
+                    "lets the client choose what runs, so it is refused unless "
+                    "agui_resume(..., allow_argument_edits=True)."
+                )
+            approvals[call_id] = approval
         elif interrupt_id.startswith(INPUT_INTERRUPT_PREFIX):
             call_id = interrupt_id.removeprefix(INPUT_INTERRUPT_PREFIX)
-            results[call_id] = (
-                ToolError(prompts.INPUT_CANCELLED) if status == "cancelled" else payload
-            )
+            if status == "resolved":
+                results[call_id] = payload
+            else:
+                cancelled = ToolError(prompts.INPUT_CANCELLED)
+                token = _token_of(payload)
+                results[call_id] = (
+                    cancelled if token is None else InputResult(value=cancelled, token=token)
+                )
         else:
             raise ValueError(
                 f"Interrupt id {interrupt_id!r} was not issued by qagents: expected "
@@ -898,7 +1171,7 @@ def _interrupts(result: Any) -> list[dict[str, Any]]:
 
 def _as_approval(interrupt_id: str, status: str, payload: Any) -> Approval:
     if status == "cancelled":
-        return Approval(approved=False)
+        return Approval(approved=False, token=_token_of(payload))
     if isinstance(payload, bool):
         return Approval(approved=payload)
     if isinstance(payload, Mapping):
@@ -912,6 +1185,85 @@ def _as_approval(interrupt_id: str, status: str, payload: Any) -> Approval:
         f"The payload for {interrupt_id!r} must be true, false or an object like "
         '{"approved": true}; got ' + repr(payload) + "."
     )
+
+
+def _token_of(payload: Any) -> str | None:
+    """The ``token`` of a resume payload, if it carries one."""
+    token = payload.get("token") if isinstance(payload, Mapping) else None
+    return token if isinstance(token, str) else None
+
+
+def _is_json(text: str) -> bool:
+    try:
+        json.loads(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _blocks_the_answer(kind: str | None, event: Any) -> bool:
+    """Whether ``event`` says an output guardrail blocked the final answer."""
+    if kind == "guardrail_tripped":
+        return _field(event, "stage") == "output"
+    if kind == "run_finished":
+        result = _field(event, "result")
+        return (
+            _field(result, "status") == "blocked"
+            and _field(_field(result, "guardrail"), "stage") == "output"
+        )
+    return False
+
+
+def _raised(result: Any) -> bool:
+    """Whether ``result`` is a tool result that records an exception the tool raised."""
+    metadata = _field(result, "metadata")
+    return (
+        _field(result, "tool_call_id") is not None
+        and bool(_field(result, "is_error"))
+        and isinstance(metadata, Mapping)
+        and bool(metadata.get("exception"))
+    )
+
+
+def _without_exception_text(value: Any) -> Any:
+    """``value`` (JSON data) with the content of every tool result that records an
+    exception replaced by `TOOL_ERROR_MESSAGE`."""
+    if isinstance(value, list):
+        return [_without_exception_text(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    cleaned = {key: _without_exception_text(item) for key, item in value.items()}
+    if _raised(cleaned):
+        cleaned["content"] = TOOL_ERROR_MESSAGE.format(name=cleaned.get("name") or "tool")
+    return cleaned
+
+
+def _before_last_answer(messages: list[Any]) -> list[Any]:
+    """``messages`` up to, not including, the last assistant message."""
+    for index in range(len(messages) - 1, -1, -1):
+        if _field(messages[index], "role") == "assistant":
+            return messages[:index]
+    return messages
+
+
+def _without_reasoning(value: Any, *, keep_text: bool) -> Any:
+    """``value`` with the reasoning parts of its messages left out, or with only
+    their provider replay data (``opaque``) left out when ``keep_text``."""
+    if isinstance(value, list):
+        return [_without_reasoning(item, keep_text=keep_text) for item in value]
+    if not isinstance(value, dict):
+        return value
+    cleaned = {key: _without_reasoning(item, keep_text=keep_text) for key, item in value.items()}
+    if isinstance(cleaned.get("parts"), list):
+        parts = []
+        for part in cleaned["parts"]:
+            if isinstance(part, dict) and part.get("type") == "reasoning":
+                if not keep_text:
+                    continue
+                part = {key: item for key, item in part.items() if key != "opaque"}
+            parts.append(part)
+        cleaned["parts"] = parts
+    return cleaned
 
 
 def _input_content(part: Any) -> dict[str, Any] | None:
@@ -939,8 +1291,10 @@ __all__ = [
     "CUSTOM_EVENTS",
     "INPUT_INTERRUPT_PREFIX",
     "RUN_ERROR_MESSAGE",
+    "RUN_ERROR_MESSAGES",
     "STEP_NAME",
     "STREAM_ENDED_MESSAGE",
+    "TOOL_ERROR_MESSAGE",
     "agui_resume",
     "agui_sse",
     "encode_sse",

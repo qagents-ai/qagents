@@ -21,19 +21,23 @@ shares the parent's remaining budget.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import copy as copying
+import dataclasses
 import inspect
 import json
 import logging
 import re
+import sys
+import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, create_model
-from pydantic_core import PydanticSerializationError
+from pydantic_core import PydanticSerializationError, to_jsonable_python
 
 from . import prompts
 from .context import Compactor
@@ -42,6 +46,7 @@ from .errors import (
     ConfigurationError,
     DeferToolCall,
     GuardrailTripped,
+    MaxDepthExceeded,
     ModelError,
     ModelResponseError,
     ModelRetry,
@@ -57,6 +62,7 @@ from .events import (
     GuardrailTriggered,
     InputRequired,
     ModelResponded,
+    OutputRejected,
     RunFinished,
     RunStarted,
     StateUpdated,
@@ -80,11 +86,12 @@ from .models.base import (
 )
 from .permissions import Approval, InputResult, Permissions
 from .results import GuardrailStage, RunResult, RunStatus, TrippedGuardrail
-from .session import PendingApproval, PendingInput, Session, SessionState
+from .session import Entry, PendingApproval, PendingInput, Session, SessionState
 from .tools import (
     RunContext,
     Tool,
     Toolkit,
+    ToolTimeout,
     _clean_schema,
     _describe_validation_error,
     render_tool_output,
@@ -107,42 +114,81 @@ Guardrail = Callable[[RunContext[Any], Any], Any]
 
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+RUN_LEASE_TTL_S = 30.0
+"""Seconds a run's lease on its session lasts without renewal (it is renewed
+every third of that while the run is live). On a store with leases, a run
+whose process died keeps its session for at most this long."""
+
+_LIVE_RUNS: dict[tuple[int, str], tuple[Any, _Run]] = {}
+"""Runs executing in this process, by (store, session id): one run per session at a time."""
+
+_USAGE_KINDS = frozenset({"message", "tool_result", "run_paused", "run_failed", "run_finished"})
+"""Entry kinds that carry ``added_usage``: usage from ``ctx.add_usage`` since the last one."""
+
 
 class Limits(BaseModel):
     """Hard stops for a run. ``None`` switches a limit off.
 
-    A child run (``parent=ctx``, as an agent used as a tool starts) also stops
-    at what remains of its parent's ``max_total_tokens``, ``max_cost_usd`` and
-    ``timeout_s`` when it starts, whichever is lower.
+    A child run (``parent=ctx``, as an agent used as a tool starts) shares its
+    parents' budgets: it stops at what remains of their ``max_total_tokens``
+    and ``max_cost_usd``, counted live, so child runs working in parallel
+    cannot together spend more than their parent has left. Its ``timeout_s``
+    is capped by what remains of its parent's when it starts, and its
+    ``max_depth`` is the lowest along the chain of parent runs.
+
+    ``max_turns``, ``max_total_tokens``, ``max_cost_usd`` and
+    ``max_tool_calls`` count the whole run: a resume (after a pause, a crash
+    or an error, by you or by `AgentRuntime.recover`) continues from what the
+    journal says the run has already used. ``RunContext.limits`` and
+    ``RunContext.remaining_budget()`` tell tools and hooks what applies.
     """
 
     max_turns: int | None = 30
-    """Model requests per run."""
+    """Model requests per run, across resumes."""
     max_total_tokens: int | None = None
-    """Input plus output tokens over the whole run."""
+    """Input plus output tokens over the whole run, across resumes."""
     max_cost_usd: float | None = None
     """Needs a model that reports cost (QCloud does, from its catalog prices).
-    A budget of zero or less stops the run before its first request."""
+    A budget of zero or less stops the run before its first request. It fails
+    closed: once a response arrives without a cost (a model without prices, an
+    unreachable catalog), the run stops as if the budget were spent, because
+    the spend can no longer be known (``usage.unpriced_requests`` counts them).
+    A response that reports neither tokens nor a cost (what test models such as
+    ``ScriptedModel`` report) counts as free, unless its model marks it unpriced:
+    a model whose server sent no usage at all sets ``unpriced_requests=1``."""
     timeout_s: float | None = None
-    """Wall-clock seconds for the whole run."""
+    """Wall-clock seconds for each ``run`` or ``resume`` call, counted from the
+    run's start (after input guardrails and toolkit loading): the time a run
+    spends paused does not count. When it expires, the request, compaction or
+    tools in progress are cancelled, and no new ones start."""
     max_tool_calls: int | None = None
-    """Tool calls per run. A call beyond it is not started: it gets an
+    """Tool calls per run that were allowed to run (executed or deferred);
+    refused calls do not count. A call beyond it is not started: it gets an
     explanatory result, and the run ends with ``stop_reason="max_tool_calls"``."""
     max_depth: int | None = 5
-    """How deeply runs may nest: a child run at a greater depth refuses to start.
-    The lower of the child's and the parent's value applies."""
+    """How deeply runs may nest: a child run at a greater depth refuses to start
+    (`MaxDepthExceeded`; an agent used as a tool reports it to the calling model
+    as an error result). The lowest value along the chain of parent runs applies."""
     tool_timeout_s: float | None = 120.0
-    """Seconds per tool call, unless the tool sets its own ``timeout``."""
+    """Seconds per tool call, unless the tool sets its own ``timeout``. An async
+    tool is cancelled; a sync tool cannot be stopped, so its thread is abandoned
+    and may still complete its work (and the interpreter waits for it at exit,
+    see `qagents.tools.TOOL_THREADS`). Either way the model is told the outcome
+    is unknown. Agents used as tools often need more: ``as_tool(timeout=...)``."""
     parallel_tools: Literal["read_only", "all", "none"] = "read_only"
     """Which tool calls of one turn run concurrently: only tools declared
-    ``read_only`` (the rest run one at a time, in order), all, or none."""
+    ``read_only`` (the rest run one at a time, in order), all, or none. A call
+    that runs one at a time also waits, within its own timeout, for an earlier
+    sync call of the run that timed out and still runs in its thread; if that
+    thread is still busy then, the call is not run and the model is told so."""
     max_parallel_tools: int = 8
     max_tool_result_chars: int | None = 60_000
     """Longer tool results are shortened in the middle before the model sees them."""
     output_retries: int = 2
     """Extra attempts for a final answer that does not match ``output_type``, that
     an output validator rejects, or (``output_mode="tool"``) that is written as
-    plain text instead of a call of the final-answer tool."""
+    plain text instead of a call of the final-answer tool. When they are used
+    up, the run raises `OutputValidationError` (it returns no result)."""
     model_retries: int = 2
     """Extra attempts for model errors that are safe to repeat."""
     retry_ambiguous: bool = False
@@ -195,10 +241,15 @@ class Agent:
             tools: Functions, `Tool` and `Toolkit` objects, agents, or lists of them.
             output_type: The type of the final answer; ``None`` or ``str`` for text.
             output_mode: How the model is asked for ``output_type``: ``"native"``
-                sends the schema as ``response_format``; ``"prompted"`` writes it
-                into the instructions; ``"tool"`` gives the model a final-answer
-                tool whose arguments are the answer, for models that call tools
-                more reliably than they follow a response format.
+                sends the schema as ``response_format`` (a schema whose root is
+                not an object, such as a ``Literal`` or a list, is sent wrapped
+                as ``{"value": ...}``, as strict providers require; a bare
+                value is accepted too); ``"prompted"`` writes it into the
+                instructions; ``"tool"`` gives the model a final-answer tool
+                whose arguments are the answer, for models that call tools
+                more reliably than they follow a response format. Without an
+                ``output_type`` the answer is text, and in ``"tool"`` mode a
+                plain-text reply is accepted as well as a final-answer call.
             output_tool_name: Name of the final-answer tool (``output_mode="tool"``).
             output_strict: Ask the provider to enforce the schema exactly, where supported.
             output_validators: Functions ``(ctx, output)`` run in order on the
@@ -207,14 +258,26 @@ class Agent:
                 the model for a corrected one. Sync or async.
             input_guardrails: Functions ``(ctx, message)`` run on the new prompt
                 (a `Message`) before it joins the conversation. Raise
-                `GuardrailTripped` to block the run.
+                `GuardrailTripped` to block the run. Only the ``prompt``
+                argument is checked: messages passed in ``history=`` and
+                messages already in the session are not, so pass the new
+                user message as ``prompt``.
             output_guardrails: Functions ``(ctx, output)`` run on the accepted
-                final answer. Raise `GuardrailTripped` to block it.
+                final answer. Raise `GuardrailTripped` to block it. They check
+                the completed answer: its text was already streamed as
+                ``text_delta`` events, which a block cannot recall, so a front
+                end that must never show a blocked answer holds the text back
+                until ``run_finished``.
             settings: Model settings for every request.
             limits: Hard stops; see `Limits`.
             permissions: Who decides whether a tool call runs; see `Permissions`.
             hooks: Your code at fixed points of the loop; see `Hooks`.
-            handoffs: Agents this one may hand the conversation to.
+            handoffs: Agents this one may hand the conversation to. They are
+                kept in the list ``agent.handoffs``, which you may change
+                after building; agents that hand off to each other (a mesh)
+                are connected that way:
+                ``triage.handoffs.append(billing); billing.handoffs.append(triage)``.
+                The list is read when a run starts and after each handoff.
             compactor: Shortens long conversations before a request.
 
         Raises:
@@ -253,12 +316,25 @@ class Agent:
         self.permissions = permissions or Permissions()
         self.hooks = list(hooks)
         self.handoffs = list(handoffs)
+        """Agents this one may hand the conversation to; change it to connect agents
+        both ways. Names must stay unique among the agents reachable through handoffs."""
         self.compactor = compactor
         self._output_adapter: TypeAdapter[Any] | None = None
         self._output_schema: dict[str, Any] | None = None
+        self._native_schema: dict[str, Any] | None = None
+        """The schema sent as ``response_format`` (``output_mode="native"``)."""
+        self._native_wrapped = False
+        """The native schema wraps a non-object answer as ``{"value": ...}``."""
         if self.output_type is not None:
             self._output_adapter = TypeAdapter(self.output_type)
             self._output_schema = self._output_adapter.json_schema()
+            self._native_schema = self._output_schema
+            if not _is_object_schema(self._output_schema):
+                wrapper = create_model(
+                    "output", __config__=ConfigDict(extra="forbid"), value=(self.output_type, ...)
+                )
+                self._native_schema = wrapper.model_json_schema()
+                self._native_wrapped = True
         self._answer_adapter: TypeAdapter[Any] | None = None
         """Validates the arguments of a final-answer call (``output_mode="tool"``)."""
         self._answer_wrapped = False
@@ -285,26 +361,42 @@ class Agent:
 
         Args:
             prompt: The new user message. May be left out when ``session`` or
-                ``history`` already ends with one.
+                ``history`` already ends with one; input guardrails then do
+                not run, because they check only this argument.
             deps: Your dependencies, passed to tools and hooks as ``ctx.deps``.
             session: Continues an existing conversation. A new in-memory
-                session is created when it is left out.
+                session is created when it is left out. One run at a time per
+                session: a run started while another run of the session is
+                executing raises `SessionError` (on a store with leases, also
+                when that run executes in another process).
             history: Seeds a new conversation with messages you kept yourself.
             limits: Replaces the agent's limits for this run.
-            settings: Merged over the agent's model settings for this run.
+            settings: Merged over the agent's model settings for this run,
+                and checked here against the model of every agent reachable
+                through handoffs, so a setting a handoff target's provider
+                would reject fails before anything runs (with that model's error).
             state: Values merged into the session state (``ctx.state``) when
                 the run starts, key by key. The merge is journaled.
             parent: The context of the run (usually a tool call) that starts
                 this one. The new run is its child: ``ctx.parent_run_id``,
                 ``ctx.parent_tool_call_id`` and ``ctx.depth`` link the two, the
-                parent's remaining token, cost and time budget caps this run,
-                the parent's hooks with ``propagate=True`` apply here too, and
-                the parent's ``on_ask`` answers approvals when this agent's
-                permissions have none. Usage is not added to the parent for
-                you; call ``parent.add_usage(result.usage)`` (``as_tool`` does).
+                parent's remaining token, cost and time budget caps this run
+                (tokens and cost live, shared with the parent's other child
+                runs), the parent's hooks with ``propagate=True`` apply here
+                too, and the parent's ``on_ask`` answers approvals when this
+                agent's permissions have none. This run's usage is added to
+                the parent run when it ends, however it ends (completed,
+                failed, cancelled); ``parent.add_usage(result.usage)``, which
+                code written for 0.2 calls, is recognised and not counted twice.
 
         Raises:
-            ConfigurationError: The child run would nest deeper than ``Limits.max_depth``.
+            MaxDepthExceeded: The child run would nest deeper than
+                ``Limits.max_depth`` (a `ConfigurationError`).
+            ConfigurationError: Two different agents reachable through
+                handoffs share a name.
+            SessionError: ``state`` holds a value the journal cannot store
+                (raised here, before anything is journaled), or the session
+                already has a run in progress (raised by the stream).
         """
         return RunStream(
             _Run(
@@ -391,10 +483,31 @@ class Agent:
         approval, ``InputResult.for_call(pending, value)`` or
         ``{"token": pending.token, "value": value}`` for a result.
 
+        Call ``resume`` on the agent you called ``run`` on (the one that owns
+        the run's limits, permissions and hooks), or on any agent from which
+        the agent active in the run can be reached through handoffs: the
+        journal records agents by ``name``, so names must be unique among the
+        agents reachable through handoffs. The run continues with the agent
+        that was active when it stopped. A new ``agent.run`` on the session
+        always starts with the agent you call.
+
+        The run keeps counting from what it used before it stopped: turns,
+        tokens, cost and tool calls (see `Limits`), and ``RunResult.usage``
+        and ``turns`` cover the whole run.
+
         Args:
             session: The session whose run is unfinished.
             approvals: Maps tool call ids from ``result.pending_approvals`` to
-                ``True``/``False`` or an `Approval`.
+                ``True``/``False`` or an `Approval`; any other value raises
+                `ConfigurationError`. An approval answers only an open call
+                of the paused turn (others are ignored), and the permission
+                rules are checked again first: a deny rule refuses the call
+                whatever the approval says. Applied approvals are journaled
+                (``approval_decided``) before the call runs, for the record:
+                a journaled approval is never taken as permission later, so
+                when a run stops while an approved call runs, the next resume
+                asks again for an idempotent or read-only call and reports
+                any other call's outcome as unknown.
             results: Maps tool call ids from ``result.pending_inputs`` to their
                 results. A value is rendered like a tool's return value; an
                 exception instance becomes an error result with its message;
@@ -407,10 +520,15 @@ class Agent:
             state: Values merged into the session state when the run resumes.
 
         Raises:
-            SessionError: The session has no unfinished run, or ``results``
-                names a call that waits for no result.
+            SessionError: The session has no unfinished run, ``results``
+                names a call that waits for no result, the run is already
+                executing (another resume, or a run in another process that
+                holds the session's lease), or the agent active in the run
+                is not reachable from this one.
             ApprovalTokenError: Pauses are signed and an answer has no token or
                 the wrong one, or the paused call in the journal was changed.
+            ConfigurationError: An ``approvals`` value is not ``True``,
+                ``False`` or an `Approval`.
         """
         stream = self.resume_stream(
             session, approvals=approvals, results=results, deps=deps, limits=limits,
@@ -421,19 +539,28 @@ class Agent:
     # -- composition -------------------------------------------------------------
 
     def as_tool(
-        self, *, name: str | None = None, description: str | None = None, read_only: bool = False
+        self,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        read_only: bool = False,
+        timeout: float | None = None,
     ) -> Tool:
         """Expose this agent as a tool another agent can call.
 
         The sub-agent works in its own fresh conversation: it sees only the
-        task text, and the caller sees only its final answer. Each call is a
-        child run of the caller's (``parent=ctx``): it is linked to the calling
-        tool call, stops at the caller's remaining budget, inherits the
-        caller's propagating hooks and ``on_ask``, and refuses to start beyond
-        ``Limits.max_depth``. Its usage is added to the caller's run and its
-        events are forwarded as `SubagentEvent`. A sub-agent run that pauses,
-        is blocked or stops at a limit is reported to the caller as an error
-        result.
+        task text, and the caller sees only its accepted final answer
+        (``result.output``: after output validators, and the final-answer
+        call's value in ``output_mode="tool"``). Each call is a child run of
+        the caller's (``parent=ctx``): it is linked to the calling tool call,
+        shares the caller's remaining budget, inherits the caller's
+        propagating hooks and ``on_ask``, and refuses to start beyond
+        ``Limits.max_depth``. Its usage is added to the caller's run (also
+        when it fails or is cancelled) and its events are forwarded as
+        `SubagentEvent`, ``run_started`` included (``run_finished`` is not:
+        its result is the tool result). A sub-agent run that pauses, is
+        blocked, stops at a limit, is refused by the provider or would nest
+        too deep is reported to the caller as an error result.
 
         Args:
             name: Tool name; defaults to the agent's name.
@@ -441,31 +568,40 @@ class Agent:
                 or ``prompts.SUBAGENT_DESCRIPTION``.
             read_only: Declare the sub-agent free of side effects, so calls may
                 run in parallel.
+            timeout: Seconds for one call of the sub-agent; ``None`` uses the
+                caller's ``Limits.tool_timeout_s`` (120 s by default), which
+                is often too short for an agent.
         """
         agent = self
 
         async def delegate(ctx: RunContext[Any], task: str) -> str:
-            stream = agent.stream(task, deps=ctx.deps, parent=ctx)
+            try:
+                stream = agent.stream(task, deps=ctx.deps, parent=ctx)
+            except MaxDepthExceeded as error:
+                raise ToolError(
+                    prompts.SUBAGENT_TOO_DEEP.format(
+                        name=agent.name, depth=error.depth, limit=error.limit
+                    )
+                ) from error
             async with stream:
                 async for event in stream:
-                    if not isinstance(event, RunStarted | RunFinished):
+                    if not isinstance(event, RunFinished):
                         ctx.emit(
                             SubagentEvent(
                                 agent=agent.name, tool_call_id=ctx.tool_call_id, event=event
                             )
                         )
             result = stream.result
-            assert result is not None
-            ctx.add_usage(result.usage)
-            if result.status != "completed":
+            assert result is not None  # its usage reached the caller's run as it ended
+            if result.status != "completed" or result.stop_reason == "content_filter":
                 raise ToolError(
                     prompts.SUBAGENT_STOPPED.format(
                         name=agent.name, reason=result.stop_reason or result.status
                     )
                 )
-            return (
-                result.text if isinstance(result.output, str) else render_tool_output(result.output)
-            )
+            if result.output is None and agent.output_type is not None:
+                return "null"  # an answer of None, never the "OK" of a tool that returns nothing
+            return render_tool_output(result.output)
 
         built = make_tool(
             delegate,
@@ -474,6 +610,7 @@ class Agent:
             or self.description
             or prompts.SUBAGENT_DESCRIPTION.format(name=self.name),
             read_only=read_only,
+            timeout=timeout,
         )
         built.parameters["properties"]["task"]["description"] = prompts.SUBAGENT_TASK_DESCRIPTION
         return built
@@ -523,7 +660,7 @@ class Agent:
         answer_type = self.output_type if self.output_type is not None else str
         adapter: TypeAdapter[Any] = self._output_adapter or TypeAdapter(answer_type)
         schema = adapter.json_schema()
-        if schema.get("type") == "object" and "$ref" not in schema:
+        if _is_object_schema(schema):
             self._answer_adapter = adapter
         else:  # tools take an object, so the answer becomes its one argument
             wrapper = create_model(
@@ -606,6 +743,9 @@ class RunStream:
 
     Iterate it once. ``cancel()`` stops the run at the next opportunity; the
     text produced so far is kept in the history and marked as interrupted.
+    Close a stream you stop reading early (``async with stream:`` or
+    ``await stream.aclose()``): until then its run counts as in progress, and
+    the session refuses another run.
     """
 
     def __init__(self, run: _Run) -> None:
@@ -644,7 +784,13 @@ class RunStream:
         return self.result
 
     async def text(self) -> AsyncIterator[str]:
-        """Only the text of the answer, as it is written."""
+        """Only the text of the answer, as it is written.
+
+        The text is streamed before the answer is checked: when an output
+        guardrail blocks it, the text has already been yielded. Check
+        ``stream.result.status`` afterwards, or use ``agent.run`` when a
+        blocked answer must never be shown.
+        """
         async with self:
             async for event in self:
                 if isinstance(event, TextDelta):
@@ -667,8 +813,8 @@ class _Failure:
         self.error = error
 
 
-class _Deferred:
-    """Tells the loop that a tool task ended by deferring its call."""
+_DONE = object()
+"""The last item every tool task puts on its group's queue."""
 
 
 class _Rejected(Exception):
@@ -679,10 +825,12 @@ class _Rejected(Exception):
         problem: How the answer failed, for `OutputValidationError`.
     """
 
-    def __init__(self, message: str, problem: str) -> None:
+    def __init__(self, message: str, problem: str, *, by_validator: bool = False) -> None:
         super().__init__(message)
         self.message = message
         self.problem = problem
+        self.by_validator = by_validator
+        """An output validator raised `ModelRetry` (the answer itself was valid)."""
 
 
 class _Run:
@@ -712,8 +860,12 @@ class _Run:
         self.prompt = prompt
         self.seed = list(history) if history is not None else []
         self.limits = limits or agent.limits
+        self._limits_given = limits is not None
         if settings is not None:
-            agent.model.validate_settings(agent.settings.merged(settings))
+            # Every agent the run may hand off to gets these settings: check them all now,
+            # before anything runs, not in the middle of the run after a handoff.
+            for target in _reachable_agents(agent):
+                target.model.validate_settings(target.settings.merged(settings))
         self.settings = settings
         self.parent = parent
         """The context of the tool call that started this run, for a child run."""
@@ -721,6 +873,10 @@ class _Run:
             parent._run if parent is not None and isinstance(parent._run, _Run) else None
         )
         self.depth = parent.depth + 1 if parent is not None else 0
+        if self.parent_run is not None:  # the lowest bound along the chain of parent runs
+            inherited, own = self.parent_run.limits.max_depth, self.limits.max_depth
+            if inherited is not None and (own is None or inherited < own):
+                self.limits = self.limits.model_copy(update={"max_depth": inherited})
         self._check_depth()
         self.permissions = agent.permissions
         hooks: list[Hooks] = list(agent.hooks)
@@ -734,10 +890,18 @@ class _Run:
         """This run's hooks: the agent's, then the parent run's propagating ones."""
         self.hooks = HookChain(self.hook_list)
         self.resume = resume
-        self.approvals: dict[str, Approval] = {
-            call_id: answer if isinstance(answer, Approval) else Approval(approved=bool(answer))
-            for call_id, answer in (approvals or {}).items()
-        }
+        self.approvals: dict[str, Approval] = {}
+        """Answers given to ``resume``; only those for open calls of the paused turn are kept."""
+        for call_id, answer in (approvals or {}).items():
+            if isinstance(answer, Approval):
+                self.approvals[call_id] = answer
+            elif answer is True or answer is False:  # never bool(): "false" must not approve
+                self.approvals[call_id] = Approval(approved=answer)
+            else:
+                raise ConfigurationError(
+                    f"approvals[{call_id!r}] is a {type(answer).__name__}. Give True, False or "
+                    "an Approval; nothing was run."
+                )
 
         self.history: list[Message] = []
         self.new_messages: list[Message] = []
@@ -761,6 +925,7 @@ class _Run:
         self.state: dict[str, Any] = {}
         """``ctx.state``: one dict for the whole run, restored from the journal."""
         self._state_seed = dict(state or {})
+        _state_json(self._state_seed)  # a value the journal cannot store fails before anything runs
         self._saved_state = "{}"
         """JSON of the state as last journaled; a different snapshot means it changed."""
         self._state_lock = asyncio.Lock()
@@ -772,8 +937,14 @@ class _Run:
         self._ordinal = 0
         """Messages this run has journaled; names tool calls in operation ids."""
         self._output_attempts = 0
-        self._tool_calls = 0
-        """Tool calls this run has authorised or started, for ``Limits.max_tool_calls``."""
+        self._counted: dict[str, None] = {}
+        """Tool calls this run allowed to run (executed or deferred), for
+        ``Limits.max_tool_calls``; restored from the journal on resume, so a call is
+        counted once."""
+        self._usage_to_journal = Usage()
+        """Usage added through ``ctx.add_usage`` that no journal entry carries yet."""
+        self._edited: set[str] = set()
+        """Calls that run with arguments an approver changed."""
         self._tool_limit_hit = False
         self._deadline: float | None = None
         """``time.monotonic()`` at which ``timeout_s`` stops the run."""
@@ -781,26 +952,74 @@ class _Run:
         self.stop_reason: str | None = None
         self.guardrail: TrippedGuardrail | None = None
         self._journal_open = False
+        self._closed = False
+        """``run_finished`` or ``run_paused`` is journaled, so an error writes no ``run_failed``."""
+        self._hooks_started = False
+        """``on_run_start`` was called, so ``on_run_end`` is owed exactly once."""
+        self._ended = False
+        """``on_run_end`` was called with the result."""
+        self._hook_error: Exception | None = None
+        """What an ``on_event`` hook raised: the run failed with it."""
+        self._batch: list[Entry] | None = None
+        """Entries collected by `_batched`, written in one store call."""
+        self._start_events: list[Event] = []
+        """Events of journal entries written while the run was prepared."""
+        self._claimed: tuple[int, str] | None = None
+        self._lease_owner: str | None = None
+        self._lease_task: asyncio.Task[None] | None = None
         self._cancel = asyncio.Event()
         self._cancel_reason: str | None = None
+        self._interruptible: asyncio.Task[Any] | None = None
+        """The task awaiting a step that a cancel interrupts (see `_unless_cancelled`)."""
+        self._interrupting = False
+        """``cancel()`` cancelled ``_interruptible``; the CancelledError it gets is ours."""
+        self._running: set[str] = set()
+        """Calls whose ``tool_started`` this run journaled and that have no result yet."""
+        self._children: list[_Run] = []
+        """Child runs that are working: their usage counts against this run's budget."""
+        self._absorbed: list[Usage] = []
+        """``RunResult.usage`` of child runs already added, so adding it again is a no-op."""
+        self._result_usage: Usage | None = None
+        self._usage_lock = threading.Lock()
+        """``ctx.add_usage`` may be called from a sync tool's worker thread."""
+        self._stuck_threads: list[concurrent.futures.Future[Any]] = []
+        """Threads of sync calls that run one at a time, timed out and still run:
+        the next such call waits for them (`_invoke`)."""
 
     def cancel(self, reason: str = "cancelled") -> None:
         if not self._cancel.is_set():
             self._cancel_reason = reason
             self._cancel.set()
+            task = self._interruptible
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:  # no running loop here
+                current = None
+            if task is not None and task is not current and not task.done():
+                self._interrupting = True
+                task.cancel()  # interrupt the model request or compaction in progress
 
     # -- the loop -----------------------------------------------------------------
 
     async def execute(self) -> AsyncIterator[Event]:
         async with contextlib.aclosing(self._execute()) as events:
             async for event in events:
-                await self.hooks.on_event(self._ctx(), event)
+                try:
+                    await self.hooks.on_event(self._ctx(), event)
+                except Exception as error:
+                    # Closing _execute below reports this error as the run's failure.
+                    self._hook_error = error
+                    raise
                 yield event
 
     async def _execute(self) -> AsyncIterator[Event]:
         timer: asyncio.TimerHandle | None = None
+        result: RunResult | None = None
         try:
             self._inherit_limits()
+            if self.parent_run is not None:  # its spend counts against the parent's budget, live
+                self.parent_run._children.append(self)
+            await self._claim()
             await self._prepare()
             yield RunStarted(
                 run_id=self.run_id,
@@ -810,8 +1029,11 @@ class _Run:
                 parent_run_id=self.parent.run_id if self.parent is not None else None,
                 depth=self.depth,
             )
+            for event in self._start_events:  # journaled with the start of the run
+                yield event
             if (updated := await self._save_state()) is not None:
-                yield updated  # the values passed as state=
+                yield updated  # the values passed as state= to a resume
+            self._hooks_started = True
             await self.hooks.on_run_start(self._ctx())
             timer = self._start_timer()
 
@@ -829,8 +1051,11 @@ class _Run:
                         self.status, self.stop_reason = "blocked", tripped.name
                         yield self._guardrail_event(tripped)
 
-            if (updated := await self._save_state()) is not None:
+            for _ in range(2):  # the second pass saves what on_event did with the first
+                if (updated := await self._save_state()) is None:
+                    break
                 yield updated  # changed by on_event, on_run_start or a guardrail
+            result = self._result()
             if self.status == "paused":
                 await self._journal(
                     "run_paused",
@@ -840,33 +1065,130 @@ class _Run:
                     },
                 )
             else:
-                await self._journal(
-                    "run_finished", {"status": self.status, "stop_reason": self.stop_reason}
-                )
-            result = self._result()
+                await self._journal("run_finished", _finished_data(result))
+            self._closed = True
+            self._ended = True  # set first: an on_run_end that raises is not reported twice
             await self.hooks.on_run_end(self._ctx(), result, None)
-            yield RunFinished(result=result)
         except Exception as error:
+            if self._ended:
+                raise
             # The run stays open in the journal, so agent.resume() can pick it up.
-            if self._journal_open:
-                with contextlib.suppress(Exception):
-                    await self._journal("run_failed", {"error": f"{type(error).__name__}: {error}"})
-            try:
-                await self.hooks.on_run_end(self._ctx(), None, error)
-            except Exception:
-                logger.exception("on_run_end raised while reporting a failed run")
+            await self._fail(error)
             raise
         except BaseException as error:
-            # Cancelled, or the stream was closed early: the run stays open in the journal
-            # (nothing is written, as before). on_run_end still runs, so tracers close spans.
-            try:
-                await self.hooks.on_run_end(self._ctx(), None, error)
-            except Exception:
-                logger.exception("on_run_end raised while reporting a stopped run")
+            if self._ended:
+                raise
+            if isinstance(error, GeneratorExit) and self._hook_error is not None:
+                await self._fail(self._hook_error)  # an on_event hook raised: the run failed
+            else:
+                # Cancelled, or the stream was closed early: the run stays open in the journal
+                # (nothing is written). on_run_end still runs, so tracers close spans.
+                await self._report_end(error)
             raise
         finally:
             if timer is not None:
                 timer.cancel()
+            self._hand_usage_to_parent()
+            await self._unclaim()
+        # Outside the try: a consumer that stops at this event does not stop a finished run.
+        yield RunFinished(result=result)
+
+    def _hand_usage_to_parent(self) -> None:
+        """Add this child run's usage to its parent run, once, however the run ended."""
+        parent = self.parent_run
+        if parent is None or self not in parent._children:
+            return
+        parent._children.remove(self)  # in the same step as the add: never counted twice or 0
+        if self.usage != Usage():
+            parent._add_usage(self.usage)
+        if self._result_usage is not None:
+            parent._absorbed.append(self._result_usage)  # parent.add_usage(result.usage): no-op
+
+    async def _fail(self, error: BaseException) -> None:
+        """Journal ``run_failed`` for an open run that raised, then report it to the hooks."""
+        if self._journal_open and not self._closed:
+            with contextlib.suppress(Exception):
+                await self._journal("run_failed", _failure_data(error))
+        await self._report_end(error)
+
+    async def _report_end(self, error: BaseException) -> None:
+        if not self._hooks_started:  # on_run_end pairs with on_run_start
+            return
+        try:
+            await self.hooks.on_run_end(self._ctx(), None, error)
+        except Exception:
+            logger.exception("on_run_end raised while reporting a run that did not finish")
+
+    # -- one run per session ---------------------------------------------------------
+
+    async def _claim(self) -> None:
+        """Make this the session's only executing run, before the journal is read.
+
+        In this process a registry refuses a second run of the session. On a
+        store with leases the run also holds the session's lease while it
+        executes, and every entry is written only while it holds it, so a run
+        in another process is refused too, and a run that lost its lease
+        cannot write. Under `AgentRuntime` the runtime's lease does both. A
+        store subclass that overrides ``append`` but not ``append_leased`` is
+        written through its ``append`` without a lease.
+        """
+        store, session_id = self.session.store, self.session.id
+        key = (id(store), session_id)
+        live = _LIVE_RUNS.get(key)
+        if live is not None:
+            raise SessionError(
+                f"Session {session_id!r} already has a run in progress in this process (run "
+                f"{live[1].run_id}). A session runs one run at a time: wait for it to finish or "
+                "cancel it. A stream you stopped reading early must be closed first "
+                "(`async with stream:` or `await stream.aclose()`)."
+            )
+        _LIVE_RUNS[key] = (store, self)
+        self._claimed = key
+        if _fenced_by_runtime(store) or _append_overridden_alone(store):
+            return
+        owner = f"qagents-run:{uuid.uuid4().hex}"
+        try:
+            held = await store.acquire_lease(session_id, owner, RUN_LEASE_TTL_S)
+        except NotImplementedError:
+            return  # a store without leases: only this process is guarded
+        if not held:
+            raise SessionError(
+                f"Session {session_id!r} has a run in progress elsewhere: another process or "
+                "worker holds its lease. Wait for that run to stop. If its process died, the "
+                f"lease expires within {RUN_LEASE_TTL_S:g} seconds (AgentRuntime.recover then "
+                "takes the run over)."
+            )
+        self._lease_owner = owner
+        self._lease_task = asyncio.create_task(self._keep_lease())
+
+    async def _keep_lease(self) -> None:
+        assert self._lease_owner is not None
+        while True:
+            await asyncio.sleep(RUN_LEASE_TTL_S / 3)
+            try:
+                held = await self.session.store.renew_lease(
+                    self.session.id, self._lease_owner, RUN_LEASE_TTL_S
+                )
+            except Exception:
+                logger.warning("Could not renew the lease of run %s; retrying", self.run_id)
+                continue
+            if not held:  # the next write fails with LeaseError, which stops the run
+                logger.error("Run %s lost the lease on session %r", self.run_id, self.session.id)
+                return
+
+    async def _unclaim(self) -> None:
+        if self._lease_task is not None:
+            self._lease_task.cancel()
+            self._lease_task = None
+        if self._lease_owner is not None:
+            owner, self._lease_owner = self._lease_owner, None
+            try:
+                await self.session.store.release_lease(self.session.id, owner)
+            except Exception:
+                logger.warning("Could not release the lease of run %s; it expires", self.run_id)
+        if self._claimed is not None and _LIVE_RUNS.get(self._claimed, (None, None))[1] is self:
+            del _LIVE_RUNS[self._claimed]
+        self._claimed = None
 
     async def _steps(self) -> AsyncIterator[Event]:
         """Advance the conversation until the run answers, pauses or stops.
@@ -878,7 +1200,10 @@ class _Run:
             if self._answered:  # a final-answer call was accepted, now or before a resume
                 return
             if self._cancel.is_set():
-                await self._settle_open_calls(prompts.TOOL_CANCELLED)
+                # Calls that never started say so; started ones are cancelled, or, when
+                # repeating them is not safe, of unknown outcome.
+                for event in await self._settle_open_calls(prompts.TOOL_NOT_EXECUTED):
+                    yield event
                 if self._cancel_reason == "timeout":
                     self.status, self.stop_reason = "limit_reached", "timeout"
                 else:
@@ -886,14 +1211,18 @@ class _Run:
                 return
             last = self.history[-1]
             if self._refused:  # the provider refused: end the run, keep its words
-                self.output = last.text if self.agent._output_adapter is None else None
-                await self._settle_open_calls(prompts.TOOL_NOT_EXECUTED)
+                for event in await self._settle_open_calls(prompts.TOOL_NOT_EXECUTED):
+                    yield event
+                refusal = next(m for m in reversed(self.history) if m.role == "assistant")
+                self.output = refusal.text if self.agent._output_adapter is None else None
                 self.stop_reason = "content_filter"
                 return
             if last.role == "assistant" and last.tool_calls:
                 async with contextlib.aclosing(self._tool_phase(last)) as phase:
                     async for event in phase:
                         yield event
+                if self._cancel.is_set():
+                    continue  # the top of the loop settles the calls and reports the stop
                 if self.pending or self.inputs:
                     self.status = "paused"
                     return
@@ -902,14 +1231,21 @@ class _Run:
                     return
                 continue
             if last.role == "assistant":
-                if await self._finalize(last):
+                outcome = await self._finalize(last)
+                if outcome is True:
                     truncated = self._last_response is not None and (
                         self._last_response.finish_reason == "length"
                     )
                     self.stop_reason = "max_output_tokens" if truncated else None
                     return
+                if isinstance(outcome, OutputRejected):
+                    yield outcome
                 continue
             stop_reason = self._limit_reached()
+            if stop_reason is None:
+                if not await self._maybe_compact():
+                    continue  # cancelled while compacting: the top of the loop stops the run
+                stop_reason = self._limit_reached()  # a summary request may use up the budget
             if stop_reason is not None:
                 self.status, self.stop_reason = "limit_reached", stop_reason
                 return
@@ -920,22 +1256,26 @@ class _Run:
                     yield event
 
     def _check_depth(self) -> None:
-        """Refuse to start a child run nested deeper than ``Limits.max_depth``."""
-        if self.parent is None:
+        """Refuse to start a child run nested deeper than ``Limits.max_depth``.
+
+        ``self.limits.max_depth`` already holds the lowest bound of the parent runs.
+        """
+        limit = self.limits.max_depth
+        if self.parent is None or limit is None or self.depth <= limit:
             return
-        bounds = [self.limits.max_depth]
-        if self.parent_run is not None:
-            bounds.append(self.parent_run.limits.max_depth)
-        known = [bound for bound in bounds if bound is not None]
-        if known and self.depth > min(known):
-            raise ConfigurationError(
-                f"Agent {self.root.name!r} cannot start a child run at depth {self.depth}: "
-                f"Limits.max_depth is {min(known)}. Agents that delegate to each other need a "
-                "point where they stop; raise Limits(max_depth=...) if this nesting is intended."
-            )
+        raise MaxDepthExceeded(
+            f"Agent {self.root.name!r} cannot start a child run at depth {self.depth}: "
+            f"Limits.max_depth is {limit}. Agents that delegate to each other need a "
+            "point where they stop; raise Limits(max_depth=...) if this nesting is intended.",
+            depth=self.depth,
+            limit=limit,
+        )
 
     def _inherit_limits(self) -> None:
-        """Cap a child run's budget by what remains of its parent's, at this moment."""
+        """Cap a child run's limits by what remains of its parents' budgets, at this moment.
+
+        Tokens and cost are also checked live while the child runs (`_limit_reached`).
+        """
         if self.parent_run is None:
             return
         changes: dict[str, Any] = {}
@@ -946,17 +1286,31 @@ class _Run:
         if changes:
             self.limits = self.limits.model_copy(update=changes)
 
+    def _spent(self) -> Usage:
+        """This run's usage plus the live usage of its child runs that are still working."""
+        total = self.usage
+        for child in list(self._children):
+            total = total.add(child._spent())
+        return total
+
     def _remaining(self) -> dict[str, Any]:
-        """What is left of this run's token, cost and time budget (``None``: no limit)."""
-        limits, usage = self.limits, self.usage
+        """What is left of the token, cost and time budget of this run and its parent runs
+        (the lowest of them; ``None``: no limit), counting child runs that are working."""
+        limits, spent = self.limits, self._spent()
         remaining: dict[str, Any] = {"max_total_tokens": None, "max_cost_usd": None}
         if limits.max_total_tokens is not None:
-            remaining["max_total_tokens"] = limits.max_total_tokens - usage.total_tokens
+            remaining["max_total_tokens"] = limits.max_total_tokens - spent.total_tokens
         if limits.max_cost_usd is not None:
-            remaining["max_cost_usd"] = limits.max_cost_usd - (usage.cost_usd or 0.0)
+            unknown = not spent.cost_complete  # an unknown cost counts as all of the budget
+            cost = limits.max_cost_usd if unknown else spent.cost_usd or 0.0
+            remaining["max_cost_usd"] = limits.max_cost_usd - cost
         remaining["timeout_s"] = (
             None if self._deadline is None else self._deadline - time.monotonic()
         )
+        if self.parent_run is not None:
+            for key, value in self.parent_run._remaining().items():
+                if value is not None and (remaining[key] is None or value < remaining[key]):
+                    remaining[key] = value
         return remaining
 
     def _start_timer(self) -> asyncio.TimerHandle | None:
@@ -977,22 +1331,9 @@ class _Run:
         self.waiting = {item.tool_call_id: item for item in state.pending_inputs}
         self._saved_state = _state_json(state.values)
         self.state.update(state.values)
-        self.state.update(self._state_seed)  # journaled once the run has started
+        self.state.update(self._state_seed)  # journaled with the start of the run
         if self.resume:
-            if state.open_run_id is None or not self.history:
-                raise SessionError(
-                    f"Session {self.session.id!r} has no unfinished run to resume. "
-                    "Start a new one with agent.run()."
-                )
-            if state.agent and state.agent != self.root.name:
-                self.agent = self._find_agent(state.agent)
-            await self._load_agent()
-            self._check_results(state)
-            self.run_id = state.open_run_id
-            self._check_tokens(state)
-            self._journal_open = True
-            self._ordinal = state.run_messages
-            await self._restore_answer()
+            await self._prepare_resume(state)
             return
 
         if self.seed and self.history:
@@ -1002,11 +1343,8 @@ class _Run:
             )
         if not (self.history or self.seed or self.prompt is not None):
             raise ConfigurationError("Nothing to run: give a prompt, a history or a session.")
+        self._check_agent_names()
         await self._load_agent()
-        if state.open_run_id is not None:
-            await self.session.append(
-                "run_finished", {"status": "abandoned"}, run_id=state.open_run_id
-            )
         started: dict[str, Any] = {"agent": self.root.name}
         if self.parent is not None:
             started.update(
@@ -1014,20 +1352,109 @@ class _Run:
                 parent_tool_call_id=self.parent.tool_call_id,
                 depth=self.depth,
             )
-        await self._journal("run_started", started)
+        if self._limits_given:  # so a recovery elsewhere (AgentRuntime) keeps them
+            started["limits"] = self.limits.model_dump(mode="json")
+        # The start of a run is one store write: a crash leaves either all of it or nothing,
+        # and a guardrail that raises leaves nothing (the previous run stays as it was).
+        async with self._batched():
+            if state.open_run_id is not None:
+                await self._journal("run_finished", dict(_ABANDONED), run_id=state.open_run_id)
+            await self._journal("run_started", started)
+            if (updated := await self._save_state()) is not None:
+                self._start_events.append(updated)  # the values passed as state=
+            for message in self.seed:
+                await self._append(message, new=False)
+            # A previous run may have stopped with tool calls still open (crashed,
+            # or paused for approvals and inputs). Close them so the conversation
+            # stays valid for the provider.
+            await self._settle_open_calls(prompts.TOOL_NOT_EXECUTED)
+            if self.prompt is not None:
+                message = _as_message(self.prompt)
+                # A blocked prompt never joins the conversation; the run ends as "blocked".
+                self.guardrail = await self._check_guardrails("input", message)
+                if self.guardrail is None:
+                    await self._append(message)
         self._journal_open = True
-        for message in self.seed:
-            await self._append(message, new=False)
-        # A previous run may have stopped with tool calls still open (crashed,
-        # or paused for approvals and inputs). Close them so the conversation
-        # stays valid for the provider.
-        await self._settle_open_calls(prompts.TOOL_NOT_EXECUTED)
-        if self.prompt is not None:
-            message = _as_message(self.prompt)
-            # A blocked prompt never joins the conversation; the run ends as "blocked".
-            self.guardrail = await self._check_guardrails("input", message)
-            if self.guardrail is None:
-                await self._append(message)
+
+    async def _prepare_resume(self, state: SessionState) -> None:
+        if state.open_run_id is None or not self.history:
+            raise SessionError(
+                f"Session {self.session.id!r} has no unfinished run to resume. "
+                "Start a new one with agent.run()."
+            )
+        self.run_id = state.open_run_id
+        self._ordinal = state.run_messages
+        paused = bool(state.pending_approvals or state.pending_inputs)
+        try:
+            self._check_agent_names()
+            if state.agent:
+                self.agent = self._find_agent(state.agent)
+            await self._load_agent()
+        except Exception:
+            # The open run cannot be resumed here (a toolkit that cannot connect, an agent
+            # that is gone): count it as a failure, so AgentRuntime's max_failures applies.
+            # A paused run stays paused: it waits for a person, not for recovery.
+            self._journal_open = not paused
+            raise
+        self._check_results(state)
+        last = self.history[-1]
+        open_calls = (
+            {call.id for call in last.tool_calls if call.id not in self.results}
+            if last.role == "assistant"
+            else set()
+        )
+        # An approval answers an open call of the paused turn and nothing else.
+        self.approvals = {key: value for key, value in self.approvals.items() if key in open_calls}
+        self._check_tokens(state)
+        self._journal_open = True
+        self.usage, self.turn = state.run_usage, state.run_turns
+        # A call that waited for approval has not been allowed to run yet: it is counted
+        # when an approval lets it run (journals list paused calls among the counted ones).
+        # One that started after its approval did run (or may have), so it still counts.
+        waiting = {item.tool_call_id for item in state.pending_approvals}
+        waiting -= set(state.started_tools)
+        self._counted = dict.fromkeys(i for i in state.run_tool_call_ids if i not in waiting)
+        if state.run_messages == 0 and last.role == "assistant" and not last.tool_calls:
+            # The run started, but its prompt never reached the journal (written by an older
+            # version, in separate writes). Finishing it would answer with the previous reply.
+            await self._journal("run_finished", dict(_ABANDONED))
+            self._closed = True
+            raise SessionError(
+                f"The open run of session {self.session.id!r} has no prompt in the journal, "
+                "so it cannot be resumed; it was closed as abandoned. Start a new run."
+            )
+        self._restore_finish_reason()
+        await self._restore_handoff()
+        await self._restore_answer()
+
+    def _check_agent_names(self) -> None:
+        """Refuse two different agents with one name among those reachable through handoffs.
+
+        The journal records the active agent by name, so a resume must find exactly one.
+        """
+        names: dict[str, Agent] = {}
+        seen: set[int] = set()
+        queue = [self.root]
+        while queue:
+            agent = queue.pop(0)
+            if id(agent) in seen:
+                continue
+            seen.add(id(agent))
+            if names.setdefault(agent.name, agent) is not agent:
+                raise ConfigurationError(
+                    f"Two different agents reachable through handoffs from {self.root.name!r} "
+                    f"are named {agent.name!r}. Runs are recorded by agent.name, so give each "
+                    "agent a unique name=."
+                )
+            tools: dict[str, Agent] = {}
+            for target in agent.handoffs:
+                if tools.setdefault(target._handoff_tool_name, target) is not target:
+                    raise ConfigurationError(
+                        f"Agent {agent.name!r} has two handoffs named "
+                        f"{target._handoff_tool_name!r}. Give the target agents names that "
+                        "differ in letters, digits, '_' or '-'."
+                    )
+            queue.extend(agent.handoffs)
 
     async def _load_agent(self) -> None:
         self.tools = await self.agent._collect_tools()
@@ -1096,6 +1523,43 @@ class _Run:
                 self._answered = True
                 return
 
+    def _restore_finish_reason(self) -> None:
+        """On resume, take back how the last model response ended (it is in its metadata).
+
+        A refusal (``content_filter``) then still ends the run without running
+        its tool calls or asking again, and a cut-off answer (``length``)
+        still reports ``max_output_tokens``.
+        """
+        last = self.history[-1]
+        assistant = self.history[-2] if last.role == "tool" and len(self.history) > 1 else last
+        if assistant.role != "assistant":
+            return
+        reason = assistant.metadata.get("finish_reason")
+        self._refused = reason == "content_filter"
+        if assistant is last and reason == "length":
+            self._last_response = ModelResponse(message=last, finish_reason="length")
+
+    async def _restore_handoff(self) -> None:
+        """On resume, finish a handoff whose result was journaled but whose switch was not."""
+        if len(self.history) < 2 or self.history[-1].role != "tool":
+            return
+        previous = self.history[-2]
+        if previous.role != "assistant" or previous.name != self.agent.name:
+            return
+        accepted = {r.tool_call_id for r in self.history[-1].tool_results if not r.is_error}
+        for call in previous.tool_calls:
+            if call.id in accepted and call.name in self.handoffs:
+                self._start_events.append(await self._switch(self.handoffs[call.name], call.id))
+                await self._load_agent()
+                return
+
+    async def _switch(self, target: Agent, call_id: str) -> AgentSwitched:
+        """Journal ``agent_switched`` and make ``target`` the active agent (load it next)."""
+        previous = self.agent
+        await self._journal("agent_switched", {"agent": target.name})
+        self.agent = target
+        return AgentSwitched(from_agent=previous.name, to_agent=target.name, tool_call_id=call_id)
+
     def _guardrail_event(self, tripped: TrippedGuardrail) -> GuardrailTriggered:
         return GuardrailTriggered(
             name=tripped.name, reason=tripped.reason, stage=tripped.stage, agent=self.agent.name
@@ -1110,10 +1574,10 @@ class _Run:
             tool = self.tools.get(call.name)
             if call.id in self.results or call.id in approvals:
                 continue
-            if tool is not None and tool.deferred:
-                accepted.add(
-                    call.id
-                )  # not journaled as waiting yet (a crash), but it can only wait
+            if tool is not None and tool.deferred and _invalid_arguments(tool, call) is None:
+                # Not journaled as waiting yet (a crash), but it can only wait. A call with
+                # invalid arguments gets an error result instead, never one from results=.
+                accepted.add(call.id)
         unknown = [call_id for call_id in self.supplied if call_id not in accepted]
         if not unknown:
             return
@@ -1131,10 +1595,12 @@ class _Run:
         """With signed pauses, refuse answers that do not carry their pause's token.
 
         An approval must match the call as the journal records it in the
-        assistant message, which is what will run, and the recorded pause must
-        still match its own token. A result must match the waiting call as
-        the journal records it. Results are unwrapped from `InputResult` (and,
-        when pauses are signed, from ``{"token": ..., "value": ...}``) here.
+        assistant message (the call that runs, unless the approval edits its
+        arguments, which the permission rules then check), and the recorded
+        pause must still match its own token. A result must match the waiting
+        call as the journal records it, its reason and metadata included.
+        Results are unwrapped from `InputResult` (and, when pauses are signed,
+        from ``{"token": ..., "value": ...}``) here.
         """
         signed = self.permissions.signs_pauses
         unwrapped: dict[str, Any] = {}
@@ -1153,38 +1619,48 @@ class _Run:
         last = self.history[-1]
         calls = {call.id: call for call in last.tool_calls} if last.role == "assistant" else {}
         recorded = {item.tool_call_id: item for item in state.pending_approvals}
-        for call_id, approval in self.approvals.items():
-            call = calls.get(call_id)
-            if call is None or call_id in self.results:
-                continue  # not an open call: the approval is ignored, as without signing
-            self._verify_token(approval.token, call.id, call.name, call.arguments, "approval")
+        for call_id, approval in self.approvals.items():  # only open calls are left
+            call = calls[call_id]
+            self._verify_token(approval.token, call, "approval")
             pause = recorded.get(call_id)
-            if pause is not None and not self._signs(pause.token, pause):
+            if pause is not None and not self.permissions.verify(
+                pause.token, **self._pause_fields(pause, "approval")
+            ):
                 raise self._tampered(call_id, call.name)
         for call_id, token in tokens.items():
             target: PendingInput | ToolCallPart | None = self.waiting.get(call_id)
             if target is None:  # a deferred call whose tool_deferred entry was lost
                 target = calls.get(call_id)
             assert target is not None  # _check_results accepted only open calls
-            self._verify_token(token, call_id, target.name, target.arguments, "result")
+            self._verify_token(token, target, "result")
 
-    def _signs(self, token: str | None, pause: PendingApproval | PendingInput) -> bool:
-        return self.permissions.verify(
-            token,
-            run_id=self.run_id,
-            tool_call_id=pause.tool_call_id,
-            name=pause.name,
-            arguments=pause.arguments,
-        )
+    def _pause_fields(
+        self,
+        pause: PendingApproval | PendingInput | ToolCallPart,
+        kind: Literal["approval", "input"],
+    ) -> dict[str, Any]:
+        """What the token of a pause of this run signs (see `approval_token`)."""
+        is_input = isinstance(pause, PendingInput)
+        return {
+            "session_id": self.session.id,
+            "run_id": self.run_id,
+            "position": self._ordinal,  # the call's assistant message is the run's last one
+            "tool_call_id": pause.id if isinstance(pause, ToolCallPart) else pause.tool_call_id,
+            "name": pause.name,
+            "arguments": pause.arguments,
+            "kind": kind,
+            "reason": pause.reason if is_input else None,
+            "metadata": pause.metadata if is_input else None,
+        }
 
     def _verify_token(
         self,
         token: str | None,
-        call_id: str,
-        name: str,
-        arguments: Mapping[str, Any],
+        target: PendingInput | ToolCallPart,
         kind: Literal["approval", "result"],
     ) -> None:
+        call_id = target.id if isinstance(target, ToolCallPart) else target.tool_call_id
+        name = target.name
         if token is None:
             how = (
                 "Approval.for_call(pending) or Approval(approved=..., token=pending.token), with "
@@ -1197,9 +1673,8 @@ class _Run:
                 f"Tool call {call_id!r} ({name}) belongs to a signed pause, so its {kind} needs "
                 f"the pause's token. Pass {how}. Nothing was run."
             )
-        if not self.permissions.verify(
-            token, run_id=self.run_id, tool_call_id=call_id, name=name, arguments=arguments
-        ):
+        pause_kind: Literal["approval", "input"] = "approval" if kind == "approval" else "input"
+        if not self.permissions.verify(token, **self._pause_fields(target, pause_kind)):
             raise self._tampered(call_id, name)
 
     def _tampered(self, call_id: str, name: str) -> ApprovalTokenError:
@@ -1211,45 +1686,47 @@ class _Run:
         )
 
     def _find_agent(self, name: str) -> Agent:
-        seen: set[int] = set()
-        queue = [self.root]
-        while queue:
-            candidate = queue.pop(0)
-            if id(candidate) in seen:
-                continue
-            seen.add(id(candidate))
+        for candidate in _reachable_agents(self.root):
             if candidate.name == name:
                 return candidate
-            queue.extend(candidate.handoffs)
         raise SessionError(
             f"The run was last handled by agent {name!r}, which is not reachable from "
             f"{self.root.name!r} through handoffs."
         )
 
     def _limit_reached(self) -> str | None:
+        """The limit that stops the run before its next request, if any.
+
+        Tokens and cost are checked for this run and for every parent run, live,
+        so child runs working in parallel share what their parents have left.
+        """
         limits = self.limits
         if limits.max_turns is not None and self.turn >= limits.max_turns:
             return "max_turns"
-        if (
-            limits.max_total_tokens is not None
-            and self.usage.total_tokens >= limits.max_total_tokens
-        ):
-            return "max_total_tokens"
-        if limits.max_cost_usd is not None and (
-            limits.max_cost_usd <= 0
-            or (self.usage.cost_usd is not None and self.usage.cost_usd >= limits.max_cost_usd)
-        ):
-            return "max_cost_usd"
+        run: _Run | None = self
+        while run is not None:
+            limits, spent = run.limits, run._spent()
+            tokens = limits.max_total_tokens
+            if tokens is not None and spent.total_tokens >= tokens:
+                return "max_total_tokens"
+            if limits.max_cost_usd is not None and (
+                limits.max_cost_usd <= 0
+                or not spent.cost_complete  # a response without a cost: fail closed
+                or (spent.cost_usd is not None and spent.cost_usd >= limits.max_cost_usd)
+            ):
+                return "max_cost_usd"
+            run = run.parent_run
         return None
 
     # -- model phase ----------------------------------------------------------------
 
     async def _model_phase(self) -> AsyncIterator[Event]:
         ctx = self._ctx()
-        await self._maybe_compact(ctx)
         request = await self.hooks.before_model(ctx, await self._build_request(ctx))
         if (updated := await self._save_state()) is not None:
             yield updated
+        if self._cancel.is_set():
+            return  # stopped while the request was prepared: nothing is sent
         model = self.agent.model
         attempt = 0
         while True:
@@ -1301,19 +1778,46 @@ class _Run:
                         parts=[TextPart(text=partial)],
                         name=self.agent.name,
                         metadata={"interrupted": True},
-                    )
+                    ),
+                    extra={"turn": self.turn},
                 )
             return
 
         response = await self.hooks.after_model(ctx, response)
         if (updated := await self._save_state()) is not None:
             yield updated
-        self.usage = self.usage.add(response.usage)
+        with self._usage_lock:
+            self.usage = self.usage.add(response.usage)
         self._last_response = response
         self._refused = response.finish_reason == "content_filter"
-        message = response.message.model_copy(update={"name": self.agent.name})
-        await self._append(message)
+        answered_by = {
+            "model": response.model or model.name,
+            "provider": response.provider or model.provider,
+        }
+        # The finish reason and the model that answered travel with the message (metadata
+        # is not sent to providers), so a resume still knows that a turn was refused or cut
+        # off, and RunResult.messages say which model wrote what.
+        metadata = {
+            **response.message.metadata,
+            "finish_reason": response.finish_reason,
+            **answered_by,
+        }
+        message = response.message.model_copy(
+            update={"name": self.agent.name, "metadata": metadata}
+        )
+        details = {
+            "usage": response.usage.model_dump(mode="json"),
+            **answered_by,
+            "turn": self.turn,
+        }
+        async with self._batched():
+            await self._append(message, extra=details)
+            settled: list[ToolCallFinished] = []
+            if self._refused:  # no safe point between a refusal and closing its tool calls
+                settled = await self._settle_open_calls(prompts.TOOL_NOT_EXECUTED)
         yield ModelResponded(response=response, agent=self.agent.name)
+        for event in settled:
+            yield event
 
     async def _build_request(self, ctx: RunContext[Any]) -> ModelRequest:
         agent = self.agent
@@ -1322,13 +1826,19 @@ class _Run:
         addition: str | None = None
         if agent.output_mode == "tool":
             # The tool is offered, never forced: some providers reject a forced tool choice.
-            addition = prompts.OUTPUT_TOOL_INSTRUCTIONS.format(name=agent.output_tool_name)
+            template = (
+                prompts.OUTPUT_TOOL_INSTRUCTIONS
+                if agent._output_adapter is not None
+                else prompts.OUTPUT_TOOL_TEXT_INSTRUCTIONS
+            )
+            addition = template.format(name=agent.output_tool_name)
         elif agent._output_schema is not None:
             if agent.output_mode == "prompted":
                 schema = json.dumps(agent._output_schema, ensure_ascii=False)
                 addition = prompts.OUTPUT_INSTRUCTIONS.format(schema=schema)
             else:
-                output = OutputSpec(json_schema=agent._output_schema, strict=agent.output_strict)
+                assert agent._native_schema is not None
+                output = OutputSpec(json_schema=agent._native_schema, strict=agent.output_strict)
         if addition is not None:
             system = f"{system}\n\n{addition}" if system else addition
         messages = ([Message.system(system)] if system else []) + list(self.history)
@@ -1343,46 +1853,71 @@ class _Run:
             output=output,
         )
 
-    async def _maybe_compact(self, ctx: RunContext[Any]) -> None:
+    async def _maybe_compact(self) -> bool:
+        """Let the compactor shorten the history before the next request (turn ``turn + 1``).
+
+        Returns ``False`` when the run was cancelled (or timed out) first or
+        meanwhile: the compactor's work, a summary request for example, is then
+        interrupted and nothing is journaled.
+        """
         compactor = self.root.compactor
         if compactor is None:
-            return
+            return True
+        ctx = dataclasses.replace(self._ctx(), turn=self.turn + 1)
         # The first request of a run or a resume has no response yet: an empty one (no usage)
         # makes the compactor estimate the whole history, so long sessions are compacted too.
         last = self._last_response or ModelResponse(message=Message(role="assistant"))
-        replacement = await compactor.compact(ctx, list(self.history), last, self.agent.model)
+        model, history = self.agent.model, list(self.history)
+        compacted, replacement = await self._unless_cancelled(
+            lambda: compactor.compact(ctx, history, last, model)
+        )
+        if not compacted:
+            return False
         if replacement:
             self.history = list(replacement)
             await self._journal(
                 "compaction",
                 {"messages": [message.model_dump(mode="json") for message in replacement]},
             )
+        return True
 
-    async def _finalize(self, last: Message) -> bool:
+    async def _finalize(self, last: Message) -> Literal[True] | OutputRejected:
         """Accept the text of ``last`` as the final answer, or ask the model to correct it."""
         agent = self.agent
-        if agent.output_mode == "tool":
+        if agent.output_mode == "tool" and agent._output_adapter is not None:
             required = prompts.OUTPUT_TOOL_REQUIRED.format(name=agent.output_tool_name)
-            self._count_rejection(
-                _Rejected(required, f"was not given with {agent.output_tool_name}")
-            )
+            rejection = _Rejected(required, f"was not given with {agent.output_tool_name}")
+            self._count_rejection(rejection)
             await self._append(Message.user(required))
-            return False
+            return self._rejected_event(rejection)
         try:
-            if agent._output_adapter is None:
+            if agent._output_adapter is None:  # text, also in output_mode="tool"
                 answer: Any = last.text
             else:
                 try:
-                    answer = agent._output_adapter.validate_python(extract_json(last.text))
+                    data = extract_json(last.text)
+                    if agent._native_wrapped and agent.output_mode == "native":
+                        data = _unwrap_value(data)
+                    answer = agent._output_adapter.validate_python(data)
                 except ValueError as error:  # pydantic's ValidationError included
                     raise _Rejected(_brief(error), "did not match the output type") from error
             self.output = await self._validate_output(answer)
             return True
         except _Rejected as rejection:
             self._count_rejection(rejection)
-            template = prompts.OUTPUT_RETRY if agent._output_adapter else prompts.OUTPUT_TEXT_RETRY
+            if agent._output_adapter is None:
+                template = prompts.OUTPUT_TEXT_RETRY
+            elif rejection.by_validator:  # the correction may need a tool call
+                template = prompts.OUTPUT_VALIDATOR_RETRY
+            else:
+                template = prompts.OUTPUT_RETRY
             await self._append(Message.user(template.format(error=rejection.message)))
-            return False
+            return self._rejected_event(rejection)
+
+    def _rejected_event(self, rejection: _Rejected) -> OutputRejected:
+        return OutputRejected(
+            reason=rejection.message, attempt=self._output_attempts, agent=self.agent.name
+        )
 
     async def _validate_output(self, output: Any) -> Any:
         """Run the active agent's output validators in order. Raises `_Rejected` on `ModelRetry`."""
@@ -1393,7 +1928,9 @@ class _Run:
                 if inspect.isawaitable(replaced):
                     replaced = await replaced
             except ModelRetry as retry:
-                raise _Rejected(_brief(retry), "was rejected by an output validator") from retry
+                raise _Rejected(
+                    _brief(retry), "was rejected by an output validator", by_validator=True
+                ) from retry
             if replaced is not None:
                 output = replaced
         return output
@@ -1433,20 +1970,43 @@ class _Run:
             result = _error_result(answer, _shorten(content, self.limits.max_tool_result_chars))
             await self._record(result)
             yield ToolCallFinished(call=answer, result=result, agent=agent.name)
+            yield self._rejected_event(rejection)
             return
         self.output = output
-        self._answered = True
         accepted = ToolResultPart(
             tool_call_id=answer.id, name=answer.name, content=prompts.OUTPUT_TOOL_ACCEPTED
         )
-        await self._record(accepted)
-        yield ToolCallFinished(call=answer, result=accepted, agent=agent.name)
-        for call in calls:
-            if call.id not in self.results:
-                skipped = _error_result(call, prompts.OUTPUT_TOOL_SKIPPED.format(name=call.name))
-                await self._record(skipped)
-                yield ToolCallFinished(call=call, result=skipped, agent=agent.name)
-        await self._close_tool_turn(calls)
+        events = await self._close_answer_turn(calls, accepted, answer)
+        self._answered = True
+        for event in events:
+            yield event
+
+    async def _close_answer_turn(
+        self,
+        calls: list[ToolCallPart],
+        accepted: ToolResultPart | None = None,
+        answer: ToolCallPart | None = None,
+    ) -> list[Event]:
+        """Journal the turn of an accepted answer in one write: the answer's result, a
+        "not run" result for every other open call, and the tool message.
+
+        Its events are returned to be yielded afterwards, so nothing can stop
+        the run between the accepted answer and the closed turn.
+        """
+        agent = self.agent.name
+        events: list[Event] = []
+        async with self._batched():
+            if accepted is not None and answer is not None:
+                await self._record(accepted)
+                events.append(ToolCallFinished(call=answer, result=accepted, agent=agent))
+            for call in calls:
+                if call.id not in self.results:
+                    content = prompts.OUTPUT_TOOL_SKIPPED.format(name=call.name)
+                    skipped = _error_result(call, content)
+                    await self._record(skipped)
+                    events.append(ToolCallFinished(call=call, result=skipped, agent=agent))
+            await self._close_tool_turn(calls)
+        return events
 
     # -- tool phase -------------------------------------------------------------------
 
@@ -1460,6 +2020,29 @@ class _Run:
         runs. The run pauses when any call waits.
         """
         calls = assistant.tool_calls
+        prior = next(
+            (
+                c
+                for c in calls
+                if self.agent._is_answer_call(c)
+                and c.id in self.results
+                and not self.results[c.id].is_error
+            ),
+            None,
+        )
+        if prior is not None:
+            # An answer was accepted before the run stopped, but its turn was not closed.
+            # The other calls of the turn were never meant to run: close it without them.
+            try:
+                self.output = await self._validate_output(self.agent._validate_answer_call(prior))
+                answered = True
+            except (_Rejected, ValueError):  # the agent changed: the model answers again
+                answered = False
+            events = await self._close_answer_turn(calls)
+            self._answered = answered
+            for event in events:
+                yield event
+            return
         answer = next(
             (c for c in calls if self.agent._is_answer_call(c) and c.id not in self.results), None
         )
@@ -1477,9 +2060,16 @@ class _Run:
 
         for call in calls:
             if call.id in self.results:
+                recorded = self.results[call.id]
+                if call.name in self.handoffs and not recorded.is_error and handoff is None:
+                    handoff = call  # accepted before the run stopped; the switch is still due
                 continue
             if call.id in self.supplied:  # given to resume(results=...)
-                result = self._supplied_result(call)
+                ctx = self._ctx(tool_call_id=call.id)
+                result = await self.hooks.after_tool(ctx, call, self._supplied_result(call))
+                result = result.model_copy(update={"tool_call_id": call.id, "name": call.name})
+                if (updated := await self._save_state()) is not None:
+                    yield updated
                 await self._record(result)
                 yield ToolCallFinished(call=call, result=result, agent=self.agent.name)
                 continue
@@ -1504,36 +2094,57 @@ class _Run:
                 refusal = prompts.UNKNOWN_TOOL.format(
                     name=call.name, available=", ".join(available) or "none"
                 )
-            elif budget is not None and self._tool_calls >= budget:
+            elif (
+                budget is not None and call.id not in self._counted and len(self._counted) >= budget
+            ):
                 refusal = prompts.TOOL_CALL_LIMIT.format(name=call.name, limit=budget)
                 self._tool_limit_hit = True
+            elif self._cancel.is_set():
+                continue  # stopped: ask no one, run nothing; the loop settles the call
             else:
                 tool = self.tools[call.name]
-                self._tool_calls += 1
                 if call.id in self.started and not (tool.read_only or tool.idempotent):
                     refusal = prompts.TOOL_INTERRUPTED.format(name=call.name)
+                elif (invalid := _invalid_arguments(tool, call)) is not None:
+                    refusal = invalid  # before anyone is asked to approve the call
                 else:
                     verdict, payload = await self._authorize(tool, call)
+                    if self._cancel.is_set() and verdict in ("run", "pending"):
+                        continue  # stopped while it was decided: the loop settles the call
+                    if verdict == "run" and call.id in self._edited:
+                        # An approver's edit is checked like the model's arguments.
+                        if (invalid := _invalid_arguments(tool, payload)) is not None:
+                            verdict, payload = "invalid", invalid
+                    if verdict == "run":
+                        self._counted[call.id] = None  # once per call, also across resumes
                     if verdict == "run" and tool.deferred:
-                        await self._defer(payload)  # never executed by the loop
-                        continue
+                        unsignable = await self._defer(payload)  # never executed by the loop
+                        if unsignable is None:
+                            continue
+                        verdict, payload = "deny", unsignable
                     if verdict == "run":
                         runnable.append((payload, tool))
                         continue
                     if verdict == "pending":
                         pending.append(payload)
                         continue
-                    refusal = prompts.PERMISSION_DENIED.format(name=call.name, reason=payload)
+                    refusal = (
+                        payload
+                        if verdict == "invalid"
+                        else prompts.PERMISSION_DENIED.format(name=call.name, reason=payload)
+                    )
             result = _error_result(call, refusal)
             await self._record(result)
             yield ToolCallFinished(call=call, result=result, agent=self.agent.name)
 
         for group in self._groups(runnable):
+            if self._cancel.is_set():
+                return  # the loop settles the calls that never started
             async with contextlib.aclosing(self._run_group(group)) as events:
                 async for event in events:
                     yield event
-            if self._cancel.is_set():
-                return  # the loop settles the calls that never finished
+        if self._cancel.is_set():
+            return  # the loop settles the calls that never finished
 
         self.pending = pending
         self.inputs = [self.waiting[call.id] for call in calls if call.id in self.waiting]
@@ -1544,54 +2155,78 @@ class _Run:
                 yield InputRequired(input=waiting, agent=self.agent.name)
             return
 
-        target: Agent | None = None
-        if handoff is not None:
-            target = self.handoffs[handoff.name]
-            await self._record(
-                ToolResultPart(
-                    tool_call_id=handoff.id,
-                    name=handoff.name,
-                    content=prompts.HANDOFF_RESULT.format(name=target.name),
+        target = self.handoffs[handoff.name] if handoff is not None else None
+        switched: AgentSwitched | None = None
+        # The handoff's result, the tool message and the switch are one write, so a
+        # resume never finds the handoff told to the model but not made.
+        async with self._batched():
+            if handoff is not None and target is not None and handoff.id not in self.results:
+                await self._record(
+                    ToolResultPart(
+                        tool_call_id=handoff.id,
+                        name=handoff.name,
+                        content=prompts.HANDOFF_RESULT.format(name=target.name),
+                    )
                 )
-            )
-        await self._close_tool_turn(calls)
-        if target is not None:
-            previous, self.agent = self.agent, target
-            await self._journal("agent_switched", {"agent": target.name})
+            await self._close_tool_turn(calls)
+            if target is not None and handoff is not None:
+                switched = await self._switch(target, handoff.id)
+        if switched is not None:
             await self._load_agent()
-            yield AgentSwitched(from_agent=previous.name, to_agent=target.name)
+            yield switched
 
     async def _authorize(self, tool: Tool, call: ToolCallPart) -> tuple[str, Any]:
         """Decide one call.
 
+        The permission rules are always checked first: a deny refuses the call
+        whatever approval was given. An approval given to ``resume`` (or by
+        ``on_ask``) then answers the call; one that edits the arguments has
+        them checked again, and is journaled (``approval_decided``) before
+        the call runs.
+
         Returns ``("run", call)``, ``("pending", PendingApproval)`` or ``("deny", reason)``.
         """
+        ctx = self._ctx(tool_call_id=call.id)
+        decision = await self.permissions.decide(ctx, tool, call)
         approval = self.approvals.pop(call.id, None)
+        if decision.behavior == "deny":
+            return "deny", decision.reason or prompts.PERMISSION_REASON_DEFAULT
         if approval is None:
-            ctx = self._ctx(tool_call_id=call.id)
-            decision = await self.permissions.decide(ctx, tool, call)
             if decision.behavior == "allow":
                 return "run", call
-            if decision.behavior == "deny":
-                return "deny", decision.reason or "it is not permitted."
             if self.permissions.on_ask is None:
-                return "pending", PendingApproval(
+                pending = PendingApproval(
                     tool_call_id=call.id,
                     name=call.name,
                     arguments=call.arguments,
                     reason=decision.reason,
-                    token=self.permissions.sign(
-                        run_id=self.run_id,
-                        tool_call_id=call.id,
-                        name=call.name,
-                        arguments=call.arguments,
-                    ),
                 )
+                try:
+                    pending.token = self.permissions.sign(**self._pause_fields(pending, "approval"))
+                except ValueError:  # NaN, an infinity or a lone surrogate in the arguments
+                    return "deny", prompts.UNSIGNABLE_CALL
+                return "pending", pending
             approval = await self.permissions.request_approval(ctx, tool, call, decision.reason)
+        edited = approval.approved and approval.arguments not in (None, call.arguments)
+        record: dict[str, Any] = {
+            "tool_call_id": call.id,
+            "name": call.name,
+            "approved": approval.approved,
+            "reason": approval.reason,
+            "arguments_changed": edited,
+        }
+        if edited:
+            record["arguments"] = approval.arguments
+        await self._journal("approval_decided", record)  # before the call runs
         if not approval.approved:
             return "deny", approval.reason or prompts.APPROVAL_DECLINED
-        if approval.arguments is not None:
+        if edited:
+            assert approval.arguments is not None
             call = call.model_copy(update={"arguments": approval.arguments, "raw_arguments": None})
+            recheck = await self.permissions.decide(ctx, tool, call)
+            if recheck.behavior == "deny":  # the approval answers "ask", never a deny
+                return "deny", recheck.reason or prompts.PERMISSION_REASON_DEFAULT
+            self._edited.add(call.id)
         return "run", call
 
     def _groups(
@@ -1616,84 +2251,151 @@ class _Run:
         return groups
 
     async def _run_group(self, group: list[tuple[ToolCallPart, Tool]]) -> AsyncIterator[Event]:
+        if self._cancel.is_set():
+            return
         queue: asyncio.Queue[Any] = asyncio.Queue()
         gate = asyncio.Semaphore(max(1, self.limits.max_parallel_tools))
         tasks = [
             asyncio.create_task(self._run_tool(call, tool, queue, gate)) for call, tool in group
         ]
         cancelled = asyncio.ensure_future(self._cancel.wait())
+        item_ready: asyncio.Future[Any] | None = None
         finished = 0
         try:
+            # Each task ends with _DONE, whatever happened in it: events a tool emits
+            # (a ToolCallFinished of a sub-agent's included) cannot end the group early.
             while finished < len(tasks):
                 item_ready = asyncio.ensure_future(queue.get())
                 await asyncio.wait({item_ready, cancelled}, return_when=asyncio.FIRST_COMPLETED)
                 if not item_ready.done():
-                    item_ready.cancel()
                     return
-                item = item_ready.result()
+                item, item_ready = item_ready.result(), None
                 if isinstance(item, _Failure):
                     raise item.error
-                if isinstance(item, _Deferred):
+                if item is _DONE:
                     finished += 1
                     continue
-                if isinstance(item, ToolCallFinished):
-                    finished += 1
                 yield item
         finally:
             cancelled.cancel()
+            if item_ready is not None:
+                item_ready.cancel()
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, *[f for f in (item_ready,) if f], return_exceptions=True)
 
     async def _run_tool(
         self, call: ToolCallPart, tool: Tool, queue: asyncio.Queue[Any], gate: asyncio.Semaphore
     ) -> None:
-        agent = self.agent.name
+        """Run one call in its own task; the last thing it puts on ``queue`` is ``_DONE``."""
         try:
             async with gate:
-                ctx = self._ctx(tool_call_id=call.id, emit=queue.put_nowait)
-                await self._journal("tool_started", {"tool_call_id": call.id, "name": call.name})
-                queue.put_nowait(ToolCallStarted(call=call, agent=agent))
-                began = time.perf_counter()
-                hooked = await self.hooks.before_tool(ctx, call)
-                if isinstance(hooked, ToolResultPart):
-                    result = hooked
-                else:
-                    try:
-                        result = await self._invoke(ctx, tool, hooked)
-                    except DeferToolCall as deferral:
-                        if (updated := await self._save_state()) is not None:
-                            queue.put_nowait(updated)
-                        await self._defer(
-                            call.model_copy(update={"arguments": hooked.arguments}),
-                            deferral.reason,
-                            deferral.metadata,
-                        )
-                        queue.put_nowait(_Deferred())
-                        return
-                result = await self.hooks.after_tool(ctx, call, result)
-                result = result.model_copy(update={"tool_call_id": call.id, "name": call.name})
-                # State before result: after a crash, a recorded result implies its state.
-                if (updated := await self._save_state()) is not None:
-                    queue.put_nowait(updated)
-                await self._record(result)
-                queue.put_nowait(
-                    ToolCallFinished(
-                        call=call,
-                        result=result,
-                        duration_ms=(time.perf_counter() - began) * 1000,
-                        agent=agent,
+                await self._execute_call(call, tool, queue)
+        except asyncio.CancelledError:
+            if _cancelled_from_outside():
+                raise  # the group, or the run, is being cancelled
+            queue.put_nowait(  # a stray CancelledError: never a silent exit that hangs the run
+                _Failure(
+                    RuntimeError(
+                        f"A hook or the journal raised CancelledError while tool call {call.id!r} "
+                        f"({call.name}) ran, although the run was not cancelled."
                     )
                 )
-        except asyncio.CancelledError:
-            raise
+            )
         except BaseException as error:  # a hook or the journal failed: stop the run
             queue.put_nowait(_Failure(error))
+        queue.put_nowait(_DONE)
+
+    async def _execute_call(
+        self, call: ToolCallPart, tool: Tool, queue: asyncio.Queue[Any]
+    ) -> None:
+        agent = self.agent.name
+        if self._cancel.is_set():
+            return  # stopped while it waited for its turn: it never starts
+        if (blocked := await self._wait_for_stuck_threads(tool, call)) is not None:
+            self._counted.pop(call.id, None)  # it never ran, so it does not count
+            await self._record(blocked)
+            queue.put_nowait(ToolCallFinished(call=call, result=blocked, agent=agent))
+            return
+        if self._cancel.is_set():
+            return  # stopped while it waited for an earlier call: it never starts
+        ctx = self._ctx(tool_call_id=call.id, emit=queue.put_nowait)
+        await self._journal("tool_started", {"tool_call_id": call.id, "name": call.name})
+        if self._cancel.is_set():
+            return  # stopped while the start was written: nothing ran
+        self._running.add(call.id)
+        queue.put_nowait(ToolCallStarted(call=call, agent=agent))
+        began = time.perf_counter()
+        hooked = await self.hooks.before_tool(ctx, call)
+        if (updated := await self._save_state()) is not None:
+            queue.put_nowait(updated)  # a change made in before_tool is journaled before the tool
+        if isinstance(hooked, ToolResultPart):
+            result = hooked
+        else:
+            try:
+                result = await self._invoke(ctx, tool, hooked)
+            except DeferToolCall as deferral:
+                if (updated := await self._save_state()) is not None:
+                    queue.put_nowait(updated)
+                unsignable = await self._defer(
+                    call.model_copy(update={"arguments": hooked.arguments}),
+                    deferral.reason,
+                    deferral.metadata,
+                )
+                if unsignable is None:
+                    return
+                refusal = prompts.PERMISSION_DENIED.format(name=call.name, reason=unsignable)
+                result = _error_result(call, refusal)
+        result = await self.hooks.after_tool(ctx, call, result)
+        result = result.model_copy(update={"tool_call_id": call.id, "name": call.name})
+        if call.id in self._edited:  # tell the model what actually ran
+            note = prompts.APPROVAL_ARGUMENTS_CHANGED.format(
+                arguments=json.dumps(call.arguments, ensure_ascii=False, default=str)
+            )
+            result = result.model_copy(update={"content": f"{note}\n{result.content}"})
+        # State before result: after a crash, a recorded result implies its state.
+        if (updated := await self._save_state()) is not None:
+            queue.put_nowait(updated)
+        await self._record(result)
+        queue.put_nowait(
+            ToolCallFinished(
+                call=call,
+                result=result,
+                duration_ms=(time.perf_counter() - began) * 1000,
+                agent=agent,
+            )
+        )
+
+    def _runs_alone(self, tool: Tool) -> bool:
+        """Calls of ``tool`` run one at a time (`Limits.parallel_tools`)."""
+        mode = self.limits.parallel_tools
+        return mode == "none" or (mode == "read_only" and not tool.read_only)
+
+    async def _wait_for_stuck_threads(
+        self, tool: Tool, call: ToolCallPart
+    ) -> ToolResultPart | None:
+        """Keep calls that run one at a time apart from a sync call of this run that timed
+        out and still runs in its thread: wait for it, within this call's timeout.
+
+        Returns ``None`` when the call may start, else its error result (it never started).
+        """
+        if not self._stuck_threads or not self._runs_alone(tool):
+            return None
+        limit = tool.timeout if tool.timeout is not None else self.limits.tool_timeout_s
+        earlier, self._stuck_threads = self._stuck_threads, []
+        if await _threads_finished(earlier, limit or None):
+            return None
+        self._stuck_threads = [thread for thread in earlier if not thread.done()]
+        content = prompts.TOOL_WAITED_FOR_EARLIER.format(name=call.name, seconds=limit)
+        result = _error_result(call, content)
+        result.metadata["timeout"] = limit
+        return result
 
     async def _invoke(self, ctx: RunContext[Any], tool: Tool, call: ToolCallPart) -> ToolResultPart:
         """Run a tool and turn whatever happens into a result the model can read.
 
         `DeferToolCall` is the one exception that passes through: the call then has no result.
+        A real cancellation of the tool's task passes through too.
         """
         metadata: dict[str, Any] = {}
         is_error = True
@@ -1707,9 +2409,23 @@ class _Run:
             content = prompts.INVALID_ARGUMENTS.format(name=call.name, error=error)
         except ToolError as error:
             content = str(error)
-        except TimeoutError:
-            seconds = tool.timeout if tool.timeout is not None else self.limits.tool_timeout_s
-            content = prompts.TOOL_TIMEOUT.format(name=call.name, seconds=seconds or 0)
+        except ToolTimeout as timeout:
+            # Only the framework's own timeout: a TimeoutError of the tool's code is a failure.
+            if not timeout.started:
+                template = prompts.TOOL_NOT_STARTED
+            elif timeout.running:
+                template = prompts.TOOL_TIMEOUT_ABANDONED
+                if timeout.thread is not None and self._runs_alone(tool):
+                    self._stuck_threads.append(timeout.thread)  # see _wait_for_stuck_threads
+            else:
+                template = prompts.TOOL_TIMEOUT
+            content = template.format(name=call.name, seconds=timeout.seconds)
+            metadata["timeout"] = timeout.seconds
+        except asyncio.CancelledError as error:
+            if _cancelled_from_outside():
+                raise
+            content = prompts.TOOL_FAILED.format(name=call.name, error=f"CancelledError: {error}")
+            metadata["exception"] = "CancelledError"
         except Exception as error:
             logger.exception("Tool %s raised", call.name)
             content = prompts.TOOL_FAILED.format(
@@ -1727,24 +2443,28 @@ class _Run:
     async def _record(self, result: ToolResultPart) -> None:
         self.results[result.tool_call_id] = result
         self.waiting.pop(result.tool_call_id, None)
-        await self._journal("tool_result", {"result": result.model_dump(mode="json")})
+        self._running.discard(result.tool_call_id)
+        data: dict[str, Any] = {"result": result.model_dump(mode="json")}
+        if result.tool_call_id in self._counted:
+            data["counted"] = True  # toward Limits.max_tool_calls, restored on resume
+        await self._journal("tool_result", data)
 
     async def _defer(
         self,
         call: ToolCallPart,
         reason: str | None = None,
         metadata: Mapping[str, Any] | None = None,
-    ) -> None:
-        """Record that ``call`` waits for a result from outside the run (signed, if set up)."""
+    ) -> str | None:
+        """Record that ``call`` waits for a result from outside the run (signed, if set up).
+
+        Returns ``None``, or the refusal for a call whose pause cannot be signed.
+        """
         waiting = PendingInput(
             tool_call_id=call.id,
             name=call.name,
             arguments=call.arguments,
             reason=reason,
             metadata=dict(metadata or {}),
-            token=self.permissions.sign(
-                run_id=self.run_id, tool_call_id=call.id, name=call.name, arguments=call.arguments
-            ),
         )
         try:
             data = waiting.model_dump(mode="json")
@@ -1753,8 +2473,15 @@ class _Run:
                 f"The deferred call to {call.name!r} cannot be journaled: {error}. "
                 "Give DeferToolCall(metadata=...) plain JSON values."
             ) from error
+        try:
+            waiting.token = self.permissions.sign(**self._pause_fields(waiting, "input"))
+        except ValueError:  # NaN, an infinity or a lone surrogate
+            return prompts.UNSIGNABLE_CALL
+        data["token"] = waiting.token
         self.waiting[call.id] = waiting
+        self._running.discard(call.id)  # it waits now; it is not running
         await self._journal("tool_deferred", {"input": data})
+        return None
 
     def _supplied_result(self, call: ToolCallPart) -> ToolResultPart:
         """Turn the value given to ``resume(results=...)`` for ``call`` into its result."""
@@ -1768,36 +2495,54 @@ class _Run:
             tool_call_id=call.id, name=call.name, content=_shorten(render_tool_output(value), limit)
         )
 
-    async def _settle_open_calls(self, template: str) -> None:
-        """Give every open tool call of the last assistant message a result, then close the turn."""
+    async def _settle_open_calls(self, template: str) -> list[ToolCallFinished]:
+        """Give every open tool call of the last assistant message a result, then close the turn.
+
+        ``template`` is for calls that never started. A call that started in
+        an earlier process, or that this run started and stopped while it ran
+        and that is not safe to repeat, is reported with an unknown outcome.
+        Returns the ``tool_call_finished`` events of the calls it settled.
+        """
         if not self.history:
-            return
+            return []
         last = self.history[-1]
         if last.role != "assistant" or not last.tool_calls:
-            return
+            return []
+        settled: list[ToolCallFinished] = []
         for call in last.tool_calls:
             if call.id in self.results:
                 continue
-            if call.id in self.started:
+            tool = self.tools.get(call.name)
+            safe = tool is not None and (tool.read_only or tool.idempotent)
+            if call.id in self.started or (call.id in self._running and not safe):
                 wording = prompts.TOOL_INTERRUPTED
+            elif call.id in self._running:
+                wording = prompts.TOOL_CANCELLED
             elif call.id in self.waiting:
                 wording = prompts.TOOL_INPUT_ABANDONED
             else:
                 wording = template
-            await self._record(_error_result(call, wording.format(name=call.name)))
+            result = _error_result(call, wording.format(name=call.name))
+            await self._record(result)
+            settled.append(ToolCallFinished(call=call, result=result, agent=self.agent.name))
         await self._close_tool_turn(last.tool_calls)
+        return settled
 
     async def _close_tool_turn(self, calls: list[ToolCallPart]) -> None:
         await self._append(Message(role="tool", parts=[self.results[call.id] for call in calls]))
         self.results = {}
         self.started = set()
+        self._running = set()
         self.waiting = {}
+        self.approvals = {}  # an answer applies only to the turn it was given for
 
     # -- plumbing ---------------------------------------------------------------------
 
     def _ctx(
         self, *, tool_call_id: str | None = None, emit: Callable[[Any], None] | None = None
     ) -> RunContext[Any]:
+        if emit is not None:
+            emit = _thread_safe(emit)  # a sync tool calls ctx.emit from its worker thread
         return RunContext(
             deps=self.deps,
             run_id=self.run_id,
@@ -1822,7 +2567,13 @@ class _Run:
         )
 
     def _add_usage(self, usage: Usage) -> None:
-        self.usage = self.usage.add(usage)
+        with self._usage_lock:  # ctx.add_usage may come from a sync tool's worker thread
+            if any(usage is absorbed for absorbed in self._absorbed):
+                # A child run's result.usage, already added when the child ended.
+                self._absorbed = [item for item in self._absorbed if item is not usage]
+                return
+            self.usage = self.usage.add(usage)
+            self._usage_to_journal = self._usage_to_journal.add(usage)  # with the next entry
 
     async def _save_state(self) -> StateUpdated | None:
         """Journal ``ctx.state`` if it changed since it was last journaled.
@@ -1838,42 +2589,125 @@ class _Run:
             self._saved_state = snapshot
         return StateUpdated(values=json.loads(snapshot), agent=self.agent.name)
 
-    async def _journal(self, kind: str, data: dict[str, Any]) -> None:
-        await self.session.append(kind, data, run_id=self.run_id)
+    async def _journal(self, kind: str, data: dict[str, Any], *, run_id: str | None = None) -> None:
+        if kind in _USAGE_KINDS and run_id is None:
+            with self._usage_lock:
+                added, self._usage_to_journal = self._usage_to_journal, Usage()
+            if added != Usage():
+                # Usage from ctx.add_usage (a compactor's summary, a sub-agent) rides on the
+                # next entry of the run, so a resume restores it (derive_state sums it).
+                data = {**data, "added_usage": added.model_dump(mode="json")}
+        entry = Entry(kind=kind, data=data, run_id=run_id or self.run_id)
+        if self._batch is not None:
+            self._batch.append(entry)
+        else:
+            await self._write([entry])
 
-    async def _append(self, message: Message, *, new: bool = True) -> None:
+    async def _write(self, entries: list[Entry]) -> None:
+        try:
+            if self._lease_owner is not None:  # fenced: written only while this run holds it
+                await self.session.store.append_leased(self.session.id, entries, self._lease_owner)
+            else:
+                await self.session.append_entries(entries)
+        except BaseException:
+            self._unwritten(entries)
+            raise
+
+    def _unwritten(self, entries: list[Entry]) -> None:
+        """Keep the added usage of entries that were not written for the next entry."""
+        for entry in entries:
+            if "added_usage" in entry.data:
+                added = Usage.model_validate(entry.data["added_usage"])
+                with self._usage_lock:
+                    self._usage_to_journal = self._usage_to_journal.add(added)
+
+    @contextlib.asynccontextmanager
+    async def _batched(self) -> AsyncIterator[None]:
+        """Collect the entries journaled inside the block and write them in one store call.
+
+        Every store writes one ``append`` atomically, so a crash leaves all of
+        them or none. If the block raises, none is written. Nested blocks join
+        the outer one. Do not yield events inside the block.
+        """
+        if self._batch is not None:
+            yield
+            return
+        self._batch = []
+        try:
+            yield
+            entries = self._batch
+        except BaseException:
+            self._unwritten(self._batch)
+            raise
+        finally:
+            self._batch = None
+        if entries:
+            await self._write(entries)
+
+    async def _append(
+        self, message: Message, *, new: bool = True, extra: Mapping[str, Any] | None = None
+    ) -> None:
         self.history.append(message)
         self._ordinal += 1
         if new:
             self.new_messages.append(message)
-        await self._journal("message", {"message": message.model_dump(mode="json")})
+        await self._journal(
+            "message", {"message": message.model_dump(mode="json"), **(extra or {})}
+        )
 
     async def _sleep(self, seconds: float) -> None:
         """Wait, but wake up at once if the run is cancelled."""
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._cancel.wait(), timeout=seconds)
 
+    async def _unless_cancelled(self, start: Callable[[], Awaitable[T]]) -> tuple[bool, T | None]:
+        """Await ``start()`` in this task, unless the run is cancelled before or meanwhile.
+
+        Returns ``(True, value)``, or ``(False, None)`` when the run's cancel (or
+        ``timeout_s``) came first: the awaitable is then interrupted with a
+        ``CancelledError`` at its current ``await``, in this task, as a timeout
+        would interrupt it. A cancellation of this task from outside passes through.
+        """
+        if self._cancel.is_set():
+            return False, None
+        task = asyncio.current_task()
+        assert task is not None
+        before = task.cancelling()
+        self._interruptible = task
+        try:
+            value = await start()
+        except (asyncio.CancelledError, Exception):
+            if not self._interrupting:
+                raise
+            # Interrupted by cancel(): whatever the interrupted code raised for it.
+            self._interrupting = False
+            if task.uncancel() > before:
+                raise  # cancelled from outside as well
+            return False, None
+        finally:
+            self._interruptible = None
+        if self._interrupting:  # cancel() came as the step finished: withdraw the request
+            self._interrupting = False
+            task.uncancel()
+        return True, value
+
     async def _until_cancelled(self, source: AsyncIterator[T]) -> AsyncIterator[T]:
-        """Yield from ``source`` until it ends or the run is cancelled, then close it."""
-        cancelled = asyncio.ensure_future(self._cancel.wait())
-        step: asyncio.Future[T] | None = None
+        """Yield from ``source`` until it ends or the run is cancelled, then close it.
+
+        Every step of ``source`` runs in the task that iterates this generator,
+        as when ``source`` is iterated directly, so a model stream's own
+        ``asyncio.timeout``, context variables and cancel scopes work.
+        """
         try:
             while True:
-                step = asyncio.ensure_future(source.__anext__())
-                await asyncio.wait({step, cancelled}, return_when=asyncio.FIRST_COMPLETED)
-                if not step.done():
-                    return
                 try:
-                    item = step.result()
+                    stepped, item = await self._unless_cancelled(source.__anext__)
                 except StopAsyncIteration:
                     return
-                yield item
+                if not stepped:
+                    return
+                yield item  # type: ignore[misc]
         finally:
-            cancelled.cancel()
-            if step is not None and not step.done():
-                step.cancel()
-                with contextlib.suppress(BaseException):
-                    await step
             close = getattr(source, "aclose", None)
             if close is not None:
                 with contextlib.suppress(Exception):
@@ -1900,6 +2734,7 @@ class _Run:
             guardrail=self.guardrail,
         )
         result._session = self.session
+        self._result_usage = result.usage
         return result
 
 
@@ -1925,6 +2760,68 @@ def _normalize_tools(items: Iterable[Any]) -> list[Tool | Toolkit]:
     return normalized
 
 
+_ABANDONED: dict[str, Any] = {
+    "status": "abandoned",
+    "stop_reason": None,
+    "output": None,
+    "text": "",
+}
+"""``run_finished`` of a run that a later run (or a resume that cannot continue it) closed."""
+
+
+def _finished_data(result: RunResult) -> dict[str, Any]:
+    """``run_finished`` data, enough to rebuild the run's `RunResult` from the journal."""
+    try:
+        output = to_jsonable_python(result.output)
+        json.dumps(output)
+    except (PydanticSerializationError, TypeError, ValueError):
+        output = None  # not JSON: the journal keeps the messages, which hold the answer
+    return {
+        "status": result.status,
+        "stop_reason": result.stop_reason,
+        "output": output,
+        "text": result.text,
+    }
+
+
+def _failure_data(error: BaseException) -> dict[str, Any]:
+    """``run_failed`` data: the exception's type and its (shortened) message, nothing more."""
+    message = _brief(error, 500)
+    return {
+        "error_type": type(error).__name__,
+        "message": message,
+        "retryable": bool(getattr(error, "retryable", False)),
+        "ambiguous": bool(getattr(error, "ambiguous", False)),
+        "error": f"{type(error).__name__}: {message}",
+    }
+
+
+def _fenced_by_runtime(store: Any) -> bool:
+    """True for `AgentRuntime`'s per-run store view, whose lease already fences every write."""
+    runtime = sys.modules.get("qagents.runtime")
+    leased = getattr(runtime, "_LeasedStore", None)
+    return isinstance(leased, type) and isinstance(store, leased)
+
+
+def _append_overridden_alone(store: Any) -> bool:
+    """True for a store subclass that overrides ``append`` but not ``append_leased``.
+
+    Such a subclass (an audit mirror, encryption, fault injection) expects every
+    entry to pass through its ``append``, which the built-in ``append_leased``
+    does not call. A plain run then writes through ``append`` and takes no
+    lease, so only runs in this process are kept apart.
+    """
+    mro = type(store).__mro__
+    append = next((cls for cls in mro if "append" in cls.__dict__), None)
+    leased = next((cls for cls in mro if "append_leased" in cls.__dict__), None)
+    return (
+        append is not None
+        and leased is not None
+        and append is not leased
+        and (issubclass(append, leased))
+    )
+
+
 def _unique(items: Iterable[T]) -> list[T]:
     """``items`` without repeats, by identity, in their first order."""
     seen: set[int] = set()
@@ -1946,6 +2843,82 @@ def _as_message(prompt: Prompt) -> Message:
 
 def _tool_safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", name)[:48] or "agent"
+
+
+def _unwrap_value(data: Any) -> Any:
+    """The answer inside ``{"value": ...}``, the wrapper of a non-object native schema.
+
+    A bare value is returned as it is, for models that answer without the wrapper.
+    """
+    if isinstance(data, dict) and set(data) == {"value"}:
+        return data["value"]
+    return data
+
+
+def _is_object_schema(schema: Mapping[str, Any]) -> bool:
+    """The schema's root is a plain object, as tool arguments and strict response formats need."""
+    return schema.get("type") == "object" and "$ref" not in schema
+
+
+def _reachable_agents(root: Agent) -> list[Agent]:
+    """``root`` and every agent reachable from it through handoffs, each once, nearest first."""
+    seen: set[int] = set()
+    found: list[Agent] = []
+    queue = [root]
+    while queue:
+        agent = queue.pop(0)
+        if id(agent) in seen:
+            continue
+        seen.add(id(agent))
+        found.append(agent)
+        queue.extend(agent.handoffs)
+    return found
+
+
+def _cancelled_from_outside() -> bool:
+    """The current task is being cancelled (a real cancellation, not a stray ``CancelledError``)."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+async def _threads_finished(
+    threads: list[concurrent.futures.Future[Any]], timeout: float | None
+) -> bool:
+    """Wait up to ``timeout`` seconds (``None``: no limit) for ``threads`` to return."""
+    waiters = [asyncio.wrap_future(thread) for thread in threads]
+    try:
+        _, pending = await asyncio.wait(waiters, timeout=timeout)
+    finally:
+        for waiter in waiters:
+            if waiter.done() and not waiter.cancelled():
+                waiter.exception()  # retrieved: the earlier call's error was reported already
+            else:
+                waiter.cancel()  # the thread already runs: cancelling its waiter cannot stop it
+    return not pending
+
+
+def _thread_safe(emit: Callable[[Any], None]) -> Callable[[Any], None]:
+    """``emit``, callable from any thread: from another one, it goes through the loop."""
+    loop = asyncio.get_running_loop()
+    owner = threading.get_ident()
+
+    def safe(event: Any) -> None:
+        if threading.get_ident() == owner:
+            emit(event)
+            return
+        with contextlib.suppress(RuntimeError):  # the loop is closed: a thread abandoned late
+            loop.call_soon_threadsafe(emit, event)
+
+    return safe
+
+
+def _invalid_arguments(tool: Tool, call: ToolCallPart) -> str | None:
+    """The error result for a call whose arguments do not match the tool, or ``None``."""
+    try:
+        tool.validate(call.arguments)
+    except ToolArgumentError as error:
+        return prompts.INVALID_ARGUMENTS.format(name=call.name, error=error)
+    return None
 
 
 def _error_result(call: ToolCallPart, content: str) -> ToolResultPart:
@@ -1993,7 +2966,7 @@ def _state_json(values: Mapping[str, Any]) -> str:
     raise SessionError("The session state is not JSON-serialisable.")
 
 
-def _brief(error: Exception, limit: int = 1500) -> str:
+def _brief(error: BaseException, limit: int = 1500) -> str:
     text = str(error)
     return text if len(text) <= limit else f"{text[:limit]}..."
 

@@ -9,7 +9,17 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from qagents import Agent, InMemoryStore, RunContext, Session, SQLiteStore, Usage, tool
+from qagents import (
+    Agent,
+    InMemoryStore,
+    Limits,
+    Message,
+    RunContext,
+    Session,
+    SQLiteStore,
+    Usage,
+    tool,
+)
 from qagents.errors import ConfigurationError, SessionError
 from qagents.models.testing import ScriptedModel, call
 from qagents.workflow import Workflow, WorkflowStatus, WorkflowSuspended
@@ -341,3 +351,140 @@ async def test_status_lists_paused_and_failed_agent_steps():
     session = Session(store, id=by_name["write"].session_id)
     await session.append("run_finished", {"status": "abandoned"}, run_id=by_name["write"].run_id)
     assert [step.name for step in (await workflow.status()).open_agent_steps] == ["mail"]
+
+
+# -- fixes ----------------------------------------------------------------------------------
+
+
+class DiesBeforeTheStepIsRecorded(InMemoryStore):
+    """Fails the first ``workflow_step`` write, like a process that dies right before it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dead = True
+
+    async def append(self, session_id, entries):
+        if self.dead and any(entry.kind == "workflow_step" for entry in entries):
+            self.dead = False
+            raise ConnectionError("the process died")
+        await super().append(session_id, entries)
+
+
+async def test_an_agent_step_that_completed_but_was_not_recorded_is_not_run_again():
+    store = DiesBeforeTheStepIsRecorded()
+    refunds: list[str] = []
+
+    @tool
+    def refund(order: str) -> str:
+        """Refund an order."""
+        refunds.append(order)
+        return "refunded"
+
+    model = ScriptedModel(
+        [call("refund", order="A-1"), '{"approved": true, "note": "refunded A-1"}'],
+        usage=Usage(requests=1, input_tokens=5),
+    )
+    agent = Agent(model, name="support", tools=[refund], output_type=Review)
+    with pytest.raises(ConnectionError):
+        await Workflow(store, id="ticket").run_agent("refund", agent, "Refund order A-1")
+
+    again = Workflow(store, id="ticket")
+    result = await again.run_agent("refund", agent, "Refund order A-1")
+    assert refunds == ["A-1"] and len(model.requests) == 2  # nothing ran again
+    assert result.status == "completed" and result.output == Review(
+        approved=True, note="refunded A-1"
+    )
+    assert result.usage.input_tokens == 10 and result.turns == 2 and result.agent == "support"
+    assert [m.role for m in result.new_messages] == ["user", "assistant", "tool", "assistant"]
+    prompts = [m for m in await again.session("refund").messages() if m.role == "user"]
+    assert len(prompts) == 1
+    assert "refund" in await again.completed_steps()  # recorded now
+
+
+async def test_an_unrecorded_step_from_an_older_journal_fails_closed():
+    store = InMemoryStore()
+    workflow = Workflow(store, id="old")
+    session = workflow.session("write")
+    await session.append("run_started", {"agent": "writer"}, run_id="r")
+    await session.append("message", {"message": Message.user("Write").model_dump()}, run_id="r")
+    answer = Message.assistant("Written.").model_dump()
+    await session.append("message", {"message": answer}, run_id="r")
+    await session.append("run_finished", {"status": "completed", "stop_reason": None}, run_id="r")
+    model = ScriptedModel(["Written again."])
+    with pytest.raises(SessionError, match="give the step a new name"):
+        await workflow.run_agent("write", Agent(model, name="writer"), "Write")
+    assert model.requests == []
+
+
+async def test_a_step_whose_run_ended_without_completing_runs_again():
+    store = InMemoryStore()
+
+    @tool(read_only=True)
+    def search(query: str) -> str:
+        """Search."""
+        return "more"
+
+    looping = Agent(
+        ScriptedModel([call("search", query="q")] * 2),
+        name="r",
+        tools=[search],
+        limits=Limits(max_turns=1),
+    )
+    first = await Workflow(store, id="w").run_agent("research", looping, "Research")
+    assert first.status == "limit_reached"
+    done = await Workflow(store, id="w").run_agent(
+        "research", Agent(ScriptedModel(["Found it."]), name="r"), "Research"
+    )
+    assert done.output == "Found it."
+
+
+async def test_map_runs_sync_functions_in_threads_without_blocking_the_loop():
+    workflow = Workflow(InMemoryStore(), id="sync-map")
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.02)
+            ticks += 1
+
+    def summarise(text: str) -> str:
+        time.sleep(0.3)
+        return text.upper()
+
+    beat = asyncio.create_task(ticker())
+    began = time.perf_counter()
+    assert await workflow.map("sum", ["a", "b", "c", "d"], summarise) == ["A", "B", "C", "D"]
+    took = time.perf_counter() - began
+    beat.cancel()
+    assert took < 1.0  # four items of 0.3 s ran at once, not one after another
+    assert ticks >= 5  # and the loop kept running meanwhile
+
+
+async def test_completed_steps_returns_a_copy():
+    workflow = Workflow(InMemoryStore(), id="copy")
+    await workflow.step("one", lambda: 1)
+    steps = await workflow.completed_steps()
+    steps["two"] = 2
+    assert await workflow.completed_steps() == {"one": 1}
+    assert await workflow.step("two", lambda: "ran") == "ran"
+
+
+async def test_run_agent_hands_every_event_to_on_event():
+    seen: list[str] = []
+
+    async def narrate(event: Any) -> None:
+        seen.append(event.type)
+
+    @tool(read_only=True)
+    def lookup(key: str) -> str:
+        """Look something up."""
+        return "value"
+
+    agent = Agent(ScriptedModel([call("lookup", key="k"), "Done."]), name="a", tools=[lookup])
+    result = await Workflow(InMemoryStore(), id="live").run_agent(
+        "step", agent, "go", on_event=narrate
+    )
+    assert result.output == "Done."
+    assert seen[0] == "run_started" and seen[-1] == "run_finished"
+    assert "tool_call_started" in seen and "tool_call_finished" in seen

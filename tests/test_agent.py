@@ -161,7 +161,10 @@ async def test_run_timeout_stops_a_slow_tool():
     model = ScriptedModel([call("slow")])
     result = await Agent(model, tools=[slow], limits=Limits(timeout_s=0.1)).run("go")
     assert (result.status, result.stop_reason) == ("limit_reached", "timeout")
-    assert result.messages[-1].tool_results[0].content == "'slow' was cancelled before it finished."
+    # It had started and is not safe to repeat: the model is told the outcome is unknown.
+    assert result.messages[-1].tool_results[0].content == prompts.TOOL_INTERRUPTED.format(
+        name="slow"
+    )
 
 
 class Invoice(BaseModel):

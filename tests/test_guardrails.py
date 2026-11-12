@@ -52,7 +52,7 @@ async def test_an_input_guardrail_blocks_the_prompt_before_any_model_request():
     )
     assert entries[-1] == (
         "run_finished",
-        {"status": "blocked", "stop_reason": "no_account_numbers"},
+        {"status": "blocked", "stop_reason": "no_account_numbers", "output": None, "text": ""},
     )
 
 
@@ -110,7 +110,9 @@ async def test_a_guardrail_that_breaks_fails_the_run_closed():
     with pytest.raises(RuntimeError, match="classifier unavailable"):
         await Agent(model, input_guardrails=[broken]).run("hello", session=session)
     assert model.requests == [] and await session.messages() == []
-    assert (await session.entries())[-1].kind == "run_failed"
+    # The start of a run is written in one piece after the input guardrails ran, so a
+    # guardrail that breaks leaves nothing behind: no open run without its prompt.
+    assert await session.entries() == []
 
     def returns_false(ctx, message: Message) -> bool:
         return False  # looks like "block", but guardrails block by raising

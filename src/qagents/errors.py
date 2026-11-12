@@ -37,12 +37,33 @@ class ConfigurationError(QAgentsError):
     """The agent, a tool or a model was set up incorrectly."""
 
 
+class MaxDepthExceeded(ConfigurationError):
+    """A child run would nest deeper than ``Limits.max_depth``, so it was not started.
+
+    An agent used as a tool reports it to the calling model as an error result
+    (`prompts.SUBAGENT_TOO_DEEP`) instead of failing the tool call.
+    """
+
+    def __init__(self, message: str, *, depth: int, limit: int) -> None:
+        super().__init__(message)
+        self.depth = depth
+        """The depth the refused run would have had."""
+        self.limit = limit
+        """The ``Limits.max_depth`` that applies (the lowest along the chain of parent runs)."""
+
+
 class SessionError(QAgentsError):
     """A session could not be loaded, resumed or written."""
 
 
 class OutputValidationError(QAgentsError):
-    """The model's final answer did not match ``output_type`` after all retries."""
+    """The model's final answer did not match ``output_type`` after all retries.
+
+    Also raised when output validators keep rejecting it, or (``output_mode="tool"``)
+    when the model keeps answering without the final-answer tool. ``agent.run``
+    raises it rather than returning a `RunResult`; the run is journaled as
+    failed (``run_failed``) and can be resumed.
+    """
 
 
 class ToolError(QAgentsError):
@@ -134,6 +155,17 @@ class GuardrailTripped(QAgentsError):
         def no_account_numbers(ctx: RunContext, message: Message) -> None:
             if IBAN.search(message.text):
                 raise GuardrailTripped("the prompt contains an account number")
+
+    By design the reason is not sent to the model and the run does not
+    continue: ``RunResult.text`` and ``output`` are empty. To have the model
+    revise a blocked answer, start a new run on the same session with a prompt
+    of your own that says what to change. To ask for a correction within the
+    run instead, use an output validator that raises `ModelRetry`.
+
+    An output guardrail checks the completed answer: text already streamed
+    (``text_delta`` events, ``RunStream.text()``, ``model_responded``) cannot
+    be recalled. A front end that must not show a blocked answer holds back
+    the text until ``run_finished`` and checks ``result.status``.
 
     Args:
         reason: Why the value was blocked, for your code, logs and the journal.
@@ -263,7 +295,8 @@ class ModelError(QAgentsError):
 
 
 class ModelBadRequestError(ModelError):
-    """The provider rejected the request before running it (400, 404, 422)."""
+    """The provider rejected the request before running it: a 4xx other than 401, 402,
+    403, 408, 409 and 429 (400, 404, 413 and 422, for example), or a redirect (3xx)."""
 
 
 class ModelAuthenticationError(ModelError):
@@ -279,7 +312,7 @@ class ModelRateLimitError(ModelError):
 
 
 class ModelServerError(ModelError):
-    """The provider failed while handling the request (5xx)."""
+    """The provider failed while handling the request (5xx), or reported a conflict (409)."""
 
 
 class ModelConnectionError(ModelError):

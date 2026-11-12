@@ -17,11 +17,16 @@ a run outlives the request that started it and the process that ran it:
 How it fits together:
 
 - **Leases.** Before a run starts, the runtime takes the session's lease in
-  the store. A heartbeat renews it every ``heartbeat_s`` seconds, and every
+  the store. A heartbeat renews it every ``heartbeat_s`` seconds from the
+  moment it is taken (also while the run is prepared or queued), and every
   journal write is checked against it in the same transaction
   (`SessionStore.append_leased`), so at most one worker writes to a run at a
   time, even after a network partition. A worker that finds its lease taken
   over stops its run.
+- **Start.** `AgentRuntime.start` journals the new run (its ``run_started``
+  entry and the prompt) before it returns, also when the run then waits for
+  a free slot. A run that start() accepted is therefore never lost: after a
+  shutdown or a crash it is open in the journal and is recovered.
 - **Recovery.** `AgentRuntime.recover` lists the sessions whose run is
   ``"running"`` or ``"failed"``, takes each free or expired lease and resumes
   the run with the agent named in the journal. Paused runs wait for a
@@ -29,10 +34,10 @@ How it fits together:
   ``poll_interval_s`` seconds.
 - **Shutdown.** `AgentRuntime.shutdown` asks each run to stop at the next
   safe point (before a model request, after a model response, or after a
-  tool call when no other tool is running), cancels runs that do not reach
-  one in time, and releases the leases. The runs stay open in the journal,
-  so another worker resumes them at once instead of waiting for a lease to
-  expire.
+  tool call when no tool of the run is executing and no journal write is in
+  flight), cancels runs that do not reach one in time, and releases the
+  leases. The runs stay open in the journal, so another worker resumes them
+  at once instead of waiting for a lease to expire.
 
 Delivery guarantees, stated plainly. They are the journal's guarantees; the
 runtime adds liveness, not exactly-once execution:
@@ -43,21 +48,43 @@ runtime adds liveness, not exactly-once execution:
   otherwise the model is told its outcome is unknown. Delivery is
   at-least-once: give tools with side effects ``ctx.operation_id`` as an
   idempotency key.
-- A model request that was in flight when the worker died is sent again on
+- A model request that was in flight when the worker *died* is sent again on
   recovery. Its first response was lost, so this costs tokens; no tool had
-  acted on it.
+  acted on it. This is the one case where recovery repeats a request that
+  may have been billed: the journal cannot tell a request cut off by a
+  crash from one that was never sent.
 - A run that failed (it raised, for example on a provider error) is resumed
-  automatically until it has failed ``max_failures`` times. Set
-  ``max_failures=0`` to leave failed runs to a person.
+  automatically until it has failed ``max_failures`` times, except when its
+  last model request failed *ambiguously* (the provider may have processed
+  and billed it; ``ModelError.ambiguous``) and the run's limits do not set
+  ``retry_ambiguous=True``. Such a run waits for a person, who resumes it
+  with `AgentRuntime.resume`. Set ``max_failures=0`` to leave every failed
+  run to a person.
+- A run whose worker dies on every attempt (a tool or a response that
+  crashes the process) is resumed at most ``max_recoveries`` times in a row
+  without making progress (a new message or tool result); then it is marked
+  failed for a person.
+- Limits given to `AgentRuntime.start` or `AgentRuntime.resume` are journaled,
+  so a run recovered on another worker keeps them.
 - Liveness depends on a worker calling `recover` (or `run_forever`). A run
   whose worker died is resumed once its lease expires, after at most
   ``lease_ttl_s`` plus ``poll_interval_s`` seconds.
 
-Rules for the store: every run on sessions that a runtime recovers must go
-through a runtime. A run started with plain ``agent.run`` holds no lease, so
-a worker would take it for a dead run and resume it while it is still
-running. Sessions that belong to a `qagents.workflow.Workflow` (ids starting
-with ``"workflow:"``) are never recovered: resume the workflow instead.
+Journal entries the runtime adds to a run (readers ignore kinds they do not
+know): ``runtime_limits`` (``limits``: the `Limits` the run was started or
+resumed with) and ``run_recovered`` (``worker``, ``status``: an automatic
+recovery resumed the run; a recovery that a shutdown stops before then is not
+journaled or counted). A ``run_failed`` entry the runtime writes for a crash loop
+has ``needs_person: true``.
+
+Rules for the store: a plain ``agent.run`` or ``agent.resume`` on a store with
+leases holds a lease of its own while it executes, so `recover` leaves it
+alone; continuing a session with ``result.session`` is safe. A store subclass
+that overrides ``append`` but not ``append_leased`` gets no lease from a
+plain run, and under a runtime its ``append`` is bypassed (every write goes
+through ``append_leased``): override both. Sessions that belong to a
+`qagents.workflow.Workflow` (ids starting with ``"workflow:"``) are never
+recovered: resume the workflow instead.
 """
 
 from __future__ import annotations
@@ -70,7 +97,7 @@ import os
 import socket
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from .errors import ConfigurationError, RunInterrupted, SessionError
@@ -80,8 +107,8 @@ from .events import (
     ModelResponded,
     RunFinished,
     RunStarted,
+    StateUpdated,
     ToolCallFinished,
-    ToolCallStarted,
     TurnStarted,
 )
 from .session import Entry, LeaseError, Session, SessionStatus, SessionStore
@@ -96,11 +123,13 @@ logger = logging.getLogger("qagents.runtime")
 HandleStatus = Literal["queued", "running", "finished", "failed", "interrupted"]
 """Where a `RunHandle` stands.
 
-* ``queued``: waiting for a free slot (``max_concurrent``).
+* ``queued``: waiting for a free slot (``max_concurrent``). A started run is
+  already journaled while it waits.
 * ``running``: the run is being driven.
 * ``finished``: the run returned a `RunResult` (completed, paused, cancelled, ...).
 * ``failed``: the run raised; the error is in ``RunHandle.error``.
-* ``interrupted``: shutdown or a lost lease stopped it; the run stays open.
+* ``interrupted``: shutdown or a lost lease stopped it; the run stays open
+  (`RunInterrupted` says how to continue it).
 """
 
 DepsFactory = Callable[[str], Any]
@@ -109,7 +138,17 @@ DepsFactory = Callable[[str], Any]
 WORKFLOW_PREFIX = "workflow:"
 """Sessions whose id starts with this belong to a workflow and are not recovered."""
 
+LIMITS_KIND = "runtime_limits"
+"""Journal entry with the `Limits` a run was started or resumed with (``limits``)."""
+
+RECOVERED_KIND = "run_recovered"
+"""Journal entry written when a run that `AgentRuntime.recover` took resumes (``worker``,
+``status``); `AgentRuntime` counts them for ``max_recoveries``."""
+
 _RECOVERABLE = ("running", "failed")
+_PROGRESS = frozenset({"message", "tool_result", "run_failed"})
+"""Entry kinds after which a run's recoveries in a row are counted from zero again."""
+_SAFE_AFTER = (TurnStarted, ModelResponded, AgentSwitched, ToolCallFinished)
 
 
 class RunHandle:
@@ -120,7 +159,15 @@ class RunHandle:
     """
 
     def __init__(
-        self, runtime: AgentRuntime, session_id: str, agent: str, *, resumed: bool, buffer: int
+        self,
+        runtime: AgentRuntime,
+        session_id: str,
+        agent: str,
+        *,
+        resumed: bool,
+        buffer: int,
+        answers: bool = False,
+        unsaved: Iterable[str] = (),
     ) -> None:
         self.session_id = session_id
         self.agent = agent
@@ -141,11 +188,21 @@ class RunHandle:
         self._changed = asyncio.Event()
         self._done = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._heartbeat: asyncio.Task[None] | None = None
+        """Renews the lease from the moment it is taken, through preparation and the run."""
         self._stream: RunStream | None = None
+        self._prepared: RunStream | None = None
+        """A started run's stream, already journaled, until the handle drives it."""
+        self._store: _LeasedStore | None = None
         self._cancel_reason: str | None = None
         self._stop_requested = False
+        self._wake_up = asyncio.Event()
+        """Set by `cancel` and by a stop request: a queued run stops waiting for its slot."""
         self._lease_lost = False
-        self._tools_running: set[str] = set()
+        self._answers = answers
+        """The run was resumed with approvals or results it has not finished using."""
+        self._unsaved = set(unsaved)
+        """Arguments given to resume() (``state``, ``limits``) not journaled yet."""
 
     @property
     def session(self) -> Session:
@@ -174,12 +231,15 @@ class RunHandle:
 
         The run ends with ``status == "cancelled"`` and is closed in the
         journal; it is not resumed later. A run that is still queued is
-        cancelled as soon as it starts. To stop a worker but keep its runs
-        open, use `AgentRuntime.shutdown` instead.
+        cancelled at once, without waiting for a slot (a cancel runs no model
+        request and no tool), and a shutdown that comes later still lets it
+        close. To stop a worker but keep its runs open, use
+        `AgentRuntime.shutdown` instead.
         """
         if self._done.is_set():
             return
         self._cancel_reason = reason
+        self._wake_up.set()
         if self._stream is not None:
             self._stream.cancel(reason)
 
@@ -221,10 +281,13 @@ class RunHandle:
     # -- used by the runtime -----------------------------------------------------------
 
     def _publish(self, event: Event) -> None:
-        if isinstance(event, ToolCallStarted):
-            self._tools_running.add(event.call.id)
-        elif isinstance(event, ToolCallFinished):
-            self._tools_running.discard(event.call.id)
+        if isinstance(event, RunStarted):
+            self.run_id = event.run_id
+        elif isinstance(event, TurnStarted | ModelResponded | AgentSwitched):
+            self._answers = False  # the answered turn is over: every answer was used
+            self._unsaved.discard("state")  # journaled right after the run started
+        elif isinstance(event, StateUpdated):
+            self._unsaved.discard("state")
         self._events.append(event)
         self._published += 1
         self._wake()
@@ -234,13 +297,24 @@ class RunHandle:
         changed.set()
 
     def _at_safe_point(self, event: Event) -> bool:
-        """True when stopping right after ``event`` interrupts no model request or tool."""
-        if isinstance(event, (RunStarted, TurnStarted, ModelResponded, AgentSwitched)):
-            return True
-        return isinstance(event, ToolCallFinished) and not self._tools_running
+        """True when stopping right after ``event`` interrupts no model request or tool.
+
+        Asked of the run itself, not of the events seen so far: tool calls of a
+        group run ahead of the consumer, so a call may already execute while its
+        ``ToolCallStarted`` still waits in the queue. Answers given to a resume
+        are only in memory until the answered turn is over, so no point before
+        that is safe.
+        """
+        if self._answers or not isinstance(event, _SAFE_AFTER):
+            return False
+        run = getattr(self._stream, "_run", None)
+        if run is not None and getattr(run, "_running", None):
+            return False  # a tool call journaled its start and has no result yet
+        return self._store is None or self._store.writing == 0
 
     def _request_stop(self) -> None:
-        self._stop_requested = True  # a queued run checks it when it gets a slot
+        self._stop_requested = True
+        self._wake_up.set()
 
     def _finish(
         self,
@@ -252,6 +326,9 @@ class RunHandle:
         self.status, self.result, self.error = status, result, error
         self._done.set()
         self._wake()
+
+
+OpenStream = Callable[[Session, Any, "Limits | None"], "RunStream"]
 
 
 class AgentRuntime:
@@ -281,7 +358,13 @@ class AgentRuntime:
         max_failures: `recover` stops resuming a failed run once it has failed
             this many times (`SessionStatus.failures`, counted in the journal
             and shared by all workers). ``0`` leaves every failed run to a
-            person; ``None`` retries without a limit.
+            person; ``None`` retries without a limit. A run whose last
+            failure was an ambiguous model error is never resumed
+            automatically (see the module documentation).
+        max_recoveries: `recover` stops resuming a run whose worker died once
+            it was recovered this many times in a row without progress (no
+            new message or tool result in between), and marks it failed for
+            a person. ``None`` recovers without a limit.
         session_prefix: When set, `recover` considers only sessions whose id
             starts with it, so several applications can share one store.
         event_buffer: Events each `RunHandle` keeps for late subscribers.
@@ -301,6 +384,7 @@ class AgentRuntime:
         max_concurrent: int = 8,
         deps_factory: DepsFactory | None = None,
         max_failures: int | None = 3,
+        max_recoveries: int | None = 5,
         session_prefix: str | None = None,
         event_buffer: int = 4096,
     ) -> None:
@@ -318,6 +402,10 @@ class AgentRuntime:
             raise ConfigurationError(
                 f"max_failures must be None or at least 0, not {max_failures}."
             )
+        if max_recoveries is not None and max_recoveries < 1:
+            raise ConfigurationError(
+                f"max_recoveries must be None or at least 1, not {max_recoveries}."
+            )
         if event_buffer < 1:
             raise ConfigurationError(f"event_buffer must be at least 1, not {event_buffer}.")
         self.store = store
@@ -328,15 +416,21 @@ class AgentRuntime:
         self.max_concurrent = max_concurrent
         self.deps_factory = deps_factory
         self.max_failures = max_failures
+        self.max_recoveries = max_recoveries
         self.session_prefix = session_prefix
         self.event_buffer = event_buffer
         self._slots = asyncio.Semaphore(max_concurrent)
         self._handles: dict[str, RunHandle] = {}
         self._claiming: set[str] = set()
+        self._claims_idle = asyncio.Event()
+        self._claims_idle.set()
         self._closing = asyncio.Event()
-        self._background: set[asyncio.Future[None]] = set()
+        self._background: set[asyncio.Future[Any]] = set()
         self._skipped: set[tuple[str, str]] = set()
         """Sessions recover() already logged as skipped, with the reason."""
+        self._held_back: dict[str, tuple[str | None, int, str]] = {}
+        """Sessions recover() leaves to a person, with the (run id, failures, status) seen,
+        so later polls skip them without a lease write until their journal changes."""
 
     def __repr__(self) -> str:
         return (
@@ -373,8 +467,12 @@ class AgentRuntime:
     ) -> RunHandle:
         """Start a run in the background, as ``agent.stream`` would.
 
-        Takes the session's lease before returning. Like ``agent.run``, a new
-        run on a session whose run is paused or failed closes that run first.
+        Takes the session's lease and journals the run (``run_started``, the
+        ``state`` values and the prompt) before returning, so a run that waits
+        for a free slot is not lost when the worker stops or dies. Like
+        ``agent.run``, a new run on a session whose run is paused or failed
+        closes that run first. Input guardrails and the toolkits' loading run
+        here, outside ``max_concurrent``.
 
         Args:
             agent_name: Name of a registered agent.
@@ -384,20 +482,24 @@ class AgentRuntime:
             deps: Passed to tools and hooks as ``ctx.deps``. When left out,
                 ``deps_factory`` builds it.
             state: Values merged into the session state when the run starts.
-            limits: Replaces the agent's limits for this run.
+            limits: Replaces the agent's limits for this run. They are
+                journaled, so the run keeps them when another worker recovers it.
 
         Raises:
             LeaseError: Another worker is driving this session, or this
                 runtime already runs it.
             ConfigurationError: No agent has that name.
+            RuntimeError: The runtime is shut down.
+            Exception: What the run raised before it was journaled (nothing
+                to run, an input guardrail that failed, a session in use).
         """
         agent = self._agent(agent_name)
         session_id = session_id or uuid.uuid4().hex
 
-        def open_stream(session: Session, deps: Any) -> RunStream:
+        def open_stream(session: Session, deps: Any, limits: Limits | None) -> RunStream:
             return agent.stream(prompt, deps=deps, session=session, state=state, limits=limits)
 
-        return await self._begin(session_id, agent, open_stream, deps, resumed=False)
+        return await self._begin(session_id, agent, open_stream, deps, resumed=False, limits=limits)
 
     async def resume(
         self,
@@ -413,7 +515,8 @@ class AgentRuntime:
 
         The run is resumed on the agent that started it, as recorded in the
         journal. Use it to answer a paused run, or to resume an interrupted
-        or failed one right away.
+        or failed one right away: a person may resume a run that `recover`
+        leaves alone (an ambiguous failure, a crash loop).
 
         Args:
             session_id: The session whose run is unfinished.
@@ -421,12 +524,15 @@ class AgentRuntime:
             results: Results for ``result.pending_inputs``.
             deps: Passed to tools and hooks; ``deps_factory`` builds it when left out.
             state: Values merged into the session state when the run resumes.
-            limits: Replaces the agent's limits for the resumed run.
+            limits: Replaces the run's limits from now on (journaled). When
+                left out, the limits the run was started with through this
+                runtime apply, else the agent's.
 
         Raises:
             SessionError: The session has no unfinished run.
             LeaseError: Another worker is driving this session.
             ConfigurationError: The run's agent is not registered here.
+            RuntimeError: The runtime is shut down.
         """
         status = await self.store.status(session_id)
         if status.open_run_id is None:
@@ -436,13 +542,17 @@ class AgentRuntime:
             )
         agent = self._agent(status.agent)
 
-        def open_stream(session: Session, deps: Any) -> RunStream:
+        def open_stream(session: Session, deps: Any, limits: Limits | None) -> RunStream:
             return agent.resume_stream(
                 session, approvals=approvals, results=results, deps=deps, state=state,
                 limits=limits,
             )  # fmt: skip
 
-        return await self._begin(session_id, agent, open_stream, deps, resumed=True)
+        return await self._begin(
+            session_id, agent, open_stream, deps, resumed=True, limits=limits,
+            answers=bool(approvals or results),
+            unsaved=[name for name, given in (("state", state), ("limits", limits)) if given],
+        )  # fmt: skip
 
     # -- recovery --------------------------------------------------------------------
 
@@ -451,11 +561,18 @@ class AgentRuntime:
 
         Looks for sessions whose run is ``"running"`` or ``"failed"`` and whose
         lease is free or expired, takes the lease and resumes the run with
-        the agent named in the journal (``deps`` from ``deps_factory``).
-        Sessions are skipped, with a log message, when the agent is not
-        registered here or when a failed run has reached ``max_failures``.
-        Paused runs are never resumed. When two workers recover at once,
-        the lease decides: each run is taken by exactly one of them.
+        the agent named in the journal (``deps`` from ``deps_factory``, the
+        limits journaled for the run). Sessions are skipped, with a log
+        message, when the agent is not registered here, when a failed run has
+        reached ``max_failures`` or failed ambiguously, or when a run is in a
+        crash loop (``max_recoveries``). Paused runs are never resumed. When
+        two workers recover at once, the lease decides: each run is taken by
+        exactly one of them.
+
+        A session whose listed lease is held by another worker and has not
+        expired is passed over without a write. The check uses this process's
+        clock; with `PostgresStore` (the database's clock) a skew between the
+        two only delays the takeover by that much.
 
         Args:
             limit: Resume at most this many runs. Defaults to the free slots
@@ -468,6 +585,9 @@ class AgentRuntime:
         if room <= 0:
             return []
         candidates = await self.store.list_sessions(status=_RECOVERABLE, prefix=self.session_prefix)
+        listed = {candidate.session_id for candidate in candidates}
+        self._skipped = {key for key in self._skipped if key[0] in listed}
+        self._held_back = {key: seen for key, seen in self._held_back.items() if key in listed}
         handles: list[RunHandle] = []
         for candidate in candidates:
             if len(handles) >= room or self._closing.is_set():
@@ -475,6 +595,10 @@ class AgentRuntime:
             session_id = candidate.session_id
             if session_id in self._handles or session_id in self._claiming:
                 continue
+            if candidate.lease_owner not in (None, self.worker_id) and candidate.lease_active():
+                continue  # another worker drives it; acquire_lease would only refuse
+            if self._held_back.get(session_id) == _seen(candidate):
+                continue  # left to a person, and nothing changed since
             if self._skip_reason(candidate) is not None:
                 continue
             handle = await self._recover_one(session_id)
@@ -500,25 +624,42 @@ class AgentRuntime:
     async def shutdown(self, timeout_s: float = 10.0) -> None:
         """Stop this worker and keep its runs open and resumable.
 
-        No new runs start. Each run is asked to stop at its next safe point:
-        before a model request, after a model response, or after a tool call
-        when no other tool is running. Runs still going after ``timeout_s``
-        seconds are cancelled, which interrupts their model request or tool
-        call (see the delivery guarantees in the module documentation).
-        Leases are released, so another worker can resume the runs at once.
-        Their handles end with status ``"interrupted"``.
+        No new runs start: a `start`, `resume` or `recover` still taking its
+        lease when shutdown begins either backs out (releasing the lease) or
+        hands its run to the shutdown like the others. Each run is asked to
+        stop at its next safe point: before a model request, after a model
+        response, or after a tool call when no tool of the run is executing.
+        A run resumed with approvals or results first finishes the turn they
+        answer. Runs still going after ``timeout_s`` seconds are cancelled,
+        which interrupts their model request or tool call (see the delivery
+        guarantees in the module documentation). A run that `RunHandle.cancel`
+        was asked to cancel is closed as cancelled, not left open. Their
+        handles end with status ``"interrupted"``.
+
+        Leases are released before this returns, so another worker can resume
+        the runs at once, with one exception: a `start`, `resume` or `recover`
+        still preparing when ``timeout_s`` runs out (a slow ``deps_factory``,
+        say) is not waited for any longer. It backs out or stops at once when
+        its preparation ends, and releases its lease then; until then its
+        heartbeat keeps the lease.
         """
         self._closing.set()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(timeout_s, 0.0)
+        with contextlib.suppress(TimeoutError):  # claims in flight launch or back out
+            await asyncio.wait_for(self._claims_idle.wait(), max(deadline - loop.time(), 0.0))
         handles = list(self._handles.values())
         for handle in handles:
             handle._request_stop()
         tasks = [handle._task for handle in handles if handle._task is not None]
-        if not tasks:
-            return
-        _, late = await asyncio.wait(tasks, timeout=max(timeout_s, 0.0))
-        for task in late:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:
+            _, late = await asyncio.wait(tasks, timeout=max(deadline - loop.time(), 0.0))
+            for task in late:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # Lease releases (and stream closes) that a cancel left to run on their own.
+        while pending := [future for future in self._background if not future.done()]:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # -- internals -------------------------------------------------------------------
 
@@ -531,44 +672,99 @@ class AgentRuntime:
             )
         return agent
 
+    def _shut_down(self) -> RuntimeError:
+        return RuntimeError(
+            f"AgentRuntime {self.worker_id!r} is shut down. Create a new runtime to run agents."
+        )
+
     def _skip_reason(self, candidate: SessionStatus) -> str | None:
         """Why ``recover`` leaves this session alone, or None. Logs each reason once."""
-        reason: str | None = None
         if candidate.session_id.startswith(WORKFLOW_PREFIX):
             return "workflow"  # resumed by its workflow; not worth a log line
         if candidate.open_run_id is None:
             return "closed"
-        if (
-            candidate.status == "failed"
-            and self.max_failures is not None
-            and candidate.failures >= self.max_failures
-        ):
-            reason = (
-                f"its run failed {candidate.failures} times (max_failures={self.max_failures}); "
-                "resume it with runtime.resume() once the cause is fixed"
-            )
-        elif candidate.agent not in self.agents:
+        reason = self._failures_reason(candidate)
+        if reason is None and candidate.agent not in self.agents:
             reason = (
                 f"its run belongs to agent {candidate.agent!r}, which this worker does not have "
                 f"(registered: {sorted(self.agents)})"
             )
         if reason is not None:
-            key = (candidate.session_id, reason)
-            if key not in self._skipped:
-                self._skipped.add(key)
-                logger.warning(
-                    "Worker %s does not recover session %r: %s.",
-                    self.worker_id,
-                    candidate.session_id,
-                    reason,
-                )
+            self._log_skip(candidate.session_id, reason)
         return reason
 
+    def _failures_reason(self, status: SessionStatus) -> str | None:
+        """Why a failed run has failed too often to be resumed automatically, or None."""
+        if status.status != "failed" or self.max_failures is None:
+            return None
+        if status.failures < self.max_failures:
+            return None
+        return (
+            f"its run failed {status.failures} times (max_failures={self.max_failures}); "
+            "resume it with runtime.resume() once the cause is fixed"
+        )
+
+    def _log_skip(self, session_id: str, reason: str) -> None:
+        key = (session_id, reason)
+        if key not in self._skipped:
+            self._skipped.add(key)
+            logger.warning(
+                "Worker %s does not recover session %r: %s.", self.worker_id, session_id, reason
+            )
+
+    def _held_reason(
+        self, current: SessionStatus, entries: list[Entry], limits: Limits
+    ) -> tuple[str, bool] | None:
+        """Why the open run must wait for a person, and whether it is a crash loop to record."""
+        run_id = current.open_run_id
+        own = [entry for entry in entries if entry.run_id == run_id]
+        if current.status == "failed":
+            failure = next((entry for entry in reversed(own) if entry.kind == "run_failed"), None)
+            data = failure.data if failure is not None else {}
+            if data.get("needs_person"):
+                return f"{data.get('message') or 'it needs a person'}", False
+            if "ambiguous" not in data:
+                return (
+                    "its failure was journaled without saying whether its last model request "
+                    "may have been billed (an older qagents wrote it); resume it with "
+                    "runtime.resume() if sending it again is safe"
+                ), False
+            if data["ambiguous"] and not limits.retry_ambiguous:
+                return (
+                    f"its last model request failed ambiguously ({data.get('error_type')}): the "
+                    "provider may have processed and billed it, so it is not sent again "
+                    "automatically; resume it with runtime.resume() once that is safe, or "
+                    "start it with Limits(retry_ambiguous=True)"
+                ), False
+        if self.max_recoveries is not None:
+            attempts = 0
+            for entry in own:
+                if entry.kind == RECOVERED_KIND:
+                    attempts += 1
+                elif entry.kind in _PROGRESS:
+                    attempts = 0
+            if attempts >= self.max_recoveries:
+                return (
+                    f"it was recovered {attempts} times in a row without progress "
+                    f"(max_recoveries={self.max_recoveries}): its worker probably dies on it "
+                    "every time; find the cause, then resume it with runtime.resume()"
+                ), True
+        return None
+
     async def _recover_one(self, session_id: str) -> RunHandle | None:
-        self._claiming.add(session_id)
-        try:
-            if not await self.store.acquire_lease(session_id, self.worker_id, self.lease_ttl_s):
-                return None  # another worker is driving it, or won the race
+        with self._claim(session_id):
+            try:
+                if not await self.store.acquire_lease(session_id, self.worker_id, self.lease_ttl_s):
+                    return None  # another worker is driving it, or won the race
+            except Exception:
+                logger.warning(
+                    "Worker %s could not take the lease of session %r; it tries again later",
+                    self.worker_id,
+                    session_id,
+                    exc_info=True,
+                )
+                return None
+            handle: RunHandle | None = None
             try:
                 # The run may have ended between the listing and the lease.
                 current = await self.store.status(session_id)
@@ -576,6 +772,23 @@ class AgentRuntime:
                     await self._release(session_id)
                     return None
                 agent = self.agents[current.agent or ""]
+                handle = self._new_handle(session_id, agent, resumed=True)
+                entries = await self.store.load(session_id)
+                limits = _journaled_limits(entries, current.open_run_id)
+                held = self._held_reason(current, entries, limits or agent.limits)
+                if held is not None:
+                    reason, crash_loop = held
+                    if crash_loop:
+                        await self.store.append_leased(
+                            session_id,
+                            [_crash_loop_entry(current.open_run_id, reason)],
+                            self.worker_id,
+                        )
+                        current = await self.store.status(session_id)
+                    self._held_back[session_id] = _seen(current)
+                    self._log_skip(session_id, reason)
+                    await self._back_out(handle)
+                    return None
                 deps = await self._deps(session_id, None)
             except Exception:
                 logger.exception(
@@ -583,7 +796,18 @@ class AgentRuntime:
                     self.worker_id,
                     session_id,
                 )
-                await self._release(session_id)
+                if handle is None:
+                    await self._release(session_id)
+                else:
+                    await self._back_out(handle)
+                return None
+            except BaseException:
+                if handle is not None and handle._heartbeat is not None:
+                    handle._heartbeat.cancel()  # the lease expires; never renew it forever
+                raise
+            # No await from here to the launch, so a shutdown cannot slip in between.
+            if self._closing.is_set() or handle._lease_lost:
+                await self._back_out(handle)
                 return None
             logger.info(
                 "Worker %s recovers session %r (run %s, status %s, agent %r)",
@@ -594,33 +818,34 @@ class AgentRuntime:
                 agent.name,
             )
 
-            def open_stream(session: Session, deps: Any) -> RunStream:
-                return agent.resume_stream(session, deps=deps)
+            def open_stream(session: Session, deps: Any, limits: Limits | None) -> RunStream:
+                return agent.resume_stream(session, deps=deps, limits=limits)
 
-            return self._launch(session_id, agent, open_stream, deps, resumed=True)
-        finally:
-            self._claiming.discard(session_id)
+            recovered = {"worker": self.worker_id, "status": current.status}
+            return self._launch(
+                handle, open_stream, deps, limits=limits, journal=None, recovered=recovered
+            )
 
     async def _begin(
         self,
         session_id: str,
         agent: Agent,
-        open_stream: Callable[[Session, Any], RunStream],
+        open_stream: OpenStream,
         deps: Any,
         *,
         resumed: bool,
+        limits: Limits | None,
+        answers: bool = False,
+        unsaved: Iterable[str] = (),
     ) -> RunHandle:
         if self._closing.is_set():
-            raise RuntimeError(
-                f"AgentRuntime {self.worker_id!r} is shut down. Create a new runtime to run agents."
-            )
+            raise self._shut_down()
         if session_id in self._handles or session_id in self._claiming:
             raise LeaseError(
                 f"Session {session_id!r} already has a run in this runtime. Wait for "
                 f"runtime.get({session_id!r}) to finish before starting or resuming another."
             )
-        self._claiming.add(session_id)
-        try:
+        with self._claim(session_id):
             if not await self.store.acquire_lease(session_id, self.worker_id, self.lease_ttl_s):
                 holder = await self.store.status(session_id)
                 raise LeaseError(
@@ -628,28 +853,103 @@ class AgentRuntime:
                     "Wait for its run to stop; if that worker died, recover() takes the run "
                     "over once the lease expires."
                 )
+            # The heartbeat runs from now on: preparing the run (deps_factory, input
+            # guardrails, toolkits) may take longer than the lease lasts.
+            handle = self._new_handle(
+                session_id, agent, resumed=resumed, answers=answers, unsaved=unsaved
+            )
+            prepared: RunStream | None = None
+            journal = limits  # limits given here are journaled for a recovery
             try:
                 deps = await self._deps(session_id, deps)
+                if resumed and limits is None:
+                    status = await self.store.status(session_id)
+                    entries = await self.store.load(session_id)
+                    limits = _journaled_limits(entries, status.open_run_id)
+                if self._closing.is_set():
+                    raise self._shut_down()
+                if not resumed:
+                    # Journal the run now, under the lease: a run that waits for a slot is
+                    # then open in the journal, so a shutdown or a crash does not lose it.
+                    store = _LeasedStore(self.store, self.worker_id)
+                    prepared = open_stream(Session(store, session_id), deps, limits)
+                    if journal is not None:  # before the run starts: it governs the whole run
+                        await store.append(session_id, [_limits_entry(prepared.run_id, journal)])
+                        journal = None
+                    first = await prepared.__anext__()
+                if handle._lease_lost:
+                    raise LeaseError(
+                        f"Worker {self.worker_id!r} lost the lease of session {session_id!r} "
+                        "while it prepared the run: another worker took the session over."
+                    )
             except BaseException:
-                await self._release(session_id)
+                if prepared is not None:
+                    with contextlib.suppress(Exception):
+                        await prepared.aclose()
+                await self._back_out(handle)
                 raise
-            return self._launch(session_id, agent, open_stream, deps, resumed=resumed)
+            self._launch(handle, open_stream, deps, limits=limits, journal=journal)
+            if prepared is not None:
+                handle._prepared, handle._store = prepared, store
+                handle._publish(first)
+            if self._closing.is_set():  # shut down while the run was journaled: it stays open
+                handle._request_stop()
+            return handle
+
+    @contextlib.contextmanager
+    def _claim(self, session_id: str) -> Iterator[None]:
+        """Mark ``session_id`` as being taken; `shutdown` waits for claims in flight."""
+        self._claiming.add(session_id)
+        self._claims_idle.clear()
+        try:
+            yield
         finally:
             self._claiming.discard(session_id)
+            if not self._claiming:
+                self._claims_idle.set()
 
-    def _launch(
+    def _new_handle(
         self,
         session_id: str,
         agent: Agent,
-        open_stream: Callable[[Session, Any], RunStream],
-        deps: Any,
         *,
         resumed: bool,
+        answers: bool = False,
+        unsaved: Iterable[str] = (),
     ) -> RunHandle:
-        handle = RunHandle(self, session_id, agent.name, resumed=resumed, buffer=self.event_buffer)
-        self._handles[session_id] = handle
+        """A handle for a session whose lease was just taken; its heartbeat starts now."""
+        handle = RunHandle(
+            self, session_id, agent.name, resumed=resumed, buffer=self.event_buffer,
+            answers=answers, unsaved=unsaved,
+        )  # fmt: skip
+        handle._heartbeat = asyncio.create_task(
+            self._heartbeat(handle), name=f"qagents-lease:{session_id}"
+        )
+        return handle
+
+    async def _back_out(self, handle: RunHandle) -> None:
+        """Give up a handle that will not run: stop its heartbeat and release the lease."""
+        heartbeat = handle._heartbeat
+        if heartbeat is not None:
+            heartbeat.cancel()
+            await asyncio.wait([heartbeat])  # a renewal in flight ends before the release
+        if not handle._lease_lost:
+            await self._release(handle.session_id)
+
+    def _launch(
+        self,
+        handle: RunHandle,
+        open_stream: OpenStream,
+        deps: Any,
+        *,
+        limits: Limits | None,
+        journal: Limits | None,
+        recovered: Mapping[str, Any] | None = None,
+    ) -> RunHandle:
+        self._handles[handle.session_id] = handle
         task = asyncio.create_task(
-            self._drive(handle, open_stream, deps), name=f"qagents-run:{session_id}"
+            self._drive(handle, open_stream, deps, limits, journal, recovered),
+            name=f"qagents-run:{handle.session_id}",
         )
         task.add_done_callback(lambda _: self._settle(handle))
         handle._task = task
@@ -659,73 +959,169 @@ class AgentRuntime:
         """Finish a handle whose task was cancelled before it ever ran (so no finally ran)."""
         if handle.done():
             return
+        if handle._heartbeat is not None:
+            handle._heartbeat.cancel()
         if self._handles.get(handle.session_id) is handle:
             del self._handles[handle.session_id]
-        handle._finish("interrupted", error=self._interrupted(handle, "shutdown"))
-        release = asyncio.ensure_future(self._release(handle.session_id))
-        self._background.add(release)
-        release.add_done_callback(self._background.discard)
+        self._keep(asyncio.ensure_future(self._abandon(handle)))
+
+    async def _abandon(self, handle: RunHandle) -> None:
+        note: RunInterrupted | None = None
+        try:
+            if handle._prepared is not None:
+                with contextlib.suppress(Exception):
+                    await handle._prepared.aclose()
+            note = await self._interrupted(handle, "shutdown")
+            await self._back_out(handle)
+        finally:
+            handle._finish("interrupted", error=note or _interrupted_text(handle, "shutdown"))
+
+    def _keep(self, future: asyncio.Future[Any]) -> None:
+        """Keep a background task alive until it is done; `shutdown` waits for it."""
+        self._background.add(future)
+        future.add_done_callback(self._background.discard)
+
+    async def _slot(self, handle: RunHandle) -> bool:
+        """Wait for a free slot; a cancel or a stop request ends the wait. True: one is held."""
+        if handle._cancel_reason is not None or handle._stop_requested:
+            return False
+        acquire = asyncio.ensure_future(self._slots.acquire())
+        woken = asyncio.ensure_future(handle._wake_up.wait())
+        try:
+            await asyncio.wait({acquire, woken}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            acquire.cancel()
+            if acquire.done() and not acquire.cancelled():
+                self._slots.release()
+            raise
+        finally:
+            woken.cancel()
+        if acquire.done():
+            return True
+        acquire.cancel()
+        return False
 
     async def _drive(
-        self, handle: RunHandle, open_stream: Callable[[Session, Any], RunStream], deps: Any
+        self,
+        handle: RunHandle,
+        open_stream: OpenStream,
+        deps: Any,
+        limits: Limits | None,
+        journal: Limits | None,
+        recovered: Mapping[str, Any] | None,
     ) -> None:
         session_id = handle.session_id
-        heartbeat = asyncio.create_task(self._heartbeat(handle))
+        heartbeat = handle._heartbeat or asyncio.create_task(self._heartbeat(handle))
         status: HandleStatus = "interrupted"
         result: RunResult | None = None
         error: BaseException | None = None
+        why: str | None = "shutdown"
+        slot = False
+        stream: RunStream | None = handle._prepared
         try:
-            async with self._slots:
-                if handle._stop_requested:  # shut down while queued: nothing has run
-                    error = self._interrupted(handle, "shutdown")
-                    return
-                handle.status = "running"
-                stream = open_stream(
-                    Session(_LeasedStore(self.store, self.worker_id), session_id), deps
-                )
-                handle._stream = stream
-                if handle._cancel_reason is not None:
-                    stream.cancel(handle._cancel_reason)
-                async with stream:
-                    async for event in stream:
-                        if isinstance(event, RunStarted):
-                            handle.run_id = event.run_id
-                        elif isinstance(event, RunFinished):
-                            # Callers continue with result.session: give them the plain store.
-                            event.result._session = Session(self.store, session_id)
-                        handle._publish(event)
-                        if handle._stop_requested and handle._at_safe_point(event):
-                            break
+            slot = await self._slot(handle)
+            # A cancel is honoured even during shutdown: it closes the run, it runs nothing.
+            if handle._stop_requested and handle._cancel_reason is None:
+                return  # shut down while queued: nothing more has run
+            handle.status = "running"
+            if stream is None:
+                handle._store = _LeasedStore(self.store, self.worker_id)
+                stream = open_stream(Session(handle._store, session_id), deps, limits)
+            handle._stream = stream
+            if handle._cancel_reason is not None:
+                stream.cancel(handle._cancel_reason)
+            async with stream:
+                async for event in stream:
+                    if isinstance(event, RunStarted):
+                        await self._journal_start(handle, event, journal, recovered)
+                    elif isinstance(event, RunFinished):
+                        # Callers continue with result.session: give them the plain store (a
+                        # plain run on it takes a lease of its own, so recover() leaves it alone).
+                        event.result._session = Session(self.store, session_id)
+                    handle._publish(event)
+                    if (
+                        handle._stop_requested
+                        and handle._cancel_reason is None
+                        and handle._at_safe_point(event)
+                    ):
+                        break
             if stream.result is not None:
-                status, result = "finished", stream.result
-            else:
-                error = self._interrupted(handle, "shutdown")
+                status, result, why = "finished", stream.result, None
         except asyncio.CancelledError:
             why = "the worker lost its lease" if handle._lease_lost else "shutdown"
-            error = self._interrupted(handle, why)
             raise
         except Exception as raised:
             if handle._lease_lost or isinstance(raised, LeaseError):
                 handle._lease_lost = True
-                error = self._interrupted(handle, "the worker lost its lease")
-                error.__cause__ = raised
+                why, error = "the worker lost its lease", raised
             else:
                 logger.warning(
                     "Run of session %r raised %s; it stays open for a resume",
                     session_id,
                     type(raised).__name__,
                 )
-                status, error = "failed", raised
+                status, error, why = "failed", raised, None
         finally:
             heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
-            if not handle._lease_lost:
-                await self._release(session_id)
+            if slot:
+                self._slots.release()
+            # The outcome is known: record it on the handle even if a cancel (shutdown's, after
+            # its timeout) lands while the lease is released. The release goes on regardless.
+            wind_down = asyncio.ensure_future(self._wind_down(handle, heartbeat, stream, why))
+            self._keep(wind_down)
+            cancelled = False
+            try:
+                note = await asyncio.shield(wind_down)
+            except asyncio.CancelledError:
+                cancelled = True
+                note = _interrupted_text(handle, why) if why is not None else None
+            if note is not None:
+                note.__cause__ = error if error is not None else None
+                error = note
             if self._handles.get(session_id) is handle:
                 del self._handles[session_id]
             # Last, so a caller woken by wait() finds the lease released and the slot free.
             handle._finish(status, result=result, error=error)
+            if cancelled:
+                raise asyncio.CancelledError
+
+    async def _journal_start(
+        self,
+        handle: RunHandle,
+        event: RunStarted,
+        journal: Limits | None,
+        recovered: Mapping[str, Any] | None,
+    ) -> None:
+        """Journal what the runtime adds to a run that has just started or resumed."""
+        entries: list[Entry] = []
+        if journal is not None:
+            entries.append(_limits_entry(event.run_id, journal))
+        # A recovery counts towards max_recoveries only once the run has resumed, and not
+        # when a shutdown already stops it: it then stops before its first model request.
+        if recovered is not None and not handle._stop_requested:
+            entries.append(Entry(kind=RECOVERED_KIND, run_id=event.run_id, data=dict(recovered)))
+        if entries:
+            assert handle._store is not None
+            await handle._store.append(handle.session_id, entries)
+        handle._unsaved.discard("limits")
+
+    async def _wind_down(
+        self,
+        handle: RunHandle,
+        heartbeat: asyncio.Task[None],
+        stream: RunStream | None,
+        why: str | None,
+    ) -> RunInterrupted | None:
+        """Close the run, say how it was interrupted (``why``), and release the lease."""
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+        if stream is not None:  # a no-op when `async with stream` closed it already
+            with contextlib.suppress(Exception):
+                await stream.aclose()
+        note = await self._interrupted(handle, why) if why is not None else None
+        if not handle._lease_lost:
+            await self._release(handle.session_id)
+        return note
 
     async def _heartbeat(self, handle: RunHandle) -> None:
         session_id = handle.session_id
@@ -736,13 +1132,14 @@ class AgentRuntime:
                     self.store.renew_lease(session_id, self.worker_id, self.lease_ttl_s),
                     timeout=self.heartbeat_s,
                 )
-            except Exception:
+            except Exception as failure:
                 logger.warning(
-                    "Worker %s could not renew its lease on session %r; retrying",
+                    "Worker %s could not renew its lease on session %r (%s); retrying",
                     self.worker_id,
                     session_id,
-                    exc_info=True,
+                    type(failure).__name__,
                 )
+                logger.debug("The renewal failed with", exc_info=True)
                 continue
             if not held:
                 logger.error(
@@ -762,14 +1159,15 @@ class AgentRuntime:
                 self.store.release_lease(session_id, self.worker_id),
                 timeout=min(self.lease_ttl_s, 10.0),
             )
-        except Exception:
+        except Exception as failure:
             logger.warning(
-                "Worker %s could not release its lease on session %r; it expires in %g s",
+                "Worker %s could not release its lease on session %r (%s); it expires in %g s",
                 self.worker_id,
                 session_id,
+                type(failure).__name__,
                 self.lease_ttl_s,
-                exc_info=True,
             )
+            logger.debug("The release failed with", exc_info=True)
 
     async def _deps(self, session_id: str, deps: Any) -> Any:
         if deps is not None or self.deps_factory is None:
@@ -779,26 +1177,120 @@ class AgentRuntime:
             value = await value
         return value
 
-    def _interrupted(self, handle: RunHandle, why: str) -> RunInterrupted:
+    async def _interrupted(self, handle: RunHandle, why: str) -> RunInterrupted:
+        """The error of an interrupted handle, worded after what the journal holds now."""
+        timeout = min(self.lease_ttl_s, 10.0)
+        try:
+            stored = await asyncio.wait_for(self.store.status(handle.session_id), timeout)
+        except (Exception, asyncio.CancelledError):
+            return _interrupted_text(handle, why)
+        held: str | None = None
+        if stored.status == "failed":
+            try:
+                entries = await asyncio.wait_for(self.store.load(handle.session_id), timeout)
+            except (Exception, asyncio.CancelledError):
+                entries = None
+            held = self._failures_reason(stored)
+            agent = self.agents.get(stored.agent or "")
+            if held is None and entries is not None and agent is not None:
+                limits = _journaled_limits(entries, stored.open_run_id) or agent.limits
+                reason = self._held_reason(stored, entries, limits)
+                held = reason[0] if reason is not None else None
+        return _interrupted_text(handle, why, stored, held)
+
+
+def _interrupted_text(
+    handle: RunHandle, why: str, stored: SessionStatus | None = None, held: str | None = None
+) -> RunInterrupted:
+    """``stored``: the session's status after the stop, when it could be read; ``held``:
+    why `AgentRuntime.recover` leaves the run to a person, if it does."""
+    session_id = handle.session_id
+    lead = f"The run of session {session_id!r} was interrupted by {why} before it finished."
+    if stored is not None and stored.open_run_id is None:
+        return RunInterrupted(f"{lead} The journal has no open run left, so nothing continues it.")
+    if handle._unsaved:
+        given = " and ".join(f"{name}=" for name in sorted(handle._unsaved))
+        verb, them = ("were", "them") if len(handle._unsaved) > 1 else ("was", "it")
+        lead += f" The {given} given to resume() {verb} not journaled: pass {them} again."
+    if stored is not None and stored.status == "paused":
+        unused = " It had not used the approvals or results given to resume()." * handle._answers
         return RunInterrupted(
-            f"The run of session {handle.session_id!r} was interrupted by {why} before it "
-            f"finished. It stays open in the journal: runtime.resume({handle.session_id!r}) "
-            "continues it, and so does recover() on any worker."
+            f"{lead}{unused} It is still paused: call runtime.resume({session_id!r}, "
+            "approvals=..., results=...) with its answers. recover() never resumes a paused run."
         )
+    if held is not None:
+        text = f"{lead} It stays open in the journal, but recover() does not resume it: {held}."
+    else:
+        text = (
+            f"{lead} It stays open in the journal: runtime.resume({session_id!r}) continues it, "
+            "and so does recover() on any worker."
+        )
+    if handle._answers:
+        text += (
+            " Approvals or results given to resume() that it had not used yet are not kept: "
+            "the run asks for them again."
+        )
+    return RunInterrupted(text)
+
+
+def _seen(status: SessionStatus) -> tuple[str | None, int, str]:
+    return status.open_run_id, status.failures, status.status
+
+
+def _limits_entry(run_id: str, limits: Limits) -> Entry:
+    return Entry(kind=LIMITS_KIND, run_id=run_id, data={"limits": limits.model_dump(mode="json")})
+
+
+def _journaled_limits(entries: list[Entry], run_id: str | None) -> Limits | None:
+    """The limits last journaled for ``run_id`` (by a runtime, or in its ``run_started``)."""
+    from .agent import Limits
+
+    if run_id is None:
+        return None
+    for entry in reversed(entries):
+        if entry.run_id != run_id:
+            continue
+        if entry.kind == LIMITS_KIND or (entry.kind == "run_started" and "limits" in entry.data):
+            return Limits.model_validate(entry.data["limits"])
+    return None
+
+
+def _crash_loop_entry(run_id: str | None, reason: str) -> Entry:
+    message = f"recover() stopped resuming the run: {reason}"
+    return Entry(
+        kind="run_failed",
+        run_id=run_id,
+        data={
+            "error_type": "RecoveryLimitReached",
+            "message": message,
+            "retryable": False,
+            "ambiguous": False,
+            "error": f"RecoveryLimitReached: {message}",
+            "needs_person": True,
+        },
+    )
 
 
 class _LeasedStore(SessionStore):
-    """One run's view of the store: every write is checked against this worker's lease."""
+    """One run's view of the store: every write is checked against this worker's lease.
+
+    ``writing`` counts the writes in flight, so a stop never lands in the middle of one.
+    """
 
     def __init__(self, store: SessionStore, owner: str) -> None:
         self._store = store
         self._owner = owner
+        self.writing = 0
 
     async def append(self, session_id: str, entries: list[Entry]) -> None:
-        await self._store.append_leased(session_id, entries, self._owner)
+        await self.append_leased(session_id, entries, self._owner)
 
     async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
-        await self._store.append_leased(session_id, entries, owner)
+        self.writing += 1
+        try:
+            await self._store.append_leased(session_id, entries, owner)
+        finally:
+            self.writing -= 1
 
     async def load(self, session_id: str) -> list[Entry]:
         return await self._store.load(session_id)

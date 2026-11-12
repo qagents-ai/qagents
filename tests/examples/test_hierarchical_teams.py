@@ -21,7 +21,7 @@ from examples.patterns.hierarchical_teams import (
     search,
     uncovered,
 )
-from qagents import Usage
+from qagents import Usage, prompts
 from qagents.models.testing import FunctionModel, call
 
 EXPECTED_RUNS = [
@@ -123,7 +123,8 @@ async def test_max_depth_stops_the_level_below_it(tmp_path):
     assert result.status == "completed"
     assert sorted(tree.runs) == [(0, "manager"), (1, "research_lead"), (1, "writing_lead")]
     # The searchers refused to start at depth 2; the research lead reported it upward.
-    assert "Limits.max_depth is 1" in tool_result(result, "research_lead").content
+    refused = prompts.SUBAGENT_TOO_DEEP.format(name="searcher", depth=2, limit=1)
+    assert refused in tool_result(result, "research_lead").content
 
 
 async def test_the_managers_budget_caps_every_level(tmp_path):
@@ -131,12 +132,11 @@ async def test_the_managers_budget_caps_every_level(tmp_path):
     ctx = scripted_context(priced, tmp_path)
     tree = RunTree()
     result = await build_manager(ctx.model, hooks=[tree], max_cost_usd=0.025).run(BRIEF)
-    # The manager spent 0.01, its research lead 0.01 of the remaining 0.015, and each searcher
-    # started with the 0.005 left: one request each, then every level stopped at its share.
-    # The three searchers started together, each with that snapshot, so the tree spent 0.05:
-    # the overshoot of up to max_parallel runs that fan_out documents.
+    # The manager spent 0.01 and its research lead 0.01 of the remaining 0.015. The three
+    # searchers started together and share the 0.005 left live: one request spends it, the
+    # other searchers stop before sending theirs, and every level above stops at its share.
     assert (result.status, result.stop_reason) == ("limit_reached", "max_cost_usd")
-    assert ctx.meter.usage.requests == 5 and result.usage.cost_usd == pytest.approx(0.05)
+    assert ctx.meter.usage.requests == 3 and result.usage.cost_usd == pytest.approx(0.03)
     stopped = tool_result(result, "research_lead")
     assert stopped.is_error and "max_cost_usd" in stopped.content
     assert [name for _, name in tree.runs].count("searcher") == 3

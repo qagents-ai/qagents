@@ -52,7 +52,8 @@ async def test_an_agent_as_a_tool_works_in_its_own_conversation():
         result.usage.requests == 4 and result.usage.input_tokens == 40
     )  # all four requests counted
     nested = [e.event.type for e in events if e.type == "subagent_event"]
-    assert nested[:3] == ["turn_started", "model_responded", "tool_call_started"]
+    assert nested[:4] == ["run_started", "turn_started", "model_responded", "tool_call_started"]
+    assert "run_finished" not in nested  # its result is the tool result
     assert {e.agent for e in events if e.type == "subagent_event"} == {"researcher"}
 
 
@@ -91,6 +92,8 @@ async def test_handoff_switches_the_active_agent():
     )
     switched = next(e for e in events if e.type == "agent_switched")
     assert (switched.from_agent, switched.to_agent) == ("triage", "billing")
+    handoff_call = next(m for m in result.messages if m.role == "assistant").tool_calls[0]
+    assert switched.tool_call_id == handoff_call.id  # the call that made the switch
     assert result.agent == "billing" and result.output == "Your invoice total is 40 EUR."
     # The specialist continues the same conversation under its own instructions.
     sent = billing_model.requests[0].messages

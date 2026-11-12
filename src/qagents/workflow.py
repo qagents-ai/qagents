@@ -16,12 +16,17 @@ instead of running again, and the function continues where it stopped:
 Guarantees, stated plainly: a step that *finished* never runs again. A step
 that was in progress when the process died runs again from its start, except
 agent steps started with ``run_agent``, which resume inside the agent run at
-the exact tool call (see `session`). Make other side-effecting
-steps idempotent.
+the exact tool call (see `session`); an agent step whose run completed just
+before the process died, before the step was recorded, is recorded from the
+step's journal instead of running again. Make other side-effecting steps
+idempotent.
 
 Use ``asyncio.gather`` to run steps in parallel, or ``map`` to run one step
 per item with an optional bound on concurrency; branches do not wait for
-each other.
+each other. A sync function passed to ``step`` runs on the event loop and
+blocks it; ``map`` runs a sync function in a worker thread. To map an agent
+over items so that each item resumes inside its own run after a crash, call
+``run_agent`` once per item (``f"{name}[{index}]"``) under ``asyncio.gather``.
 
 Long waits (hours or days) do not keep a process alive. ``wait_for_signal``
 returns a value another process sent with `Workflow.send_signal`, and
@@ -72,11 +77,14 @@ from typing import Any, Literal, TypeVar
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from pydantic_core import PydanticSerializationError, to_jsonable_python
 
-from .agent import Agent, Prompt
+from .agent import Agent, Prompt, RunStream
 from .errors import ConfigurationError, SessionError, WorkflowSuspended
+from .events import Event
+from .messages import Message, Usage
 from .permissions import Approval
 from .results import RunResult
 from .session import (
+    Entry,
     PendingApproval,
     PendingInput,
     Session,
@@ -85,11 +93,15 @@ from .session import (
     advance_status,
     derive_state,
 )
+from .tools import _is_async_callable
 
 T = TypeVar("T")
 
 _SHARED_OPTIONS = ("deps", "limits", "settings")
 """Options of `Workflow.run_agent` that both ``agent.run`` and ``agent.resume`` accept."""
+
+EventCallback = Callable[[Event], Any]
+"""Called with every event of an agent step's run (`Workflow.run_agent`). May be async."""
 
 
 class AgentStepStatus(BaseModel):
@@ -166,7 +178,11 @@ class Workflow:
         return Session(self.store, id=f"workflow:{self.id}:{name}")
 
     async def completed_steps(self) -> dict[str, Any]:
-        """Names and recorded results of the steps that have finished."""
+        """Names and recorded results of the steps that have finished (a copy)."""
+        return dict(await self._completed_map())
+
+    async def _completed_map(self) -> dict[str, Any]:
+        """What this object remembers of the finished steps; the steps add to it."""
         if self._completed is None:
             await self._scan()
         assert self._completed is not None
@@ -185,13 +201,15 @@ class Workflow:
             name: The step's durable identity: unique within the workflow, and
                 the same on every run.
             function: Called without arguments; sync, or returning an awaitable.
+                A sync function runs on the event loop and blocks it while it
+                runs; wrap blocking work as ``lambda: asyncio.to_thread(work)``.
             type: Validate a recorded result into this type when it is replayed.
 
         Raises:
             ConfigurationError: Another step with this name is running at the
                 same time.
         """
-        completed = await self.completed_steps()
+        completed = await self._completed_map()
         if name in completed:
             return _revive(completed[name], type)
         with self._claim(name):
@@ -228,8 +246,11 @@ class Workflow:
         Args:
             name: Prefix of the item steps' names.
             items: The items, in order.
-            function: Called with one item; sync, or returning an awaitable.
-                Its result must be JSON-serialisable, as for `step`.
+            function: Called with one item; async, or sync (it then runs in a
+                worker thread, so sync items run concurrently too and do not
+                block the event loop; a sync function that returns an
+                awaitable has it awaited on the loop). Its result must be
+                JSON-serialisable, as for `step`.
             concurrency: How many items may run at once; ``None`` runs all of
                 them at once. Finished items do not count.
             type: Validate replayed results into this type, as for `step`.
@@ -249,15 +270,23 @@ class Workflow:
         values = list(items)
         if not values:
             return []
-        completed = await self.completed_steps()
+        completed = await self._completed_map()
         gate = asyncio.Semaphore(concurrency) if concurrency is not None else None
+
+        async def call(item: Any) -> Any:
+            if _is_async_callable(function):
+                return await function(item)
+            produced = await asyncio.to_thread(function, item)  # never block the loop
+            if inspect.isawaitable(produced):
+                produced = await produced
+            return produced
 
         async def run_item(index: int, item: Any) -> Any:
             step_name = f"{name}[{index}]"
             if gate is None or step_name in completed:
-                return await self.step(step_name, lambda: function(item), type=type)
+                return await self.step(step_name, lambda: call(item), type=type)
             async with gate:
-                return await self.step(step_name, lambda: function(item), type=type)
+                return await self.step(step_name, lambda: call(item), type=type)
 
         tasks = [asyncio.create_task(run_item(index, item)) for index, item in enumerate(values)]
         try:
@@ -283,6 +312,7 @@ class Workflow:
         approvals: Mapping[str, Approval | bool] | None = None,
         results: Mapping[str, Any] | None = None,
         state: Mapping[str, Any] | None = None,
+        on_event: EventCallback | None = None,
         **options: Any,
     ) -> RunResult:
         """Run an agent as a step, in its own durable session.
@@ -291,7 +321,18 @@ class Workflow:
         agent run is resumed rather than restarted. A run that pauses for
         approvals or inputs is returned as it is and not recorded as
         finished: call ``run_agent`` again with ``approvals`` or ``results``
-        to continue it.
+        to continue it. Calling it again without them resumes the run, which
+        checks the permissions again and pauses again for what still waits
+        (with a new ``run_paused`` entry); to read a paused step without
+        running anything, use `status`.
+
+        Only a ``completed`` run is recorded as the step's result. When the
+        step's run ended otherwise (blocked by a guardrail, at a limit,
+        cancelled), the next ``run_agent`` starts a new run in the step's
+        session: it sends ``prompt`` again, and the model sees the earlier
+        attempt. When the step's run completed but the process died before
+        the step was recorded, the result is rebuilt from the step's journal
+        and recorded, and the agent is not run again.
 
             result = await wf.run_agent("plan", planner, "Plan the launch")
             if result.status == "paused":
@@ -311,6 +352,10 @@ class Workflow:
                 ``agent.resume``.
             results: Results for the paused run's ``pending_inputs``.
             state: Values merged into the step session's state.
+            on_event: Called with every event of the run as it happens (sync
+                or async), to narrate a step live. If it raises, the run
+                stops and stays open (like a stream closed early); calling
+                ``run_agent`` again resumes it.
             **options: ``deps``, ``limits`` or ``settings``, passed to
                 ``agent.run`` or ``agent.resume``.
 
@@ -319,8 +364,10 @@ class Workflow:
                 and ``agent.resume`` accept, or another step with this name is
                 running at the same time.
             SessionError: ``results`` were given but the step has no open run
-                to give them to, or a recorded output no longer matches the
-                agent's ``output_type``.
+                to give them to, a recorded output no longer matches the
+                agent's ``output_type``, or the step's run completed without
+                being recorded and its journal (written before qagents 0.3)
+                cannot rebuild the result.
         """
         unknown = sorted(set(options) - set(_SHARED_OPTIONS))
         if unknown:
@@ -329,17 +376,26 @@ class Workflow:
                 "the step starts and to agent.resume() when it continues, so it accepts only "
                 f"the ones both take: {', '.join(_SHARED_OPTIONS)}."
             )
-        completed = await self.completed_steps()
+        completed = await self._completed_map()
         if name in completed:
             return self._revive_result(name, completed[name], agent)
         with self._claim(name):
             session = self.session(name)
-            current = await session.state()
+            entries = await session.entries()
+            current = derive_state(entries)
             if current.open_run_id is not None and current.messages:
-                result = await agent.resume(
+                stream = agent.resume_stream(
                     session, approvals=approvals, results=results, state=state, **options
                 )
+                result = await _drive(stream, on_event)
             else:
+                unrecorded = self._finished_unrecorded(name, session.id, entries)
+                if unrecorded is not None:  # completed, then the process died: record it now
+                    await self._journal.append(
+                        "workflow_step", {"name": name, "result": unrecorded}
+                    )
+                    completed[name] = unrecorded
+                    return self._revive_result(name, unrecorded, agent)
                 if results:
                     raise SessionError(
                         f"Workflow {self.id!r}: step {name!r} has no open run, so the results= "
@@ -348,7 +404,8 @@ class Workflow:
                         "start it."
                     )
                 await self._note_agent_step(name, session)
-                result = await agent.run(prompt, session=session, state=state, **options)
+                stream = agent.stream(prompt, session=session, state=state, **options)
+                result = await _drive(stream, on_event)
             if result.status == "completed":
                 recorded = to_jsonable_python(result)
                 await self._journal.append("workflow_step", {"name": name, "result": recorded})
@@ -547,6 +604,60 @@ class Workflow:
                 "workflow_agent_started", {"name": name, "session_id": session.id}
             )
 
+    def _finished_unrecorded(
+        self, name: str, session_id: str, entries: list[Entry]
+    ) -> dict[str, Any] | None:
+        """The recorded form of the step's latest run, when it completed but was not recorded."""
+        start = next(
+            (
+                index
+                for index in range(len(entries) - 1, -1, -1)
+                if entries[index].kind == "run_started"
+            ),
+            None,
+        )
+        if start is None:
+            return None
+        run_id = entries[start].run_id
+        own = [entry for entry in entries[start:] if entry.run_id == run_id]
+        finish = next((entry for entry in own if entry.kind == "run_finished"), None)
+        if finish is None or finish.data.get("status") != "completed":
+            return None  # still open, or ended otherwise: the step runs again
+        data = finish.data
+        if "output" not in data:
+            raise SessionError(
+                f"Workflow {self.id!r}: the agent run of step {name!r} completed, but the step "
+                "was not recorded (the process stopped in between), and its journal was written "
+                "by a qagents that does not keep the output with the run. Rather than run the "
+                "agent again, nothing was run: give the step a new name to run it again."
+            )
+        agent_name = entries[start].data.get("agent")
+        for entry in own:
+            if entry.kind == "agent_switched":
+                agent_name = entry.data.get("agent", agent_name)
+        state = derive_state(entries)
+        usage = state.run_usage
+        if added := data.get("added_usage"):
+            usage = usage.add(Usage.model_validate(added))
+        result = RunResult(
+            run_id=run_id or "",
+            session_id=session_id,
+            agent=agent_name or "",
+            status="completed",
+            stop_reason=data.get("stop_reason"),
+            output=data["output"],
+            text=data.get("text") or "",
+            messages=state.messages,
+            new_messages=[
+                Message.model_validate(entry.data["message"])
+                for entry in own
+                if entry.kind == "message"
+            ],
+            usage=usage,
+            turns=state.run_turns,
+        )
+        return to_jsonable_python(result)
+
     def _revive_result(self, name: str, recorded: Any, agent: Agent) -> RunResult:
         """A finished agent step's recorded result, with its output in the agent's type."""
         result = RunResult.model_validate(recorded)
@@ -568,6 +679,18 @@ class Workflow:
 
 def _journal_id(workflow_id: str) -> str:
     return f"workflow:{workflow_id}"
+
+
+async def _drive(stream: RunStream, on_event: EventCallback | None) -> RunResult:
+    """Run ``stream`` to its end, handing each event to ``on_event``."""
+    async with stream:
+        async for event in stream:
+            if on_event is not None:
+                outcome = on_event(event)
+                if inspect.isawaitable(outcome):
+                    await outcome
+    assert stream.result is not None
+    return stream.result
 
 
 def _revive(value: Any, type: Any) -> Any:

@@ -15,14 +15,17 @@ The loop, with its hook points:
 
 Hooks may read and change ``ctx.state``. A change made in ``before_model``,
 ``after_model``, ``before_tool`` or ``after_tool`` is journaled right after the
-hook returns; a change made in ``on_run_start`` or ``on_event`` is journaled at
-the next of those points or when the run stops. Changes made in
-``on_run_end`` are not saved.
+hook returns (a change in ``before_tool`` before the tool starts); a change
+made in ``on_run_start`` or ``on_event`` is journaled at the next of those
+points or when the run stops. Changes made in ``on_run_end``, and in
+``on_event`` for the run's last ``state_updated`` and its ``run_finished``
+event, are not saved: the run is already closed in the journal then.
 
 Calls of a tool declared ``deferred=True`` pass the permission check but run
-no tool hooks. A call whose tool raised `DeferToolCall` ran ``before_tool``
-but has no result yet, so ``after_tool`` does not run for it; a result
-supplied later with ``agent.resume(results=...)`` is recorded as given.
+no ``before_tool``. A call whose tool raised `DeferToolCall` ran
+``before_tool`` but has no result yet. Either way, the result supplied later
+with ``agent.resume(results=...)`` goes through ``after_tool`` before it is
+recorded, so hooks that check or redact results see it too.
 
 Child runs (an agent used as a tool, or any run started with ``parent=ctx``)
 use their own hooks plus the hooks of the parent run whose class sets
@@ -90,10 +93,17 @@ class Hooks:
     ) -> None:
         """The run finished (``result``), failed or was stopped (``error``).
 
-        ``error`` is the exception that failed the run, or the
-        ``asyncio.CancelledError`` or ``GeneratorExit`` that stopped it (a
-        cancelled task, or a stream closed before its end). A stopped run stays
-        open in the journal and can be resumed.
+        Called exactly once per run, and only for a run whose ``on_run_start``
+        was called: a run refused before it started (a bad approval token, a
+        session that is busy) reaches no hook. ``error`` is the exception that
+        failed the run (for an ``on_event`` hook that raised, that hook's own
+        exception), or the ``asyncio.CancelledError`` or ``GeneratorExit``
+        that stopped it (a cancelled task, or a stream closed before its end).
+        A stopped run stays open in the journal and can be resumed.
+
+        In a `HookChain` every hook's ``on_run_end`` is called even when an
+        earlier one raises, so tracers always close their spans; the first
+        exception is raised afterwards.
         """
 
 
@@ -142,5 +152,11 @@ class HookChain(Hooks):
     async def on_run_end(
         self, ctx: RunContext[Any], result: RunResult | None, error: BaseException | None
     ) -> None:
-        for hook in self.hooks:
-            await hook.on_run_end(ctx, result, error)
+        first: Exception | None = None
+        for hook in self.hooks:  # every hook, so each tracer closes what it opened
+            try:
+                await hook.on_run_end(ctx, result, error)
+            except Exception as raised:
+                first = first or raised
+        if first is not None:
+            raise first

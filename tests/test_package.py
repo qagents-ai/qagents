@@ -63,17 +63,27 @@ def test_qagents_works_when_the_optional_packages_are_missing():
         import sys
         for name in {OPTIONAL!r}:
             sys.modules[name] = None  # every import of it now fails
-        import qagents
+        import inspect, pydoc
+        import qagents, qagents.toolkits
         from qagents import *
         from qagents import AnthropicModel, MLflowHooks, PostgresStore
         try:
             from qagents import MCPToolkit
         except ImportError as error:
-            print("mcp:", "qagents[mcp]" in str(error))
+            print("from-import refused")
+        for module in (qagents, qagents.toolkits):
+            try:
+                module.MCPToolkit
+            except AttributeError as error:
+                print("mcp:", "qagents[mcp]" in str(error))
+            print(hasattr(module, "MCPToolkit"), "MCPToolkit" in dir(module))
+            pydoc.render_doc(module)
+            inspect.getmembers(module)
         """
     )
     assert done.returncode == 0, done.stderr
-    assert done.stdout.strip() == "mcp: True"
+    assert done.stdout.split("\n")[0] == "from-import refused"
+    assert done.stdout.strip().split("\n")[1:] == ["mcp: True", "False False"] * 2
 
 
 def test_lazy_names_resolve_to_their_modules():

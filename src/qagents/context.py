@@ -7,7 +7,7 @@ replaced by a shorter one. Three are included:
 |---|---|---|
 | `ToolResultClearing` | puts a placeholder in place of old tool results | no model request |
 | `SummarizingCompactor` | replaces older messages with a summary | one model request |
-| `CompactorChain` | tries compactors in order; the first result wins | what the winner costs |
+| `CompactorChain` | asks compactors in order, each on the previous result | what those cost |
 
 Clearing keeps every message, so the conversation keeps its shape; a summary is shorter but
 loses detail.
@@ -24,8 +24,19 @@ request (`next_request_tokens`: the tokens the provider reported for the last re
 estimate of the messages added since) with a threshold: ``trigger_tokens``, a
 ``trigger_fraction`` of the model's context window (``model.capabilities().context_length``), or
 the lower of the two when both are given. The first request of a run or of a resume has no
-previous response; the compactor then receives an empty response (no usage) and the whole
-history is estimated.
+previous response; the compactor then receives an empty response (no usage), and the
+compactors here estimate the whole request the run would send: the history, the system
+message, the tool definitions and the output schema (an ``instructions`` function is called
+once more for that, before every request when the provider reports no usage). A
+`CompactorChain` passes that estimate to each of its compactors as a stand-in response.
+Reasoning that providers are not sent back is not counted: a `ReasoningPart` counts only
+when it carries opaque provider data for replay, and the reasoning tokens of the last
+response count only when that response has such a part.
+
+**Summary requests.** The request `SummarizingCompactor` makes goes through the run's hooks
+(``before_model`` and ``after_model``), like every request of the loop: a hook that rewrites
+requests applies to it, and tracing hooks record it. A summary cut off by the token limit, or
+refused by the provider, never replaces the history: the compactor raises instead.
 
 **The journal keeps everything.** Compaction changes what is sent, not what happened. The
 replacement history is written to the session journal as one ``compaction`` entry; the earlier
@@ -60,10 +71,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Sequence
+from contextvars import ContextVar
 from typing import Any
 
 from . import prompts
-from .errors import ConfigurationError
+from .errors import ConfigurationError, ModelResponseError
+from .hooks import HookChain
 from .messages import (
     ImagePart,
     Message,
@@ -72,6 +85,7 @@ from .messages import (
     TextPart,
     ToolCallPart,
     ToolResultPart,
+    Usage,
 )
 from .models.base import (
     Model,
@@ -90,6 +104,11 @@ _TOOL_PART_TOKENS = 8
 _IMAGE_TOKENS = 1_000
 _TOOL_DEFINITION_TOKENS = 10
 
+_compaction_model: ContextVar[Model | None] = ContextVar("qagents_compaction_model", default=None)
+"""The model a compactor's own request goes to, set while the run's ``before_model`` hooks
+see that request (a request's hooks otherwise cannot tell it is not for the agent's model).
+The MLflow hooks name the request's span after it."""
+
 
 # --- token estimates -----------------------------------------------------------------
 
@@ -102,19 +121,23 @@ def estimate_tokens(
     A fast heuristic that needs no tokenizer: one token per four bytes of UTF-8 text, plus a
     fixed amount for structure. It counts
 
-    - text and reasoning text, tool-call names and argument JSON, and tool-result content, at
-      four bytes per token, which comes to about four characters per token for English and code,
-      two for Greek or Cyrillic and one and a third for Chinese or Japanese;
+    - text, tool-call names and argument JSON, and tool-result content, at four bytes per
+      token, which comes to about four characters per token for English and code, two for Greek
+      or Cyrillic and one and a third for Chinese or Japanese;
+    - the text of a `ReasoningPart` that carries opaque provider data, the same way. Reasoning
+      without it is never sent back to a provider (the OpenAI-compatible and QCloud adapters
+      drop all reasoning, the Anthropic adapter replays only its own signed blocks), so it is
+      not part of a request and not counted;
     - 4 tokens per message, for the role and separators;
     - 8 tokens per tool call and per tool result, for ids and framing;
     - 1,000 tokens per image, whatever its size (an image's base64 data is not counted as text);
     - for each tool definition in ``tools``: its name, description and parameter schema as
       compact JSON, plus 10 tokens.
 
-    Opaque provider data in a `ReasoningPart` is not counted. The estimate never decreases when
-    messages are added or text grows. Real counts depend on the model's tokenizer and on the
-    language, so treat this as a rough figure; use the provider's reported usage, or its
-    token-counting endpoint, when you need exact numbers.
+    The opaque data itself is not counted. The estimate never decreases when messages are added
+    or text grows. Real counts depend on the model's tokenizer and on the language, so treat
+    this as a rough figure; use the provider's reported usage, or its token-counting endpoint,
+    when you need exact numbers.
 
     Args:
         messages: The messages to estimate.
@@ -128,7 +151,7 @@ def estimate_tokens(
     for message in messages:
         fixed += _MESSAGE_TOKENS
         for part in message.parts:
-            if isinstance(part, TextPart | ReasoningPart):
+            if isinstance(part, TextPart) or (isinstance(part, ReasoningPart) and part.opaque):
                 size += _utf8_size(part.text)
             elif isinstance(part, ToolCallPart):
                 fixed += _TOOL_PART_TOKENS
@@ -172,13 +195,18 @@ def next_request_tokens(messages: Sequence[Message], last_response: ModelRespons
     """Estimate the input tokens of the next request.
 
     Starts from the tokens the provider reported for the last request, input plus output (the
-    output is part of the history now), and adds `estimate_tokens` for the messages that joined
-    the history after that response, typically tool results. This keeps a single large tool
-    result from slipping past a threshold that the last request was still under.
+    output is part of the history now; ``last_response.context_tokens`` when the provider set
+    it, because ``usage`` then sums several requests), and adds `estimate_tokens` for the
+    messages that joined the history after that response, typically tool results. This keeps
+    a single large tool result from slipping past a threshold that the last request was still
+    under. The reasoning tokens of the output are left out unless the response holds a
+    `ReasoningPart` with opaque provider data, the only reasoning that is sent back.
 
     When there is no response, or the provider reported no tokens, the whole history is
-    estimated instead. That estimate leaves out the system message and the tool definitions,
-    which a compactor does not see.
+    estimated instead. That estimate leaves out the system message, the tool definitions and
+    the output schema, which are not in ``messages``. The compactors included here add them
+    before the first request of a run or a resume: they pass a stand-in response whose usage
+    is the estimate of the request the run would send.
 
     Args:
         messages: The history the next request will send, without the system message.
@@ -187,12 +215,18 @@ def next_request_tokens(messages: Sequence[Message], last_response: ModelRespons
     Returns:
         The estimated number of input tokens.
     """
-    reported = 0
-    if last_response is not None:
-        reported = last_response.usage.input_tokens + last_response.usage.output_tokens
+    if last_response is None:
+        return estimate_tokens(messages)
+    usage = last_response.usage
+    boundary = _last_assistant_index(messages)
+    if last_response.context_tokens is not None and last_response.context_tokens > 0:
+        # Already the size of the last request alone; its reasoning share is not known.
+        return last_response.context_tokens + estimate_tokens(messages[boundary + 1 :])
+    reported = usage.input_tokens + usage.output_tokens
     if reported <= 0:
         return estimate_tokens(messages)
-    boundary = _last_assistant_index(messages)
+    if not _replays_reasoning(last_response.message):
+        reported -= min(usage.reasoning_tokens, usage.output_tokens)
     return reported + estimate_tokens(messages[boundary + 1 :])
 
 
@@ -261,7 +295,11 @@ class Compactor:
             messages: The history the next request would send, without the system message.
             last_response: The previous model response of the run. Its usage says how large
                 the last request was. Before the first request of a run or a resume it is an
-                empty assistant response with no usage.
+                empty assistant response with no usage, except in a `CompactorChain`, which
+                passes a stand-in whose usage estimates the whole first request (system
+                message and tool definitions included). In a `CompactorChain`, after an
+                earlier compactor shortened the history, it is a copy whose usage is the size
+                of the shortened request.
             model: The model the next request goes to.
 
         Returns:
@@ -403,6 +441,7 @@ class ToolResultClearing(_ThresholdCompactor):
         last_response: ModelResponse | None,
         model: Model,
     ) -> list[Message] | None:
+        last_response = await _sized(ctx, messages, last_response)
         if not await self.triggered(messages, last_response, model):
             return None
         boundary = _last_assistant_index(messages)
@@ -469,14 +508,20 @@ class SummarizingCompactor(_ThresholdCompactor):
 
     Once the next request reaches the threshold, everything except the most recent
     ``keep_last`` messages is rendered as a plain transcript (`render_transcript`) and
-    summarised by ``model`` when given, otherwise by the agent's own model; the summary request
-    is counted in the run's usage. The summary, prefixed with ``prompts.SUMMARY_PREFIX``, takes
-    the place of those messages as one user message. The kept tail never starts with a tool
-    result, so a tool call is never separated from its result. System messages at the start of
-    the history are kept as they are. When the older part is only an earlier summary, nothing
-    is summarised again.
+    summarised by ``model`` when given, otherwise by the agent's own model. The summary request
+    goes through the run's hooks (``before_model``, ``after_model``) like any request of the
+    loop, and is counted in the run's usage. The summary, prefixed with
+    ``prompts.SUMMARY_PREFIX``, takes the place of those messages as one user message. The kept
+    tail never starts with a tool result, so a tool call is never separated from its result.
+    System messages at the start of the history are kept as they are. When the older part is
+    only an earlier summary, nothing is summarised again.
 
         agent = Agent(model, compactor=SummarizingCompactor(trigger_fraction=0.8, keep_last=8))
+
+    A summary that was cut off (``finish_reason == "length"``), refused (``"content_filter"``)
+    or empty never replaces the history. The compactor raises `ModelResponseError` instead,
+    which ends the run: keeping the history would make the next request summarise the whole
+    transcript again, at the same price and most likely with the same result.
 
     The summary rewrites almost the whole history, so a provider's prompt cache starts over
     after it, and reasoning from the summarised turns is dropped with them.
@@ -489,7 +534,7 @@ class SummarizingCompactor(_ThresholdCompactor):
         trigger_fraction: float | None = None,
         keep_last: int = 6,
         model: Model | str | None = None,
-        max_summary_tokens: int = 2000,
+        max_summary_tokens: int | None = None,
     ) -> None:
         """Configure when to summarise and with which model.
 
@@ -500,20 +545,25 @@ class SummarizingCompactor(_ThresholdCompactor):
             keep_last: How many of the most recent messages are kept verbatim.
             model: The model that writes the summary, for example a cheaper one. ``None``
                 uses the agent's model.
-            max_summary_tokens: ``max_tokens`` of the summary request.
+            max_summary_tokens: ``max_tokens`` of the summary request. On a model that
+                thinks, thinking counts toward it as well as the summary, so a small value
+                cuts the summary off (and the compactor then raises). ``None``, the default,
+                leaves it to the model's adapter, which sizes it for thinking plus the reply.
 
         Raises:
             ValueError: An argument is out of range.
         """
         if keep_last < 1:
             raise ValueError("keep_last must be at least 1")
+        if max_summary_tokens is not None and max_summary_tokens < 1:
+            raise ValueError("max_summary_tokens must be at least 1, or None.")
         super().__init__(trigger_tokens=trigger_tokens, trigger_fraction=trigger_fraction)
         self.keep_last = keep_last
         """How many of the most recent messages are kept verbatim."""
         self.model = resolve_model(model) if model is not None else None
         """The model that writes the summary; ``None`` uses the agent's model."""
         self.max_summary_tokens = max_summary_tokens
-        """``max_tokens`` of the summary request."""
+        """``max_tokens`` of the summary request; ``None`` leaves it to the model's adapter."""
 
     async def compact(
         self,
@@ -522,6 +572,7 @@ class SummarizingCompactor(_ThresholdCompactor):
         last_response: ModelResponse | None,
         model: Model,
     ) -> list[Message] | None:
+        last_response = await _sized(ctx, messages, last_response)
         if not await self.triggered(messages, last_response, model):
             return None
         lead = 0
@@ -539,11 +590,34 @@ class SummarizingCompactor(_ThresholdCompactor):
             ],
             settings=ModelSettings(max_tokens=self.max_summary_tokens),
         )
-        response = await (self.model or model).request(request)
-        ctx.add_usage(response.usage)
+        summarizer = self.model or model
+        response = await _hooked_request(ctx, summarizer, request)
         summary = response.message.text.strip()
-        if not summary:
-            return None
+        problem = None
+        if response.finish_reason == "length":
+            limit = (
+                "the model's default limit"
+                if self.max_summary_tokens is None
+                else f"max_summary_tokens={self.max_summary_tokens}"
+            )
+            problem = (
+                f"was cut off at the token limit ({limit}). Raise max_summary_tokens; on a "
+                "model that thinks, the limit covers the thinking as well as the summary"
+            )
+        elif response.finish_reason == "content_filter":
+            problem = (
+                "was refused by the provider (finish_reason 'content_filter'). Give "
+                "SummarizingCompactor another model=, or use ToolResultClearing"
+            )
+        elif not summary:
+            problem = "was empty"
+        if problem is not None:
+            raise ModelResponseError(
+                f"The summary written by {summarizer.provider}:{summarizer.name} {problem}. "
+                "The history was not replaced.",
+                provider=summarizer.provider,
+                model=summarizer.name,
+            )
         replacement = Message(
             role="user",
             parts=[TextPart(text=prompts.SUMMARY_PREFIX + summary)],
@@ -553,17 +627,21 @@ class SummarizingCompactor(_ThresholdCompactor):
 
 
 class CompactorChain(Compactor):
-    """Tries several compactors in order; the first that returns a history wins.
+    """Asks several compactors in order, each with the history the one before it left.
 
-    The rest are not asked for that request. Put the cheapest first:
+    When a compactor returns a shorter history, the compactors after it are asked with that
+    history, and with a ``last_response`` whose usage is the reported size of the last request
+    less what the replacement saved, so each one acts only if the request still reaches its
+    own trigger. The chain returns the last replacement (one ``compaction`` entry in the
+    journal), or ``None`` when none of them acted. Put the cheapest first:
 
         CompactorChain([
             ToolResultClearing(trigger_fraction=0.6),
             SummarizingCompactor(trigger_fraction=0.8),
         ])
 
-    Here old tool results are cleared first; once there is nothing left to clear and the
-    conversation still fills 80% of the window, it is summarised.
+    Here old tool results are cleared first; when the conversation still fills 80% of the
+    window after that, the cleared history is summarised in the same step.
     """
 
     def __init__(self, compactors: Iterable[Compactor]) -> None:
@@ -591,17 +669,105 @@ class CompactorChain(Compactor):
         self,
         ctx: RunContext[Any],
         messages: list[Message],
-        last_response: ModelResponse,
+        last_response: ModelResponse | None,
         model: Model,
     ) -> list[Message] | None:
+        current: list[Message] | None = None
+        last_response = await _sized(ctx, messages, last_response)  # once for the chain
         for compactor in self.compactors:
-            replacement = await compactor.compact(ctx, list(messages), last_response, model)
+            history = current if current is not None else messages
+            replacement = await compactor.compact(ctx, list(history), last_response, model)
             if replacement:
-                return replacement
-        return None
+                last_response = _shrunk(last_response, history, replacement)
+                current = list(replacement)
+        return current
 
 
 # --- helpers ---------------------------------------------------------------------------
+
+
+def _shrunk(
+    last_response: ModelResponse | None, before: list[Message], after: list[Message]
+) -> ModelResponse | None:
+    """A stand-in for ``last_response`` after ``before`` was replaced by ``after``.
+
+    Its usage makes `next_request_tokens` of ``after`` the size of the next request with
+    ``before`` less the estimated saving, so the system message and the tool definitions that
+    the reported usage includes stay counted. Without reported usage the history is estimated
+    whole anyway, and ``last_response`` is returned as it is.
+    """
+    usage = last_response.usage if last_response is not None else None
+    if last_response is None or usage is None or usage.input_tokens + usage.output_tokens <= 0:
+        return last_response
+    size = next_request_tokens(before, last_response)
+    size -= estimate_tokens(before) - estimate_tokens(after)
+    unseen = estimate_tokens(after[_last_assistant_index(after) + 1 :])
+    return last_response.model_copy(
+        update={"usage": Usage(requests=usage.requests, input_tokens=max(size - unseen, 1))}
+    )
+
+
+async def _sized(
+    ctx: RunContext[Any], messages: Sequence[Message], last_response: ModelResponse | None
+) -> ModelResponse | None:
+    """``last_response``, or a stand-in that says how large the next request is.
+
+    Before the first request of a run or a resume there is no reported usage, and
+    `next_request_tokens` estimates only ``messages``. The stand-in's usage adds the system
+    message, the tool definitions and the output schema of the request the run would send now,
+    so a long system prompt or many tools count toward the trigger. Building that request
+    calls an ``instructions`` function once more; with a provider that reports no usage, that
+    happens before every request. A bare ``RunContext`` (a compactor called in
+    a test) has no run, and ``last_response`` is returned as it is.
+    """
+    usage = last_response.usage if last_response is not None else None
+    if usage is not None and usage.input_tokens + usage.output_tokens > 0:
+        return last_response
+    build = getattr(ctx._run, "_build_request", None)
+    if build is None:
+        return last_response
+    request = await build(ctx)
+    # Only what the run puts in front of the history: a system message already in
+    # ``messages`` is counted by estimate_tokens below.
+    front = request.messages[: max(len(request.messages) - len(messages), 0)]
+    system = [message for message in front if message.role == "system"]
+    rest = estimate_request_tokens(request.model_copy(update={"messages": system}))
+    if rest <= 0:
+        return last_response
+    seen = messages[: _last_assistant_index(messages) + 1]  # next_request_tokens adds the rest
+    return ModelResponse(
+        message=Message(role="assistant"),
+        usage=Usage(input_tokens=rest + estimate_tokens(seen)),
+    )
+
+
+async def _hooked_request(
+    ctx: RunContext[Any], model: Model, request: ModelRequest
+) -> ModelResponse:
+    """Send a compactor's own request through the run's hooks, and count its usage.
+
+    A bare ``RunContext`` (a compactor called in a test) has no run, so no hooks. The
+    ``before_model`` hooks see ``_compaction_model`` set to ``model``.
+    """
+    hooks = getattr(ctx._run, "hooks", None)
+    if not isinstance(hooks, HookChain):
+        hooks = None
+    if hooks is not None:
+        token = _compaction_model.set(model)
+        try:
+            request = await hooks.before_model(ctx, request)
+        finally:
+            _compaction_model.reset(token)
+    response = await model.request(request)
+    ctx.add_usage(response.usage)  # billed whatever the hooks do next
+    if hooks is not None:
+        response = await hooks.after_model(ctx, response)
+    return response
+
+
+def _replays_reasoning(message: Message) -> bool:
+    """Whether ``message`` holds reasoning that is sent back to the provider."""
+    return any(isinstance(part, ReasoningPart) and part.opaque for part in message.parts)
 
 
 def _safe_cut(messages: list[Message], keep_last: int) -> int:

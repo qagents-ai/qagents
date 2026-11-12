@@ -49,8 +49,16 @@ Message content stays out of traces unless ``record_content=True``. Then model
 spans carry their messages, tool definitions and response in the OpenAI chat
 format, which the MLflow UI renders as a conversation; tool spans carry the
 arguments and the result; run spans carry the prompt and the final answer.
-Inline (base64) images are replaced by a short placeholder. Approval tokens
-and ``ctx.state`` values are never recorded.
+Inline images (``ImagePart.data``, or a ``data:`` URL) are replaced by a short
+placeholder. Error text is content too: without ``record_content`` a failed
+tool call has the status description `TOOL_FAILED`, and a span that an
+exception ended records only the exception's type, without its message or
+stack trace, because exception messages often quote the model's answer.
+Approval tokens and ``ctx.state`` values are never recorded.
+
+A compactor's own model request (the summary of `SummarizingCompactor`) goes
+through the run's hooks, so it has a ``chat`` span and counts in the trace's
+token usage.
 
 Every span a run opened is ended when the run ends: on an answer, a pause, a
 cancellation, a limit, a guardrail block or an exception. Spans left open by a
@@ -71,6 +79,7 @@ from typing import Any, ClassVar
 
 from pydantic_core import to_jsonable_python
 
+from ..context import _compaction_model
 from ..errors import ConfigurationError
 from ..events import AgentSwitched, ApprovalRequired, GuardrailTriggered, InputRequired
 from ..hooks import Hooks
@@ -137,10 +146,17 @@ class _OpenRun:
 class MLflowHooks(Hooks):
     """Record runs as MLflow traces.
 
+    Traces go to the tracking server MLflow is configured with for the
+    process (``mlflow.set_tracking_uri``, ``MLFLOW_TRACKING_URI`` or `enable`).
+    MLflow's tracing exports through one process-wide provider, so there is
+    no per-hook ``tracking_uri``; ``experiment_id`` picks the experiment.
+
     Args:
         record_content: Record messages, tool definitions, tool arguments and
-            results, the prompt and the answer. Off by default because they
-            often contain personal data.
+            results, the prompt and the answer, and the text of errors (a
+            failed tool's result, the message and stack trace of an
+            exception). Off by default because they often contain personal
+            data.
         experiment_id: Log the traces this hook starts to this experiment
             instead of the active one. Ignored for runs that nest in a span of
             your application (that trace is already in an experiment).
@@ -247,19 +263,23 @@ class MLflowHooks(Hooks):
             self._fail(run.chat)
         model, provider = _agent_model(ctx)  # a handoff changes the model
         run.model, run.provider = model or run.model, provider or run.provider
+        model, provider = run.model, run.provider
+        summarizer = _compaction_model.get()
+        if summarizer is not None:  # a compactor's summary request goes to its own model
+            model, provider = summarizer.name, summarizer.provider
         attributes: dict[str, Any] = {}
-        if run.model:
-            attributes[self._key.MODEL] = run.model
-        if run.provider:
-            attributes[self._key.MODEL_PROVIDER] = run.provider
+        if model:
+            attributes[self._key.MODEL] = model
+        if provider:
+            attributes[self._key.MODEL_PROVIDER] = provider
         inputs = None
         if self.record_content:
             attributes[self._key.MESSAGE_FORMAT] = "openai"
             inputs = {"messages": chat_messages(request.messages)}
-            if run.model:
-                inputs["model"] = run.model
+            if model:
+                inputs["model"] = model
         run.chat = self._mlflow.start_span_no_context(
-            f"chat {run.model}" if run.model else "chat",
+            f"chat {model}" if model else "chat",
             span_type=self._SpanType.CHAT_MODEL,
             parent_span=run.span,
             inputs=inputs,
@@ -384,7 +404,9 @@ class MLflowHooks(Hooks):
             if self.record_content:
                 outputs = _run_outputs(result)
         if error is not None:
-            run.span.record_exception(error if isinstance(error, Exception) else str(error))
+            recorded = self._record_error(run.span, error)
+            if recorded is not None:
+                status = recorded
             attributes[ATTR["status"]] = "failed"
         if run.owns_trace and run.trace_id is not None:
             self._tag_trace(run.trace_id, attributes)
@@ -477,14 +499,28 @@ class MLflowHooks(Hooks):
         """End the model and tool spans a failure or a cancellation left open."""
         if run.chat is not None:
             if isinstance(error, Exception):  # most likely the model request failed
-                run.chat.record_exception(error)
-                run.chat.end()
+                run.chat.end(status=self._record_error(run.chat, error))
             else:
                 self._fail(run.chat)
             run.chat = None
         for span in run.tools.values():
             self._fail(span)
         run.tools.clear()
+
+    def _record_error(self, span: Any, error: BaseException) -> Any:
+        """Add the exception event of ``error`` to ``span``; return the status to end it with.
+
+        The message and the stack trace (which repeats the messages of chained exceptions)
+        are recorded only with ``record_content``: they often quote content, such as the
+        answer that failed validation. Otherwise the event has the exception's type only.
+        Returns ``None`` when MLflow's ``record_exception`` already set the status.
+        """
+        if self.record_content:
+            span.record_exception(error if isinstance(error, Exception) else str(error))
+            return None
+        name = type(error).__name__
+        span.add_event(self._SpanEvent("exception", attributes={"exception.type": name}))
+        return self._SpanStatus(self._ERROR, name)
 
     def _fail(self, span: Any) -> None:
         span.end(status=self._SpanStatus(self._ERROR, UNFINISHED))
@@ -545,7 +581,8 @@ def chat_messages(messages: list[Message]) -> list[dict[str, Any]]:
     """Messages in the OpenAI chat format that the MLflow UI renders as a conversation.
 
     A tool message becomes one ``role: "tool"`` message per result. Inline
-    images are replaced by a text placeholder; image URLs are kept.
+    images (``data``, or a ``data:`` URL) are replaced by a text placeholder
+    with their media type and size; other image URLs are kept.
     """
     converted: list[dict[str, Any]] = []
     for message in messages:
@@ -594,18 +631,28 @@ def _content(message: Message) -> str | list[dict[str, Any]]:
         if isinstance(part, TextPart):
             parts.append({"type": "text", "text": part.text})
         elif isinstance(part, ImagePart):
-            if part.url:
+            if part.url and not part.url.lower().startswith("data:"):
                 parts.append({"type": "image_url", "image_url": {"url": part.url}})
             else:
-                kind = part.media_type or "image"
-                size = len(part.data or "")
-                parts.append({"type": "text", "text": f"[{kind}, {size} base64 characters]"})
+                parts.append({"type": "text", "text": _image_placeholder(part)})
     return parts
 
 
+def _image_placeholder(part: ImagePart) -> str:
+    """A short stand-in for an inline image: its media type and size, not its data."""
+    if part.url:  # a data: URL, "data:<media type>[;base64],<payload>"
+        header, _, payload = part.url.partition(",")
+        kind = header[len("data:") :].split(";")[0] or part.media_type or "image"
+        encoding = "base64 " if ";base64" in header.lower() else ""
+        return f"[{kind}, {len(payload)} {encoding}characters]"
+    return f"[{part.media_type or 'image'}, {len(part.data or '')} base64 characters]"
+
+
 def _run_outputs(result: RunResult) -> dict[str, Any]:
+    # A text answer given with the final-answer tool is in the output, not in the last message.
+    text = result.output if isinstance(result.output, str) else result.text
     outputs: dict[str, Any] = {
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": result.text}}]
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}}]
     }
     if result.output is not None and not isinstance(result.output, str):
         outputs["output"] = to_jsonable_python(result.output, fallback=repr)

@@ -139,7 +139,8 @@ def build_manager(
             "findings: one short paragraph per sub-question, keeping every figure. Never "
             "answer from memory."
         ),
-        tools=[fan_out(searcher, max_parallel=3, max_tasks=6, timeout=300)],
+        # The searchers only read the database: read_only=True lets a resume run them again.
+        tools=[fan_out(searcher, max_parallel=3, max_tasks=6, timeout=300, read_only=True)],
         limits=limits(4),
     )
     writer = Agent(

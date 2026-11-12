@@ -9,16 +9,24 @@ registry, so every provider registered with `register_provider` works. The
 command adds no instructions of its own: the model sees ``--instructions``, the
 conversation and the tool descriptions, nothing else.
 
-Tools that change something ask first. The prompt shows the call and waits for
-``y``; any other answer, or the end of input, declines. ``chat`` streams the
-answer and shows each tool call on one line. ``run`` writes tool activity and
-approval prompts to stderr, so stdout holds only the answer (or the JSON
-result) and the usage. Answers are read from stdin, so with ``run -`` (the
-prompt on stdin) every call that needs approval is declined.
+Tools with effects outside the conversation ask first: writing and editing
+files, shell commands, saving and deleting notes, and fetching web pages,
+since a URL can carry workspace data out. The prompt shows the whole call,
+every argument in full, and waits for ``y``; any other answer, or the end of
+input, declines.
+``chat`` streams the answer and shows each tool call on one line. ``run``
+writes tool activity and approval prompts to stderr, so stdout holds only the
+answer (or the JSON result) and the usage. Answers are read from stdin, so
+with ``run -`` (the prompt on stdin) every call that needs approval is declined.
 
-``--max-cost`` covers the whole command: in ``chat`` each prompt gets what is
-left of the budget. It needs a model whose prices are known (QCloud catalog
-models), and the command refuses to start otherwise.
+Text from the model and from tools reaches the terminal with control
+characters (which start terminal escape sequences) and bidirectional controls
+escaped, as in ``\\x1b``, so it cannot restyle the terminal or forge a prompt.
+
+``--max-cost`` covers the whole command, runs that failed included: in
+``chat`` each prompt gets what is left of the budget. A request that failed
+is not counted, since its usage is unknown. It needs a model whose prices are
+known (QCloud catalog models), and the command refuses to start otherwise.
 
 Exit codes: 0 when the agent answered, 1 when the run failed or stopped
 without an answer, 2 for a mistake in the command line, 130 after Ctrl-C.
@@ -33,8 +41,9 @@ import json
 import os
 import sys
 import threading
+import unicodedata
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import IO, Any
 
@@ -51,8 +60,8 @@ from .tools import RunContext, Tool
 
 TOOL_SETS: dict[str, str] = {
     "files": "list, read and search files in --workspace; write and edit them after approval",
-    "web": "fetch public web pages",
-    "notes": "keep notes as Markdown files in <workspace>/notes",
+    "web": "fetch public web pages, each after approval",
+    "notes": "keep notes as Markdown files in <workspace>/notes; save and delete after approval",
     "time": "tell the current date and time",
     "shell": "run shell commands in --workspace, each after approval",
     "todo": "keep a todo list for multi-step work in the session state",
@@ -67,7 +76,15 @@ DEFAULT_SESSION = "default"
 """Session id used with ``--db`` when ``--session`` is not given."""
 
 _PREVIEW = 100
-"""Characters of a tool's arguments or result shown on its line."""
+"""Characters of a tool's arguments or result shown on its line, and the
+longest call an approval prompt shows on one line."""
+
+_ASK_FIRST = ("save_note", "delete_note", "fetch_url")
+"""Tools the command asks about although they do not require approval: notes
+are overwritten and deleted, and a fetched URL can carry workspace data out."""
+
+_BIDI = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+"""Bidirectional controls: they reorder the text around them."""
 
 
 class UsageError(Exception):
@@ -230,7 +247,7 @@ async def _chat(args: argparse.Namespace, console: _Console) -> int:
     try:
         await _check_cost_limit(agent, args)
         session = _session(store, args)
-        spent = Usage()
+        spent = _Spent()
         console.say(
             f"qagents chat with {agent.model.provider}:{agent.model.name}"
             f"{_tools_note(args)}, {_session_note(session, store)}."
@@ -252,7 +269,7 @@ async def _chat(args: argparse.Namespace, console: _Console) -> int:
                     session = _fresh_session(store, session)
                     console.say(f"Started a new conversation ({_session_note(session, store)}).")
                 elif command == "/usage":
-                    console.say(_usage_text(spent))
+                    console.say(_usage_text(spent.usage))
                 elif command == "/help":
                     console.say(
                         "/usage  tokens and cost so far\n"
@@ -262,20 +279,18 @@ async def _chat(args: argparse.Namespace, console: _Console) -> int:
                 else:
                     console.say(f"Unknown command {command}. Commands: /usage, /reset, /exit.")
                 continue
-            limits = _limits(args, spent)
+            limits = _limits(args, spent.usage)
             if limits is None:
                 console.say(
                     f"The --max-cost budget of ${args.max_cost:g} is used up "
-                    f"({_usage_text(spent)}). Leave with /exit."
+                    f"({_usage_text(spent.usage)}). Leave with /exit."
                 )
                 continue
             try:
-                result, usage = await _converse(agent, text, session, limits, args, spent, console)
-            except QAgentsError as error:
-                console.end_text()
+                result = await _converse(agent, text, session, limits, args, spent, console)
+            except QAgentsError as error:  # what the run used is counted all the same
                 console.say(f"error: {error}")
                 continue
-            spent = spent.add(usage)
             if not result.completed:
                 console.say(f"[the run stopped: {_stop_text(result)}]")
     finally:
@@ -294,27 +309,32 @@ async def _run(args: argparse.Namespace, console: _Console) -> int:
         session = _session(store, args)
         limits = _limits(args, Usage())
         assert limits is not None
+        spent = _Spent()
         try:
-            result, usage = await _converse(
-                agent, prompt, session, limits, args, Usage(), console, stream_text=False
+            result = await _converse(
+                agent, prompt, session, limits, args, spent, console, stream_text=False
             )
         except QAgentsError as error:
             console.error(f"error: {error}")
+            console.error(f"[usage] {_usage_text(spent.usage)}")
             if args.json:
                 failure = {"type": type(error).__name__, "message": str(error)}
-                console.write(json.dumps({"status": "error", "error": failure}, indent=2) + "\n")
+                usage = spent.usage.model_dump(mode="json")
+                data = {"status": "error", "error": failure, "usage": usage}
+                console.write(json.dumps(data, indent=2) + "\n")
             return 1
     finally:
         await _close(agent, store)
 
     if args.json:
         data = result.model_dump(mode="json")
-        data["usage"] = usage.model_dump(mode="json")  # every part of a resumed run
+        data["usage"] = spent.usage.model_dump(mode="json")  # every part of a resumed run
         console.write(json.dumps(data, indent=2) + "\n")
     else:
-        if result.text:
-            console.write(result.text.rstrip("\n") + "\n")
-        console.write(f"\n[usage] {_usage_text(usage)}\n")
+        text = result.text.rstrip("\n")
+        if text:
+            console.write((_visible(text) if _is_terminal(console.out) else text) + "\n")
+        console.write(f"\n[usage] {_usage_text(spent.usage)}\n")
     if not result.completed:
         console.error(f"The run stopped without an answer: {_stop_text(result)}.")
         return 1
@@ -396,57 +416,64 @@ async def _converse(
     session: Session,
     limits: Limits,
     args: argparse.Namespace,
-    spent: Usage,
+    spent: _Spent,
     console: _Console,
     *,
     stream_text: bool = True,
-) -> tuple[RunResult, Usage]:
+) -> RunResult:
     """Run ``prompt``, then answer the questions of a paused run until it stops for good.
 
+    The run's usage is counted in ``spent``, also when a part raises. Every
+    resume gets the same ``limits``: they count the whole run, resumes included.
+
     Returns:
-        The last result, and the usage of every part of the run.
+        The last result.
     """
     activity = console.out if stream_text else console.err
-    result = await _show(agent.stream(prompt, session=session, limits=limits), console, stream_text)
-    usage = result.usage
+    spent.start()
+    stream = agent.stream(prompt, session=session, limits=limits)
+    result = await _show(stream, console, stream_text, spent)
     while result.status == "paused":
         approvals: dict[str, bool] = {}
         for approval in result.pending_approvals:
             approvals[approval.tool_call_id] = await _approve(
-                console, activity, f"{approval.name}({_arguments_text(approval.arguments)})"
+                console, activity, _call_text(approval.name, approval.arguments)
             )
         results: dict[str, Any] = {}
         for pending in getattr(result, "pending_inputs", []):
             answer = await console.ask(_question_text(pending.name, pending.arguments), activity)
             if answer is None:
-                return result, usage  # no more input: leave the run paused
+                return result  # no more input: leave the run paused
             results[pending.tool_call_id] = answer.rstrip("\r\n")
-        remaining = _limits(args, spent.add(usage))
-        if remaining is None:
-            return result, usage
-        options: dict[str, Any] = {"approvals": approvals, "limits": remaining}
+        if _limits(args, spent.usage) is None:
+            return result  # the budget is used up: leave the run paused
+        options: dict[str, Any] = {"approvals": approvals, "limits": limits}
         if results:
             options["results"] = results
-        result = await _show(agent.resume_stream(session, **options), console, stream_text)
-        usage = usage.add(result.usage)
-    return result, usage
+        result = await _show(agent.resume_stream(session, **options), console, stream_text, spent)
+    return result
 
 
-async def _show(stream: RunStream, console: _Console, stream_text: bool) -> RunResult:
+async def _show(
+    stream: RunStream, console: _Console, stream_text: bool, spent: _Spent
+) -> RunResult:
     """Consume a run, writing its answer text and a line per tool call."""
     activity = console.out if stream_text else console.err
-    async with stream:
-        async for event in stream:
-            kind = event.type
-            if kind == "text_delta" and stream_text:
-                console.text(event.text)
-            elif kind in ("tool_call_started", "tool_call_finished", "agent_switched"):
-                console.note(_activity_text(event), activity)
-            elif kind == "subagent_event":
-                inner = event.event
-                if getattr(inner, "type", None) in ("tool_call_started", "tool_call_finished"):
-                    console.note(f"  [{event.agent}]{_activity_text(inner)}", activity)
-    console.end_text()
+    try:
+        async with stream:
+            async for event in stream:
+                kind = event.type
+                if kind == "text_delta" and stream_text:
+                    console.text(event.text)
+                elif kind in ("tool_call_started", "tool_call_finished", "agent_switched"):
+                    console.note(_activity_text(event), activity)
+                elif kind == "subagent_event":
+                    inner = event.event
+                    if getattr(inner, "type", None) in ("tool_call_started", "tool_call_finished"):
+                        console.note(f"  [{event.agent}]{_activity_text(inner)}", activity)
+    finally:
+        console.end_text()
+        spent.add(stream)
     assert stream.result is not None
     return stream.result
 
@@ -472,7 +499,7 @@ def _build_agent(
         raise UsageError(f"--workspace {args.workspace} is not a directory.")
 
     async def approve(ctx: RunContext[Any], tool: Tool, call: ToolCallPart, reason: Any) -> bool:
-        return await _approve(console, activity, f"{call.name}({_arguments_text(call.arguments)})")
+        return await _approve(console, activity, _call_text(call.name, call.arguments))
 
     try:
         tools = _build_tools(_tool_names(args.tools), workspace)
@@ -482,7 +509,7 @@ def _build_agent(
             instructions=args.instructions,
             tools=tools,
             settings=ModelSettings(max_tokens=args.max_tokens) if args.max_tokens else None,
-            permissions=Permissions(on_ask=approve),
+            permissions=Permissions(ask=_ASK_FIRST, on_ask=approve),
         )
     except (ConfigurationError, ValueError) as error:
         raise UsageError(str(error)) from error
@@ -569,6 +596,7 @@ def _fresh_session(store: SessionStore | None, current: Session) -> Session:
 
 
 async def _approve(console: _Console, stream: IO[str], call: str) -> bool:
+    """Ask whether ``call``, as `_call_text` shows it, may run."""
     answer = await console.ask(f"  [approve] {call}? [y/N] ", stream)
     if answer is None:
         console.note("  (no answer: declined)", stream)
@@ -600,12 +628,41 @@ def _activity_text(event: Any) -> str:
     return f"  <- {event.call.name}: {_clip(first, _PREVIEW)}{size}"
 
 
-def _arguments_text(arguments: dict[str, Any]) -> str:
+def _arguments_text(arguments: Mapping[str, Any], limit: int | None = _PREVIEW) -> str:
+    """The arguments on one line, clipped to ``limit`` characters unless it is ``None``."""
     pieces = [
-        f"{name}={json.dumps(value, ensure_ascii=False, default=str)}"
+        f"{_key(name)}={json.dumps(value, ensure_ascii=False, default=str)}"
         for name, value in arguments.items()
     ]
-    return _clip(", ".join(pieces), _PREVIEW)
+    text = ", ".join(pieces)
+    return text if limit is None else _clip(text, limit)
+
+
+def _call_text(name: str, arguments: Mapping[str, Any]) -> str:
+    """A tool call as approval prompts show it: every argument in full, nothing clipped.
+
+    A short call fits on one line. A longer one gets a line per argument, as
+    indented JSON, and text with line breaks is shown line by line after a
+    ``|``. Control and format characters are escaped, so what is shown is
+    exactly what will run.
+    """
+    line = f"{name}({_arguments_text(arguments, limit=None)})"
+    if len(line) <= _PREVIEW:
+        return _visible(line, strict=True)
+    lines = [f"{name}("]
+    for key, value in arguments.items():
+        if isinstance(value, str) and "\n" in value:
+            lines.append(f"    {_key(key)} = {len(value):,} characters:")
+            lines.extend(f"      | {text}" for text in value.split("\n"))
+        else:
+            text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+            lines.append(f"    {_key(key)} = " + text.replace("\n", "\n    "))
+    lines.append("  )")
+    return "\n".join(_visible(item, strict=True) for item in lines)
+
+
+def _key(name: str) -> str:
+    return name if name.isidentifier() else json.dumps(name, ensure_ascii=False)
 
 
 def _question_text(name: str, arguments: dict[str, Any]) -> str:
@@ -672,6 +729,63 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else f"{text[: limit - 3]}..."
 
 
+def _visible(text: str, *, strict: bool = False) -> str:
+    """``text``, safe for a terminal: what could restyle, move or hide output is escaped.
+
+    Control characters other than newline and tab (they start terminal escape
+    sequences, ``\\r`` moves to the start of the line), bidirectional controls
+    and lone surrogates become escapes such as ``\\x1b``. ``strict`` also
+    escapes tabs and the other format characters, such as zero-width spaces.
+    """
+    if not strict:
+        text = text.replace("\r\n", "\n")
+    escaped = []
+    for char in text:
+        category = unicodedata.category(char)
+        if char == "\n" or (char == "\t" and not strict):
+            escaped.append(char)
+        elif category in ("Cc", "Cs") or char in _BIDI or (strict and category == "Cf"):
+            escaped.append(char.encode("unicode_escape").decode("ascii"))
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
+def _is_terminal(stream: IO[str]) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+class _Spent:
+    """What the command's runs have used so far, runs that raised included."""
+
+    def __init__(self) -> None:
+        self.usage = Usage()
+        self._before = Usage()
+        """What the runs before the current one used."""
+        self._run = Usage()
+        """What the current run used, across its resumes."""
+
+    def start(self) -> None:
+        """A new run begins: what the earlier ones used is final."""
+        self._before, self._run = self.usage, Usage()
+
+    def add(self, stream: RunStream) -> None:
+        """Count one part of the current run: its start, or a resume.
+
+        A resume reports the usage of the whole run (it continues from the
+        journal), so it replaces what the earlier parts reported. A resume
+        that failed before it loaded the run reports nothing and changes nothing.
+        """
+        # The run's running total is kept when the run raises; stream.result is not.
+        used = stream._run.usage
+        if used != Usage():
+            self._run = used
+        self.usage = self._before.add(self._run)
+
+
 def _tolerant(stream: IO[str]) -> IO[str]:
     """``stream``, made to replace characters its encoding cannot write instead of failing."""
     reconfigure = getattr(stream, "reconfigure", None)
@@ -683,7 +797,11 @@ def _tolerant(stream: IO[str]) -> IO[str]:
 
 
 class _Console:
-    """The command's input and output, with the bookkeeping streamed text needs."""
+    """The command's input and output, with the bookkeeping streamed text needs.
+
+    Everything but `write` goes through `_visible`, so text from the model
+    and from tools cannot reach the terminal as escape sequences.
+    """
 
     def __init__(self, stdin: IO[str], out: IO[str], err: IO[str]) -> None:
         self.stdin = stdin
@@ -693,13 +811,14 @@ class _Console:
         """Streamed answer text was written to ``out`` without a final newline."""
 
     def write(self, text: str) -> None:
+        """``text`` as it is: for output the command builds itself, such as JSON."""
         self.out.write(text)
         self.out.flush()
 
     def text(self, text: str) -> None:
         """Streamed answer text."""
         if text:
-            self.write(text)
+            self.write(_visible(text))
             self._open_line = not text.endswith("\n")
 
     def end_text(self) -> None:
@@ -709,19 +828,19 @@ class _Console:
 
     def say(self, line: str) -> None:
         self.end_text()
-        self.write(line + "\n")
+        self.write(_visible(line) + "\n")
 
     def note(self, line: str, stream: IO[str]) -> None:
         """A line of activity, on ``out`` (chat) or ``err`` (run)."""
         if stream is self.out:
             self.say(line)
         else:
-            stream.write(line + "\n")
+            stream.write(_visible(line) + "\n")
             stream.flush()
 
     def error(self, line: str) -> None:
         self.end_text()
-        self.err.write(line + "\n")
+        self.err.write(_visible(line) + "\n")
         self.err.flush()
 
     async def ask(self, prompt: str, stream: IO[str] | None = None) -> str | None:
@@ -729,7 +848,7 @@ class _Console:
         target = stream if stream is not None else self.out
         if target is self.out:
             self.end_text()
-        target.write(prompt)
+        target.write(_visible(prompt))
         target.flush()
         line = await _read(self.stdin.readline)
         return line if line else None

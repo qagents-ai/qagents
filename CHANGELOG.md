@@ -107,7 +107,7 @@ did. Everything from 0.1 keeps working; the behaviour changes are listed under "
 #### Context management
 
 - `ToolResultClearing`: replaces old tool results with a placeholder, without a model request.
-- `CompactorChain`: tries compactors in order; the first result wins.
+- `CompactorChain`: asks each compactor in order, each on the previous one's replacement.
 - `trigger_fraction` (a share of the model's context window) next to `trigger_tokens`.
 - `estimate_tokens`, `estimate_request_tokens`, `next_request_tokens` and
   `unpaired_tool_calls` in `qagents.context`.
@@ -131,7 +131,7 @@ did. Everything from 0.1 keeps working; the behaviour changes are listed under "
 
 - `qagents.toolkits.mcp.MCPToolkit` (extra `mcp`): tools of an MCP server over stdio or
   streamable HTTP (protocol 2026-07-28, falling back to 2025-11-25). Annotations map to
-  `read_only` and `idempotent`; tools that may be destructive ask for approval by default;
+  `read_only` and `idempotent`; tools not declared read-only ask for approval by default;
   definitions can be pinned by hash (`MCPToolChangedError`); binary content never reaches the
   model; progress notifications become `mcp_progress` events.
 
@@ -160,6 +160,7 @@ did. Everything from 0.1 keeps working; the behaviour changes are listed under "
 #### Package
 
 - New top-level exports: `AgentRuntime`, `RunHandle`, `fan_out`, `route`, `RouteResult`,
+  `MaxDepthExceeded`, `ToolTimeout`,
   `FallbackModel`, `RateLimitedModel`, `cassette`, `CompactorChain`, `ToolResultClearing`,
   `InputResult`, `PendingInput`, `SessionStatus`, `TrippedGuardrail`, `WorkflowStatus`,
   `DeferToolCall`, `ModelRetry`, `GuardrailTripped`, `ApprovalTokenError`, `LeaseError`,
@@ -211,6 +212,232 @@ did. Everything from 0.1 keeps working; the behaviour changes are listed under "
   `prompts.TOOL_INPUT_ABANDONED`, the same way it closes pending approvals.
 - `PendingApproval` gains `token` (`None` unless pauses are signed), so its JSON dump has one
   more key.
+
+#### From the pre-release review
+
+An adversarial review of 0.2 before its release found defects in every area. Their fixes change
+these behaviours; the fixes themselves are listed under "Fixed".
+
+Behaviour you will notice:
+
+- `qagents.multi.fan_out` is no longer read-only by default (`read_only=False`): a run resumed
+  after an interruption does not repeat a fan-out that may have acted, and several fan-out
+  calls of one turn run one at a time under `parallel_tools="read_only"`. Pass
+  `read_only=True` when every tool of the workers is read-only. Its `timeout` defaults to
+  `multi.FAN_OUT_TIMEOUT_S` (600 s) instead of `Limits.tool_timeout_s`.
+- `MCPToolkit` asks for approval before every tool the server does not declare read-only (new
+  default `approval="side_effects"`; `"destructive"` keeps the old rule). `pins` is an
+  allow-list (`allow_unpinned=True` to opt out), `approval="all"` ignores the server's
+  annotations, and `definition_hash` covers the tool's title, so pins of titled tools must be
+  taken again from `definition_hashes()`.
+- `web_tools()` without `allow_hosts`: `fetch_url` asks for approval and is not read-only
+  (`requires_approval=False` restores the old behaviour).
+- Signed pauses use a new token payload (version 2, RFC 8785 canonical JSON, bound to the
+  session, the call's position in the run and the kind of pause). Pauses signed before this
+  change no longer verify; restart those runs. A call whose arguments cannot be signed (NaN, an
+  infinity, broken Unicode, an integer a double cannot hold exactly) is refused with
+  `prompts.UNSIGNABLE_CALL` instead of crashing the run.
+- One run per session at a time: a run or resume while another run of the session executes
+  raises `SessionError`. On a store with leases a plain `Agent.run` holds a 30 s lease
+  (`agent.RUN_LEASE_TTL_S`, owner `qagents-run:<uuid>`), so `AgentRuntime.recover()` leaves it
+  alone. Close a stream you stop early before the next run of its session.
+- `Limits` count the whole run across resumes (`max_turns`, `max_total_tokens`,
+  `max_cost_usd`, `max_tool_calls`; `RunResult.usage` and `turns` too); `timeout_s` applies to
+  each `run()` or `resume()` call. Limits passed as `limits=` are journaled in `run_started`
+  (and by `AgentRuntime` as `runtime_limits`), so a recovered run keeps them.
+- `Limits.max_cost_usd` fails closed: a response with an unknown cost (`Usage.unpriced_requests`,
+  set by `OpenAIChatModel` and `QCloudModel` when the server reports no usage) stops the run.
+  `max_tool_calls` counts only calls allowed to run; refused, invalid, waiting and declined
+  calls do not count. `max_depth` is inherited down the chain of runs (`MaxDepthExceeded`), and
+  children that run at once share the parent's token and cost budget live.
+- `Agent.as_tool()` returns the accepted `result.output` (validators and final-answer tool
+  included), reports a refused or too-deep child as an error result
+  (`prompts.SUBAGENT_TOO_DEEP`), and takes `timeout=`.
+- Tool arguments are validated before anyone is asked, so `can_use_tool`, `on_ask`,
+  `before_tool` and pauses only see valid arguments; a `before_tool` hook can no longer repair
+  invalid ones. Approvals: the permission rules are checked first and a deny always wins,
+  approvals for calls that are not open are ignored, edited arguments are checked again,
+  journaled (`approval_decided`) and disclosed to the model, and `approvals=` values must be
+  `True`, `False` or an `Approval`.
+- Cancel and timeouts tell the model what happened: a call that never started gets
+  `TOOL_NOT_EXECUTED`, a running read-only or idempotent call `TOOL_CANCELLED`, any other
+  running call `TOOL_INTERRUPTED` (outcome unknown). `TOOL_TIMEOUT` is reworded. Sync tools run
+  on a pool qagents owns (`tools.TOOL_THREADS`); a timed-out call raises `tools.ToolTimeout`
+  and its thread is abandoned, not killed.
+- Model streams and compaction run in the task that iterates the stream: a provider's own
+  `asyncio.timeout` works, and an outer cancellation is no longer swallowed.
+- `AgentRuntime.start()` journals the run before it returns, so errors of its preparation
+  (nothing to run, an input guardrail that raises, a session in use) are raised by `start()`.
+  `recover()` does not resume a run whose last failure was ambiguous (unless the run's limits
+  set `retry_ambiguous`), a `run_failed` without flags, or one that needs a person; after
+  `max_recoveries` (new, default 5) recoveries without progress it marks the run failed
+  (`RecoveryLimitReached`). `shutdown()` waits for calls in flight and no longer treats
+  `RunStarted` as a safe point.
+- `Workflow.map` runs sync functions in threads (functions that need the event loop must be
+  async); `Workflow.completed_steps()` returns a copy.
+- AG-UI: error text, guardrail reasons, the text of tool exceptions (`TOOL_ERROR_MESSAGE`) and
+  sub-agents' usage and reasoning data are not sent unless asked for (`expose_errors=True`,
+  `guardrail_reasons=True`); `agui_resume` refuses edited arguments unless
+  `allow_argument_edits=True`; a run blocked by an output guardrail always ends with a
+  `MESSAGES_SNAPSHOT` without the blocked answer.
+- CLI: `save_note`, `delete_note` and `fetch_url` ask first, approval prompts show the whole
+  call, model and tool text is escaped before it reaches the terminal, and `--max-cost` and
+  `/usage` count runs that fail part-way and paused runs once.
+- `OpenAIChatModel` and `QCloudModel`: 4xx errors other than 401/402/403/408/409/429 are
+  `ModelBadRequestError` (not retried, not ambiguous), 408 is a retryable `ModelTimeoutError`,
+  redirects are not followed, and a missing usage gives `cost_usd=None`. Error messages never
+  quote credentials in `base_url`; an `api_key` or header with control or non-ASCII characters
+  is refused at construction.
+- Cassettes: secret detection is broader (keys are matched in snake_case form), so more settings
+  are redacted and request fingerprints can change: record affected cassettes again.
+  `RecordingModel(overwrite=True)` replaces the file only on its first recorded response, and
+  `QAGENTS_CASSETTE_MODE=replay` also refuses `cassette(mode="record")`.
+- `AnthropicModel`: `thread` and `mcp_servers` are no longer allowed in `extra`; unsupported
+  combinations (effort on Haiku 4.5, `xhigh` on 4.6 models, fallbacks on Haiku 5.5,
+  `thinking_display="updates"` on a model without it, a `max_tokens` above the model's limit)
+  fail when the model is built; open maps and bare objects in strict or structured schemas are
+  refused before sending; a turn still paused after `max_continuations` ends with finish reason
+  `"length"`; a tool call cut off by `max_tokens` is never run; usage includes every billed
+  iteration.
+- `SummarizingCompactor`: `max_summary_tokens` defaults to `None` (the adapter's limit); a
+  summary that is cut off, refused or empty raises `ModelResponseError` instead of replacing the
+  history; its request goes through the run's hooks. `CompactorChain` asks every compactor in
+  turn, each on the previous one's replacement. Compactors count the system prompt, tools and
+  output schema before the first request, and reasoning that is not sent back is not counted.
+- With `record_content=False`, `OTelHooks` and `MLflowHooks` keep error text (exception
+  messages, stack traces, failed tool results) out of traces: spans get the exception type only.
+- `qagents.evals`: `Contains`, `Regex`, `JSONSchemaValid` and `IsInstance` check the accepted
+  answer (`EvalContext.answer_text`, `output`), and runs or judges that raise keep their usage.
+- `file_tools`: `search_files` runs its regex in a child `python -I` process stopped at
+  `search_timeout` (new `max_file_bytes`, `search_timeout`, `search_python`); listings skip
+  Windows junctions. `notes_tools` refuses linked notes and writes notes atomically (mode 0600
+  on POSIX).
+- `qagents.MCPToolkit` and `qagents.toolkits.MCPToolkit` raise `AttributeError` (naming the
+  `qagents[mcp]` extra) when the MCP SDK is missing, and `dir()` leaves them out, so `hasattr`,
+  `help(qagents)` and `inspect` work; `from qagents import MCPToolkit` still raises
+  `ImportError`.
+
+Other API changes:
+
+- New: `errors.MaxDepthExceeded` and `tools.ToolTimeout` (both exported from `qagents`),
+  `models.is_secret_setting_key`, `permissions.canonical_json`, `Session.append_entries`,
+  `RunContext.limits` and `remaining_budget()`, `Usage.unpriced_requests` and `cost_complete`,
+  `ModelResponse.context_tokens`, `AgentSwitched.tool_call_id`, the `OutputRejected` event,
+  `AgentRuntime(max_recoveries=)`, `route(classifier_session=)` and `RouteResult.used_default`,
+  `Workflow.run_agent(on_event=)`, `FallbackModel(model_settings=, cooldown_s=)` and
+  `metadata["fallback"]` on its responses, `QCloudModel(catalog_timeout=)`,
+  `RecordingModel(redact_keys=)`, `AGUIProjector(hold_final_answer=, guardrail_reasons=)`,
+  `to_agui_messages(expose_errors=)`, `web_tools(requires_approval=)`, and the prompt constants
+  `APPROVAL_ARGUMENTS_CHANGED`, `UNSIGNABLE_CALL`, `OUTPUT_VALIDATOR_RETRY`,
+  `OUTPUT_TOOL_TEXT_INSTRUCTIONS`, `TOOL_TIMEOUT_ABANDONED`, `TOOL_NOT_STARTED`,
+  `TOOL_THREADS_EXHAUSTED`, `TOOL_WAITED_FOR_EARLIER`, `TOOL_CALL_TRUNCATED`,
+  `SUBAGENT_TOO_DEEP` and the `PERMISSION_REASON_*` texts (now used by `Permissions`).
+- `output_mode="tool"` without an `output_type` accepts a plain-text answer; native mode sends
+  a schema whose root is not an object wrapped as `{"value": ...}`.
+- Journal: `run_finished` holds `{status, stop_reason, output, text}`; `run_failed` adds
+  `error_type`, `message`, `retryable` and `ambiguous`; assistant messages carry `usage`,
+  `model`, `provider`, `turn` and `metadata["finish_reason"]`; usage added through
+  `ctx.add_usage` rides on the next entry as `added_usage`; new kinds `approval_decided`,
+  `runtime_limits` and `run_recovered`. `derive_state` ignores entries a run writes after its
+  own `run_finished`, and marks an answer an output guardrail blocked with
+  `metadata["blocked"]`.
+- `SQLiteStore` uses `PRAGMA synchronous=FULL` and its own executor thread; `PostgresStore`
+  refuses NaN, infinities and lone surrogates with `SessionError` and runs no DDL when its
+  schema already exists. Every store supports `async with`.
+
+### Fixed
+
+Defects found by the pre-release review of 0.2, by area. Each fix has a regression test.
+
+- **Agent loop and journal.** A crash can no longer leave a half-written start of a run, turn,
+  refusal or handoff: related entries are written in one append, and resume repairs journals
+  written in pieces. A finished tool call is never run twice: one run per session, fenced
+  writes, and an approved call that started before a crash still counts. Usage, turns and tool
+  calls are restored on resume, so pausing cannot reset a limit; a declined or waiting call, or
+  one that never started, no longer uses up `max_tool_calls`. `on_run_end` runs once, after
+  `on_run_start`, also when an `on_event` hook raises. A stray `CancelledError` from a tool, or
+  a tool that emits `ToolCallFinished`, no longer hangs or ends a tool group early; nothing
+  starts after a cancel or timeout, including during retry back-off and compaction; state
+  changed in `before_tool` is journaled before the tool runs; an invalid `state=` fails before
+  anything is written; handoff names must be unique.
+- **Permissions and signed pauses.** Tokens cover the session, the call's position and the
+  pause kind, so a pause cannot be copied into another session or replayed after its run
+  finished; an integer that a double cannot hold exactly is refused rather than signed
+  ambiguously; refusal reasons come from `qagents.prompts`.
+- **Tools.** Tool timeouts cover an awaitable a sync function returns, a tool's own
+  `TimeoutError` is reported as a failure, abandoned sync threads are bounded, and later calls
+  that run one at a time never overlap them.
+- **Child runs.** A child's usage reaches the parent once, however the child ends; parallel
+  children cannot overshoot the parent's budget; depth limits apply down the whole chain.
+- **Runtime, workflows and Postgres.** Shutdown races no longer launch runs after `shutdown()`
+  or cut a tool call that already started; a slow preparation keeps its lease (the heartbeat
+  starts with the lease); limits survive recovery; crash loops are bounded; a cancelled queued
+  run is closed; a finished run keeps its result when its lease release is cancelled; a
+  recovery that backs out writes nothing; interrupted runs say whether their `state=` and
+  `limits=` were kept and whether `recover()` will resume them. `Workflow.run_agent` never runs
+  a completed but unrecorded step again. `PostgresStore`: appends and deletes no longer race, a
+  role with only table privileges works, and polls no longer write a lease row per candidate.
+- **Multi-agent helpers.** `fan_out` and `route` report a refusing worker as an error; `route`
+  reads quoted or Markdown route names.
+- **Model adapters.** OpenAI-compatible and QCloud: error classes match the HTTP status,
+  tool-call fragments without an index are assembled correctly, a stream labelled as JSON is
+  read, a completion without a finish reason is refused instead of taken as complete, refusals
+  map to `content_filter`, multi-part text is not run together, and strict schemas get
+  `additionalProperties: false`. Anthropic: a billed continuation is never sent again, server
+  tool input is kept and replayed, costs are per iteration and model, compactors read the size
+  of the last request (`ModelResponse.context_tokens`) instead of the billed sum, thinking
+  blocks are replayed where the API allows and a rejected signature is retried without them
+  outside an open tool round, and foreign or repeated tool-call ids are made valid.
+  `RecordingModel` redacts more secrets and no longer deletes a cassette it never wrote;
+  `RateLimitedModel` bounds the whole wait; `FallbackModel` says which model answered.
+- **AG-UI and CLI.** Signed pauses can be declined from AG-UI; dict events project like event
+  models; interleaved tool-call deltas and handoff results are sent correctly, also on resume;
+  a blocked answer is never sent again in a later run's snapshot, and with
+  `hold_final_answer=True` a native sub-agent's answer that passed is sent. The CLI no longer
+  clips approval prompts or double-counts the usage of resumed runs.
+- **Tracing, compaction and evals.** Error text stays out of traces without
+  `record_content=True`; summary requests are traced; a cut-off summary no longer replaces the
+  history; a system message already in the history is counted once; MLflow no longer uploads
+  `data:` images; evaluators read the accepted answer.
+- **Toolkits.** File and notes tools never follow junctions or links out of their folder, and
+  work on Linux and macOS (where `stat` has no junction constant); `search_files` cannot freeze
+  the process; `fetch_url` checks the host name it connects to, bounds decompression and
+  refuses NAT64 and other internal addresses; `MCPToolkit.aclose()` waits for a connect in
+  progress.
+- **Package.** `help(qagents)`, `hasattr` and `inspect` work without the MCP extra.
+
+### Known limitations
+
+Not fixed in 0.2; each is documented where it applies.
+
+- A writer who can append to the session store can replay an answered signed pause inside a run
+  that is still open, by appending the run's entries again from its `run_started`. Signed
+  pauses protect against forgery, alteration, and copies across sessions or finished runs.
+- Output guardrails check the completed answer, whose text has been streamed by then. Hold it
+  until `run_finished` (`AGUIProjector(hold_final_answer=True)` for AG-UI) or use `agent.run`.
+- An OpenAI strict tool with defaulted parameters is sent with a partial `required` list, which
+  OpenAI rejects (vLLM and SGLang accept it).
+- The in-flight model request of a worker that died is sent again on recovery: the journal
+  cannot tell it from one never sent.
+- `Permissions(mode="read_only")` allows, without asking, a read-only tool that also sets
+  `requires_approval=True`.
+- `fetch_url` resolves a host twice (DNS rebinding); a note that is a hard link is read through.
+- A timed-out `search_files` keeps its child process until `search_timeout`.
+- The text of a `fan_out` worker's exception reaches the calling model and AG-UI clients
+  (credentials in `base_url` are no longer part of it).
+- Hooks cannot tell a compactor's summary request from a loop request.
+- A store subclass that overrides only `append` runs plain runs without a lease, so only runs in
+  the same process are kept apart.
+- `AnthropicModel` replaces an `anthropic-beta` header set in the client's `default_headers`; an
+  exhausted `pause_turn` is reported as finish reason `"length"`; the usage of a billed pause
+  segment is lost when its continuation fails; open-map schemas fail when the request is built,
+  not when the agent is.
+- By design, and documented: input guardrails check only `prompt=` (not `history=`); a run whose
+  output retries are used up raises `OutputValidationError`; a guardrail's reason is not sent to
+  the model; skipped calls keep an `OUTPUT_TOOL_SKIPPED` result; `Workflow.run_agent` runs a
+  step whose run did not complete again, and checks permissions again on a paused step;
+  `MLflowHooks` uses MLflow's process-wide tracking URI; there is no streaming `route()`, no
+  public crash simulation for tests, and no per-case evaluator scoping.
 
 ### New optional dependencies
 
