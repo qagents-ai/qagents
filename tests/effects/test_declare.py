@@ -3,9 +3,13 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
+
+from qagents.effects._declare import Dedupe, Unique
 from qagents.errors import (
     ApprovalConflictError,
     ClaimConflict,
+    ConfigurationError,
     DeferToolCall,
     EffectConflictError,
     EffectHeld,
@@ -80,3 +84,51 @@ def test_store_and_operator_errors_are_not_tool_errors():
     ):
         assert isinstance(error, SessionError)
         assert not isinstance(error, ToolError)
+
+
+def test_dedupe_pessimistic_defaults_and_margin():
+    contract = Dedupe(window_s=3600, contract="Example API v1")
+    assert contract.concurrent == "unknown"
+    assert contract.replays_errors is True
+    assert contract.replays_rejections is False
+    assert contract.binds_params is False
+    assert contract.margin() == 180
+    assert Dedupe(10, "short").margin() == 60
+    assert Dedupe(3600, "explicit", margin_s=0).margin() == 0
+    assert Dedupe(3600, "explicit", margin_s=20).margin() == 20
+
+
+@pytest.mark.parametrize("window", [0, -1, True, float("nan"), float("inf"), "3600"])
+def test_dedupe_refuses_invalid_retention_window(window):
+    with pytest.raises(ConfigurationError, match="window_s"):
+        Dedupe(window, "example")
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"contract": ""},
+        {"concurrent": "allows"},
+        {"margin_s": -1},
+        {"margin_s": float("inf")},
+        {"replays_errors": "false"},
+        {"replays_rejections": 0},
+        {"binds_params": 1},
+    ],
+)
+def test_dedupe_refuses_invalid_contract_settings(fields):
+    with pytest.raises(ConfigurationError):
+        Dedupe(**{"window_s": 100, "contract": "example", **fields})
+
+
+def test_unique_keeps_its_declared_duplicate_types():
+    class Duplicate(Exception):
+        pass
+
+    contract = Unique("unique constraint on request_id", (Duplicate,))
+    assert contract.on_duplicate == (Duplicate,)
+    with pytest.raises(ConfigurationError):
+        Unique("", (Duplicate,))
+    for bad in ((), [Duplicate], (42,), (object,)):
+        with pytest.raises(ConfigurationError):
+            Unique("constraint", bad)

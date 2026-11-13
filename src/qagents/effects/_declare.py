@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -70,3 +72,73 @@ class Key:
         return digest(
             {"prefix": self.prefix, "fields": list(self.fields), "per_call": self.is_per_call}
         )
+
+
+def _finite_nonnegative(value: float, name: str, *, positive: bool = False) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value < 0
+        or (positive and value == 0)
+    ):
+        bound = "positive" if positive else "nonnegative"
+        raise ConfigurationError(f"{name} must be a finite {bound} number.")
+
+
+@dataclass(frozen=True)
+class Dedupe:
+    """A destination's bounded key-retention contract, with pessimistic defaults.
+
+    Concurrency defaults to unknown, errors are presumed replayed, rejection
+    replay and parameter binding are not promised. Prefer a probed preset.
+    """
+
+    window_s: float
+    contract: str
+    concurrent: Literal["rejects", "waits", "unknown"] = "unknown"
+    replays_errors: bool = True
+    replays_rejections: bool = False
+    binds_params: bool = False
+    margin_s: float | None = None
+
+    def __post_init__(self) -> None:
+        _finite_nonnegative(self.window_s, "window_s", positive=True)
+        if not isinstance(self.contract, str) or not self.contract.strip():
+            raise ConfigurationError(
+                "Dedupe contract must name the destination's documented promise."
+            )
+        if self.concurrent not in ("rejects", "waits", "unknown"):
+            raise ConfigurationError("concurrent must be rejects, waits, or unknown.")
+        for name in ("replays_errors", "replays_rejections", "binds_params"):
+            if type(getattr(self, name)) is not bool:
+                raise ConfigurationError(f"{name} must be bool.")
+        if self.margin_s is not None:
+            _finite_nonnegative(self.margin_s, "margin_s")
+
+    def margin(self) -> float:
+        """Return the explicit margin, or max(60 seconds, 5% of the retention window)."""
+        return self.margin_s if self.margin_s is not None else max(60.0, 0.05 * self.window_s)
+
+
+@dataclass(frozen=True)
+class Unique:
+    """A destination's permanent unique-key promise and its definite duplicate exceptions."""
+
+    contract: str
+    on_duplicate: tuple[type[BaseException], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.contract, str) or not self.contract.strip():
+            raise ConfigurationError(
+                "Unique contract must name the destination's permanent constraint."
+            )
+        if not isinstance(self.on_duplicate, tuple) or not self.on_duplicate:
+            raise ConfigurationError(
+                "Unique on_duplicate needs a nonempty tuple of exception types."
+            )
+        if any(
+            not isinstance(kind, type) or not issubclass(kind, BaseException)
+            for kind in self.on_duplicate
+        ):
+            raise ConfigurationError("Unique on_duplicate entries must be exception types.")
