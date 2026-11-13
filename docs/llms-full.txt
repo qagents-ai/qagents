@@ -615,9 +615,19 @@ if result.status == "paused":
 - The pending calls are also in `(await session.state()).pending_approvals`, which is what an
   approvals page would read.
 
-!!! note "Not in 0.1"
-    Approval tokens are not signed. Treat the session store as trusted, and authenticate whoever
-    calls `resume` in your application. Signed approvals are on the [roadmap](../design.md#roadmap).
+### Signed pauses
+
+Configure `Permissions(approval_secret=...)` to sign paused approvals and deferred inputs.
+Return `Approval.for_call(pending)` or `InputResult.for_call(pending, value)` when resuming;
+these carry the recorded token. A missing token or a changed signed call raises
+`ApprovalTokenError` before a tool runs. Authenticate whoever calls `resume` in your
+application: the token protects the paused call's integrity, not the reviewer's identity
+or the rest of the journal.
+
+Signed JSON integers must be between `-(2**53 - 1)` and `2**53 - 1`, inclusive. Larger
+integers are refused rather than rounded. PostgreSQL JSONB can normalize an integral float
+to an integer; a large float normalized outside this range also fails verification on
+resume. Use strings for identifiers or exact quantities beyond the safe integer range.
 
 ---
 
