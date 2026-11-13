@@ -36,6 +36,7 @@ import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextvars import ContextVar
 from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, create_model
@@ -1020,8 +1021,10 @@ class _Run:
         """``on_run_end`` was called with the result."""
         self._hook_error: Exception | None = None
         """What an ``on_event`` hook raised: the run failed with it."""
-        self._batch: list[Entry] | None = None
-        """Entries collected by `_batched`, written in one store call."""
+        self._batch: ContextVar[tuple[asyncio.Task[Any] | None, list[Entry]] | None] = ContextVar(
+            "qagents_journal_batch", default=None
+        )
+        """Entries collected by `_batched`, owned by the task that opened the block."""
         self._start_events: list[Event] = []
         """Events of journal entries written while the run was prepared."""
         self._claimed: tuple[int, str] | None = None
@@ -3093,8 +3096,9 @@ class _Run:
                 # holds of its usage (RunContext.journaled_usage), whatever entry carried it.
                 data = {**data, "added_usage_by_operation": _usage_dumps(by_operation)}
         entry = Entry(kind=kind, data=data, run_id=run_id or self.run_id)
-        if self._batch is not None:
-            self._batch.append(entry)
+        batch = self._current_batch()
+        if batch is not None:
+            batch.append(entry)
         else:
             await self._write([entry])
 
@@ -3130,22 +3134,30 @@ class _Run:
 
         Every store writes one ``append`` atomically, so a crash leaves all of
         them or none. If the block raises, none is written. Nested blocks join
-        the outer one. Do not yield events inside the block.
+        the outer one in the same task. Other tasks write independently. Do not
+        yield events inside the block.
         """
-        if self._batch is not None:
+        if self._current_batch() is not None:
             yield
             return
-        self._batch = []
+        entries: list[Entry] = []
+        token = self._batch.set((asyncio.current_task(), entries))
         try:
             yield
-            entries = self._batch
         except BaseException:
-            self._unwritten(self._batch)
+            self._unwritten(entries)
             raise
         finally:
-            self._batch = None
+            self._batch.reset(token)
         if entries:
             await self._write(entries)
+
+    def _current_batch(self) -> list[Entry] | None:
+        batch = self._batch.get()
+        # Child tasks inherit ContextVars, but must not inherit a parent's mutable batch.
+        if batch is not None and batch[0] is asyncio.current_task():
+            return batch[1]
+        return None
 
     async def _append(
         self, message: Message, *, new: bool = True, extra: Mapping[str, Any] | None = None
