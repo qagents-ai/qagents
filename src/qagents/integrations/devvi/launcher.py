@@ -57,6 +57,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from ... import prompts
 from ...external import ExternalAgentConfigurationError
 from .._process import build_env, find_program
 from .._process import resolve_command as resolve_program
@@ -151,7 +152,7 @@ def resolve_node(
         found = locate_program("node", environ=environ, exclude=exclude)
         if found is None:
             raise ExternalAgentConfigurationError(
-                "Node.js was not found, so the Devvi CLI cannot start.\n"
+                f"{prompts.DEVVI_NODE_NOT_FOUND}\n"
                 f"Install Node >= {_dotted(NODE_MIN_VERSION)} and put it on PATH, or set "
                 f"{ENV_NODE} to the node executable."
                 + _hidden_note("node", environ, exclude, ENV_NODE)
@@ -162,19 +163,19 @@ def resolve_node(
     else:
         prefix = [str(part) for part in node]
         if not prefix:
-            raise ExternalAgentConfigurationError("node= must not be empty.")
+            raise ExternalAgentConfigurationError(prompts.DEVVI_NODE_EMPTY)
     program = prefix[0]
     found = locate_program(program, environ=environ, exclude=exclude)
     if found is None:
         raise ExternalAgentConfigurationError(
-            f"Node.js was not found at {program!r} (from {where}).\n"
+            f"{prompts.DEVVI_NODE_NOT_FOUND_AT.format(program=program, source=where)}\n"
             f"Set {ENV_NODE} to the node executable, or put node on PATH."
             + _hidden_note(program, environ, exclude, ENV_NODE)
         )
     if _WINDOWS and Path(found).suffix.lower() in (".cmd", ".bat"):
         raise ExternalAgentConfigurationError(
-            f"Node at {found!r} is a {Path(found).suffix} shim, which Windows runs through "
-            f"cmd.exe.\nSet {ENV_NODE} to the real node.exe."
+            f"{prompts.DEVVI_NODE_SHIM.format(path=found, suffix=Path(found).suffix)}\n"
+            f"Set {ENV_NODE} to the real node.exe."
         )
     return (found, *prefix[1:])
 
@@ -201,7 +202,7 @@ def resolve_command(
     if command is not None:
         program = tuple(str(part) for part in command)
         if not program:
-            raise ExternalAgentConfigurationError("command= must not be empty.")
+            raise ExternalAgentConfigurationError(prompts.DEVVI_COMMAND_EMPTY)
         return DevviCommand(program=program, source="command")
     configured = str(devvi_bin) if devvi_bin is not None else _get(environ, ENV_BIN)
     if configured:
@@ -212,7 +213,7 @@ def resolve_command(
         found = locate_program("devvi", environ=environ, exclude=exclude)
         if found is None:
             raise ExternalAgentConfigurationError(
-                "The Devvi CLI was not found.\n"
+                f"{prompts.DEVVI_CLI_NOT_FOUND}\n"
                 f"Set {ENV_BIN} to Devvi's apps/cli/lib/bin.js (or lib/bin.js of the installed "
                 "@deepseek-ai/dsh package), or put devvi on PATH."
                 + _hidden_note("devvi", environ, exclude, ENV_BIN)
@@ -272,9 +273,10 @@ def _existing_path(
     found = locate_program(expanded, environ=environ, exclude=exclude)
     if found is None:
         bare = not (os.path.isabs(expanded) or os.path.dirname(expanded))
-        where = " on PATH" if bare else ""
+        where = prompts.DEVVI_CLI_ON_PATH if bare else ""
+        first = prompts.DEVVI_CLI_NOT_FOUND_AT.format(path=configured, where=where, source=source)
         raise ExternalAgentConfigurationError(
-            f"The Devvi CLI was not found at {configured!r}{where} (from {source}).\n"
+            f"{first}\n"
             f"Set {ENV_BIN} to an existing file (an absolute path): Devvi's apps/cli/lib/bin.js, "
             "or lib/bin.js of the installed @deepseek-ai/dsh package."
             + _hidden_note(expanded, environ, exclude, ENV_BIN)
@@ -292,8 +294,7 @@ def _script_of(path: Path) -> Path | None:
             script = parse_cmd_shim(path)
             if script is None:
                 raise ExternalAgentConfigurationError(
-                    f"{path} is a {suffix} shim that Windows would run through cmd.exe, and "
-                    "it does not say which script it starts.\n"
+                    f"{prompts.DEVVI_CLI_SHIM.format(path=path, suffix=suffix)}\n"
                     f"Set {ENV_BIN} to the package's lib/bin.js instead."
                 )
             return script
@@ -303,7 +304,7 @@ def _script_of(path: Path) -> Path | None:
         if sibling.is_file() and (script := parse_cmd_shim(sibling)) is not None:
             return script
         raise ExternalAgentConfigurationError(
-            f"{path} cannot be started on Windows (it is not a .exe or a .js file).\n"
+            f"{prompts.DEVVI_CLI_NOT_RUNNABLE.format(path=path)}\n"
             f"Set {ENV_BIN} to the package's lib/bin.js."
         )
     real = path.resolve()
@@ -344,7 +345,7 @@ def parse_node_version(text: str) -> tuple[int, int, int]:
     match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", text or "")
     if match is None:
         raise ExternalAgentConfigurationError(
-            f"Could not read the Node version from {text.strip()[:80]!r}."
+            prompts.DEVVI_NODE_VERSION_UNREADABLE.format(text=text.strip()[:80])
         )
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
@@ -353,8 +354,10 @@ def check_node_version(version: tuple[int, int, int]) -> None:
     """Refuse Node older than `NODE_MIN_VERSION`."""
     if version < NODE_MIN_VERSION:
         raise ExternalAgentConfigurationError(
-            f"Node {_dotted(version)} is too old for Devvi, which needs "
-            f">= {_dotted(NODE_MIN_VERSION)}.\n"
+            prompts.DEVVI_NODE_TOO_OLD.format(
+                version=_dotted(version), minimum=_dotted(NODE_MIN_VERSION)
+            )
+            + "\n"
             f"Install a newer Node, or set {ENV_NODE} to one."
         )
 
@@ -378,7 +381,7 @@ def parse_devvi_version(text: str) -> str:
         else ""
     )
     raise ExternalAgentConfigurationError(
-        f"`devvi --version` printed {(text or '').strip()[:80]!r}, which is not a version.\n"
+        f"{prompts.DEVVI_VERSION_NOT_PRINTED.format(text=(text or '').strip()[:80])}\n"
         f"Check that {ENV_BIN} points at the Devvi CLI, and that Node is >= 24.9.0.{hint}"
     )
 
@@ -387,12 +390,17 @@ def check_devvi_version(version: str, *, allow_untested: bool = False) -> None:
     """Refuse a Devvi version qagents was not written against (see `TESTED_VERSIONS`)."""
     match = _DEVVI_VERSION.match(version)
     if match is None:
-        raise ExternalAgentConfigurationError(f"Devvi version {version!r} cannot be read.")
+        raise ExternalAgentConfigurationError(
+            prompts.DEVVI_VERSION_UNREADABLE.format(version=version)
+        )
     if (int(match.group(1)), int(match.group(2))) in TESTED_VERSIONS or allow_untested:
         return
-    tested = ", ".join(f"{major}.{minor}.x" for major, minor in TESTED_VERSIONS)
+    tested = prompts.EXTERNAL_SETUP_LIST_SEPARATOR.join(
+        prompts.DEVVI_TESTED_VERSION.format(major=major, minor=minor)
+        for major, minor in TESTED_VERSIONS
+    )
     raise ExternalAgentConfigurationError(
-        f"Devvi {version} is not a version qagents was tested with ({tested}).\n"
+        f"{prompts.DEVVI_VERSION_UNTESTED.format(version=version, tested=tested)}\n"
         "Devvi's SDK protocol has no version negotiation, so a newer Devvi may speak it "
         "differently. Pass allow_untested_version=True to try it anyway."
     )
@@ -466,18 +474,15 @@ def build_environment(
             ``passthrough`` names a variable the launcher owns.
     """
     if permission_mode not in PERMISSION_MODES:
+        modes = prompts.EXTERNAL_SETUP_LIST_SEPARATOR.join(PERMISSION_MODES)
         raise ExternalAgentConfigurationError(
-            f"permission_mode must be one of {', '.join(PERMISSION_MODES)}, "
-            f"not {permission_mode!r}."
+            prompts.DEVVI_PERMISSION_MODE_UNKNOWN.format(modes=modes, mode=permission_mode)
         )
     names = [str(name) for name in passthrough]
     explicit = dict(extra or {})
     for name in [*names, *explicit]:
         if str(name).upper() in _RESERVED:
-            raise ExternalAgentConfigurationError(
-                f"{name} is set by qagents: use home= for the Devvi home and "
-                "permission_mode= for DSH_PERMISSION_MODE."
-            )
+            raise ExternalAgentConfigurationError(prompts.DEVVI_VARIABLE_RESERVED.format(name=name))
     owned = {
         "DEVVI_HOME": str(home),
         "DSH_HOME": str(home),
@@ -521,12 +526,11 @@ async def run_probe(
             **options,
         )
     except NotImplementedError as error:
-        raise ExternalAgentConfigurationError(
-            "This event loop cannot run subprocesses. On Windows use the default Proactor "
-            "event loop."
-        ) from error
+        raise ExternalAgentConfigurationError(prompts.DEVVI_NO_SUBPROCESSES) from error
     except OSError as error:
-        raise ExternalAgentConfigurationError(f"Cannot start {command[0]!r}: {error}") from error
+        raise ExternalAgentConfigurationError(
+            prompts.DEVVI_CANNOT_START.format(program=command[0], error=error)
+        ) from error
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
     except BaseException as error:  # a timeout, or the caller was cancelled: stop it too
@@ -575,16 +579,20 @@ async def probe(
         code, out, err = await run_probe([*command.node, "--version"], env=env, cwd=cwd)
         if code != 0:
             raise ExternalAgentConfigurationError(
-                "Node did not start (`node --version` failed).\n"
+                f"{prompts.DEVVI_NODE_DID_NOT_START}\n"
                 f"Command: {' '.join(command.node)}; exit code {code}; stderr: {err.strip()[-500:]}"
             )
         node_version = parse_node_version(out)
         check_node_version(node_version)
     code, out, err = await run_probe(command.argv("--version"), env=env, cwd=cwd, timeout=timeout)
     if code != 0:
-        how = "did not finish in time" if code is None else f"exited with code {code}"
+        how = (
+            prompts.DEVVI_PROBE_TIMEOUT
+            if code is None
+            else prompts.DEVVI_PROBE_EXIT.format(code=code)
+        )
         raise ExternalAgentConfigurationError(
-            f"The Devvi CLI did not start: `devvi --version` {how}.\n"
+            f"{prompts.DEVVI_CLI_DID_NOT_START.format(how=how)}\n"
             f"Command: {' '.join(command.argv('--version'))}; stderr: {err.strip()[-1000:]}\n"
             f"Check {ENV_BIN} (and run `pnpm run build` in a Devvi checkout)."
         )
@@ -697,7 +705,7 @@ def _patch_files(paths: Sequence[str | Path]) -> list[str]:
         path = Path(extra)
         if not path.is_file():
             raise ExternalAgentConfigurationError(
-                f"The Devvi patch file {str(extra)!r} does not exist."
+                prompts.DEVVI_PATCH_FILE_MISSING.format(path=str(extra))
             )
         files.append(str(path.resolve()))
     return files

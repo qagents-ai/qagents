@@ -23,6 +23,7 @@ from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
+from .. import prompts
 from ..errors import (
     ExternalAgentConfigurationError,
     ExternalAgentConnectionError,
@@ -167,8 +168,10 @@ class ExternalTurnContext:
 
     @property
     def prompt_text(self) -> str:
-        """The text parts of the task, joined by blank lines."""
-        return "\n\n".join(part.text for part in self.task if isinstance(part, TextPart))
+        """The text parts of the task, joined with `prompts.EXTERNAL_AGENT_TASK_SEPARATOR` (a
+        blank line)."""
+        texts = (part.text for part in self.task if isinstance(part, TextPart))
+        return prompts.EXTERNAL_AGENT_TASK_SEPARATOR.join(texts)
 
     @property
     def suggested_session_id(self) -> str:
@@ -235,10 +238,11 @@ class ExternalTurnContext:
 
         Pass ``message_id`` when the protocol says which message (or which
         content block) the text belongs to. Text whose id differs from the
-        text just before it is another block: it is separated by a blank line,
-        in the turn's text and in the ``text_delta`` event (``"\\n\\n"`` before
-        it). Without ids, deltas are joined as they come, which is right for a
-        token stream: for whole committed blocks, give each block its own id.
+        text just before it is another block: it is separated by
+        `prompts.EXTERNAL_AGENT_TEXT_BLOCK_SEPARATOR` (a blank line), in the
+        turn's text and at the start of its ``text_delta`` event. Without ids,
+        deltas are joined as they come, which is right for a token stream: for
+        whole committed blocks, give each block its own id.
         """
         if not text:
             return
@@ -252,7 +256,7 @@ class ExternalTurnContext:
             and self._text_message is not None
             and message_id != self._text_message
         ):
-            text = "\n\n" + text
+            text = prompts.EXTERNAL_AGENT_TEXT_BLOCK_SEPARATOR + text
         if message_id is not None:
             self._text_message = message_id
         self._text.append(text)

@@ -118,3 +118,29 @@ Datadog). Install with `pip install "qagents[otel]"`.
   closed.
 - Error text (a failed tool's status description, exception messages and stack traces) counts
   as content: without `record_content=True` a span records only the exception's type.
+
+An [external agent](external-agents.md) used as a tool (Devvi, an ACP agent) runs its own loop,
+so its model requests and tools get no spans. Its permission decisions and the end of its turn
+are span events on the `execute_tool` span of the call that ran it (on the run span when the
+event names no call):
+
+```text
+execute_tool coder
+  event qagents.external.permission_decided   tool, outcome, approved, decision, decided_by
+  event qagents.external.turn_finished        status, stop_reason, session_id, backend,
+                                              tokens, cost, tool_calls, changed_files_count
+```
+
+- A permission's arguments and reason, the paths the turn changed, and a stop reason that is not
+  a known word (an error turn's stop reason is the agent's message) are content: they are
+  recorded only with `record_content=True`. Known words are `qagents.external.STOP_REASONS`,
+  `permission` and `closed` (a turn qagents cancelled), and the words an adapter passes through
+  (ACP's `max_turn_requests`; Devvi's `forked`, `blocked` and `interrupted`).
+- A field of the wrong type in the event's data (from a custom adapter) is left out; tracing
+  never fails a run.
+- The tool span ends at the time its tool returned. Events of the turn that reach the hook after
+  that are stamped with that time, so they fall inside the span.
+- A calling run that is cancelled or times out during the turn ends the span before the turn
+  reports its end: that span has no `turn_finished` event.
+- `MLflowHooks` does not record these events. To see them in MLflow, export the spans of
+  `OTelHooks` to the MLflow server's `/v1/traces` endpoint.

@@ -1,0 +1,303 @@
+# Held-out questions: `search_eval.toml`'s check on overfitting. Read by
+# tests/docs_mcp/test_search_eval.py; the opt-in benchmark reports their top-1 and top-3
+# rates next to the eval set's. Do not tune the ranking on these: a change that helps the
+# eval set only and not these fits the eval wordings, not the way people ask.
+#
+# `expected` has the same form as in `search_eval.toml`. The first group was written
+# before the second round of ranking changes; the second by a reviewer of the first round.
+
+# --- written before the second round -----------------------------------------------------
+
+[[question]]
+query = "quickstart"
+expected = ["getting-started.md", "examples/quickstart.py"]
+
+[[question]]
+query = "install with pip"
+expected = ["getting-started.md#install", "README.md#install"]
+
+[[question]]
+query = "tool decorator"
+expected = ["concepts/tools.md", "src/qagents/tools.py"]
+
+[[question]]
+query = "how are tool arguments validated"
+expected = ["concepts/tools.md"]
+
+[[question]]
+query = "mark a tool read only so it runs in parallel"
+expected = ["concepts/tools.md#flags"]
+
+[[question]]
+query = "tool that throws an error"
+expected = ["concepts/tools.md#results-and-errors"]
+
+[[question]]
+query = "continue a conversation later"
+expected = ["concepts/sessions.md", "getting-started.md#keep-the-conversation"]
+
+[[question]]
+query = "survive a restart"
+expected = ["concepts/sessions.md"]
+
+[[question]]
+query = "allow and deny rules for tools"
+expected = ["concepts/permissions.md"]
+
+[[question]]
+query = "ask before deleting files"
+expected = ["concepts/permissions.md"]
+
+[[question]]
+query = "typed result from the agent"
+expected = ["concepts/structured-output.md"]
+
+[[question]]
+query = "print text while the model writes it"
+expected = ["concepts/streaming.md", "getting-started.md#stream-the-answer"]
+
+[[question]]
+query = "abort a run"
+expected = ["concepts/streaming.md#cancel"]
+
+[[question]]
+query = "voice agent"
+expected = ["concepts/streaming.md#real-time-and-voice"]
+
+[[question]]
+query = "a team of agents"
+expected = ["concepts/multi-agent.md"]
+
+[[question]]
+query = "durable job with several steps"
+expected = ["concepts/multi-agent.md#workflows"]
+
+[[question]]
+query = "spending limit for a run"
+expected = ["concepts/loop.md#limits"]
+
+[[question]]
+query = "what does a run return"
+expected = ["concepts/loop.md#what-a-run-returns"]
+
+[[question]]
+query = "summarize long chats"
+expected = ["concepts/hooks.md#long-conversations"]
+
+[[question]]
+query = "send traces to an observability backend"
+expected = ["concepts/hooks.md#tracing", "src/qagents/tracing.py"]
+
+[[question]]
+query = "use gpt from openai"
+expected = ["providers.md", "src/qagents/models/openai_chat.py"]
+
+[[question]]
+query = "anthropic model"
+expected = ["providers.md", "src/qagents/models/anthropic.py"]
+
+[[question]]
+query = "shell tool"
+expected = ["toolkits.md#shell"]
+
+[[question]]
+query = "let the agent read files on disk"
+expected = ["toolkits.md#files"]
+
+[[question]]
+query = "scripted model"
+expected = ["testing.md", "src/qagents/models/testing.py"]
+
+[[question]]
+query = "http api for my agent"
+expected = ["serving.md", "examples/serve_fastapi.py"]
+
+[[question]]
+query = "design principles"
+expected = ["design.md"]
+
+[[question]]
+query = "use devvi from a workflow step"
+expected = ["integrations/devvi.md#as-a-workflow-step"]
+
+[[question]]
+query = "hand a coding task to an external agent"
+expected = ["concepts/external-agents.md", "integrations/acp.md", "integrations/devvi.md"]
+
+[[question]]
+query = "make a coding agent one of my agent's tools"
+expected = ["concepts/external-agents.md#using-an-external-agent", "integrations/devvi.md#a-lead-with-a-coder"]
+
+[[question]]
+query = "agent client protocol"
+expected = ["integrations/acp.md"]
+
+[[question]]
+query = "test an external agent offline"
+expected = ["concepts/external-agents.md#testing-offline-with-scriptedexternalagent"]
+
+[[question]]
+query = "let a coding agent call my python functions"
+expected = ["integrations/mcp-server.md", "concepts/external-agents.md#two-planes-who-drives-the-agent-and-what-tools-it-has"]
+
+[[question]]
+query = "set up the docs mcp in codex"
+expected = ["coding-agents.md#codex-cli"]
+
+[[question]]
+query = "workflow"
+expected = ["concepts/multi-agent.md#workflows", "src/qagents/workflow.py"]
+
+[[question]]
+query = "runtime"
+expected = ["src/qagents/runtime.py"]
+
+[[question]]
+query = "mlflow"
+expected = ["src/qagents/integrations/mlflow.py", "examples/patterns/mlflow_tracing.py"]
+
+# --- written by the reviewer of the first round ------------------------------------------
+
+[[question]]
+query = "add a tool to my agent"
+expected = ["concepts/tools.md", "getting-started.md"]
+
+[[question]]
+query = "function calling"
+expected = ["concepts/tools.md"]
+
+[[question]]
+query = "tools for an agent"
+expected = ["concepts/tools.md", "getting-started.md"]
+
+[[question]]
+query = "what tools can an agent use"
+expected = ["concepts/tools.md", "toolkits.md"]
+
+[[question]]
+query = "agent with tools example"
+expected = ["concepts/tools.md", "getting-started.md", "examples/quickstart.py"]
+
+[[question]]
+query = "how does the agent loop work"
+expected = ["concepts/loop.md"]
+
+[[question]]
+query = "max turns"
+expected = ["concepts/loop.md#limits"]
+
+[[question]]
+query = "approve tool calls"
+expected = ["concepts/permissions.md"]
+
+[[question]]
+query = "ask the user before running a shell command"
+expected = ["concepts/permissions.md"]
+
+[[question]]
+query = "agent permissions"
+expected = ["concepts/permissions.md"]
+
+[[question]]
+query = "how do i pause an agent"
+expected = ["concepts/permissions.md#pause-and-resume"]
+
+[[question]]
+query = "agent sessions"
+expected = ["concepts/sessions.md"]
+
+[[question]]
+query = "save the conversation to a database"
+expected = ["concepts/sessions.md#stores", "src/qagents/stores/postgres.py", "src/qagents/session.py"]
+
+[[question]]
+query = "agent memory"
+expected = ["concepts/sessions.md", "toolkits.md#notes-memory", "getting-started.md#keep-the-conversation"]
+
+[[question]]
+query = "exactly once tool execution"
+expected = ["concepts/sessions.md#what-is-guaranteed", "design.md#guarantees"]
+
+[[question]]
+query = "cancel a running agent"
+expected = ["concepts/streaming.md#cancel"]
+
+[[question]]
+query = "agent streaming"
+expected = ["concepts/streaming.md"]
+
+[[question]]
+query = "output schema with pydantic"
+expected = ["concepts/structured-output.md"]
+
+[[question]]
+query = "handoff"
+expected = ["concepts/multi-agent.md#handoffs"]
+
+[[question]]
+query = "sub-agents"
+expected = ["concepts/multi-agent.md#sub-agents"]
+
+[[question]]
+query = "crash recovery for external agents"
+expected = ["concepts/external-agents.md#the-journal-and-crash-recovery"]
+
+[[question]]
+query = "devvi permissions"
+expected = ["integrations/devvi.md#permissions"]
+
+[[question]]
+query = "acp permission rules"
+expected = ["integrations/acp.md#tool-names-for-permission-rules", "integrations/acp.md#permission-answers"]
+
+[[question]]
+query = "connect the docs server to cursor"
+expected = ["coding-agents.md#cursor"]
+
+[[question]]
+query = "read and write files tool"
+expected = ["toolkits.md#files"]
+
+[[question]]
+query = "web search tool"
+expected = ["toolkits.md#web"]
+
+[[question]]
+query = "custom model provider"
+expected = ["providers.md#writing-a-provider", "examples/custom_provider.py"]
+
+[[question]]
+query = "openai compatible endpoint"
+expected = ["providers.md#openai-compatible-servers"]
+
+[[question]]
+query = "unit test a tool"
+expected = ["testing.md#test-a-tool-on-its-own"]
+
+[[question]]
+query = "fake model for tests"
+expected = ["testing.md", "src/qagents/models/testing.py"]
+
+[[question]]
+query = "trace runs with opentelemetry spans"
+expected = ["concepts/hooks.md#tracing", "src/qagents/tracing.py"]
+
+[[question]]
+query = "summarize old messages when the context is full"
+expected = ["concepts/hooks.md#long-conversations"]
+
+[[question]]
+query = "agent hooks"
+expected = ["concepts/hooks.md"]
+
+[[question]]
+query = "deploy my agent as a REST API"
+expected = ["serving.md", "examples/serve_fastapi.py"]
+
+[[question]]
+query = "connect to an mcp server"
+expected = ["src/qagents/toolkits/mcp.py", "examples/patterns/mcp_tools.py", "README.md#tools"]
+
+[[question]]
+query = "serve tools over mcp"
+expected = ["integrations/mcp-server.md"]

@@ -56,6 +56,32 @@ every such change is listed under "Changed").
 - The AG-UI projection opens tool calls that arrive without a model response (an external
   agent's, a served MCP call's) and ends a direct external turn at its `turn_finished` event.
 
+#### Tracing of external agents
+
+- `OTelHooks` records two span events for an external agent run through `as_tool()`, on the
+  `execute_tool` span of that call (or on the run span when the event names no call):
+  `qagents.external.permission_decided` and `qagents.external.turn_finished` (names in
+  `qagents.tracing.EVENTS`, attributes in `ATTR`).
+  - `permission_decided` carries `gen_ai.agent.name` and
+    `qagents.external.permission.approved`; valid fields supplied by the event add
+    `qagents.external.permission.tool`, `.tool_call_id`, `.outcome`,
+    `.decision` and `.decided_by`.
+  - `turn_finished` carries `gen_ai.agent.name`, `gen_ai.usage.input_tokens`,
+    `gen_ai.usage.output_tokens` and `qagents.external.tool_calls`. Valid optional fields add
+    `qagents.external.status`, `qagents.external.session_id`, `qagents.external.backend`,
+    `qagents.usage.cached_input_tokens`, `qagents.cost_usd` and
+    `qagents.external.changed_files_count`, and `qagents.external.stop_reason` when the
+    stop reason is a known word (`qagents.external.STOP_REASONS`, `permission`, `closed`, and
+    the adapters' `max_turn_requests`, `forked`, `blocked` and `interrupted`).
+  - Only with `record_content=True`: `qagents.external.permission.arguments` (JSON),
+    `qagents.external.permission.reason`, `qagents.external.changed_files`, and any other stop
+    reason (an error turn's stop reason is the agent's message).
+  - A field of the wrong type (a custom adapter's event data) is left out, so tracing never
+    fails a run. The tool span stays open until the call's `tool_call_finished` event, then
+    ends at the time its tool returned; events that arrive later carry that time. A calling
+    run that is cancelled mid-turn records no `turn_finished`. `MLflowHooks` records neither
+    event: export the `OTelHooks` spans to MLflow's `/v1/traces` endpoint instead.
+
 #### Docs for coding agents
 
 - `python -m qagents.docs_mcp`: an MCP server (stdio, `qagents[mcp]`) with the docs of the
@@ -66,6 +92,25 @@ every such change is listed under "Changed").
   from the docs of the installed version.
 - `AGENTS.md`, a Claude Code skill (`skills/qagents/SKILL.md`), `docs/coding-agents.md`, and
   `scripts/build_llms_txt.py` for `docs/llms.txt` and `docs/llms-full.txt`.
+- `search_docs` ranks plain questions better. A section whose heading says what the query
+  says scores higher; a missing word costs less the more common it is; `agent` counts a
+  quarter next to other words; integration pages weigh half unless the query names their
+  topic (each page's topic words, such as `claude`, `codex`, `gemini` or `worker` for the
+  external-agent pages, are data in `docs_mcp/corpus.py`); API reference stubs and the
+  research page weigh 0.6; one plain word that names a guide section (`tools`, `hooks`) finds
+  the guide first, any other plain word (`evals`, `agui`) the module. The tokenizer folds
+  `-ied` endings and `code`/`coding`, and splits `SQLiteStore` into `sqlite`. Measured over
+  `tests/docs_mcp/search_eval.toml` (86 questions, the set the ranking was tuned on): top-1
+  68/86 (0.79); top-3 80/86 (0.93). Over `search_heldout.toml` (73 questions):
+  top-1 53/73 (0.73); top-3 60/73 (0.82). This second set is a regression check rather
+  than a pristine holdout: synonym ablation inspected its scores and one question
+  informed MCP-server topic words. "agent tools" and "how do I make an agent with tools"
+  put `concepts/tools.md` first; "connect a copilotkit frontend" finds the AG-UI API
+  first. The benchmark is opt-in: `pytest tests/docs_mcp -m docs_benchmark`.
+- `get_api` on a module constant, and a module's member list (which `llms-full.txt` is built
+  from), show the constant's docs: the string right after the assignment, or a `#:` comment
+  above it or at the end of its line. A constant that a package re-exports shows the docs of
+  the module that defines it (for example `qagents.external.APPROVAL_KEY`).
 
 #### Docs and package
 
@@ -91,6 +136,49 @@ every such change is listed under "Changed").
   alone waits for it.
 - Every model-facing string of the new modules is in `qagents.prompts` (`EXTERNAL_*`,
   `TOOL_SERVER_*`, `ACP_*`, `DEVVI_*`).
+- **Model-facing:** through `as_tool()`, a session that the tool did not open is refused with
+  the new `prompts.EXTERNAL_AGENT_UNKNOWN_SESSION`, inside `EXTERNAL_AGENT_FAILED`: "{name}
+  failed: session {session} was not opened by {name} in this conversation; leave session out
+  to start a new one". It said "session {session} does not exist; ..." (`DEVVI_UNKNOWN_SESSION`)
+  before. Once the tool keeps its 50 latest sessions, the refusal is the new
+  `EXTERNAL_AGENT_FORGOTTEN_SESSION` instead ("session {session} is not among the last
+  {limit} sessions that {name} opened or continued in this conversation, which are the only
+  ones it can continue; ..."), because the session may be an older one that was dropped.
+  `DEVVI_UNKNOWN_SESSION` remains the Devvi SDK stop reason for a session Devvi does not have:
+  one your code passed, or one the tool opened that Devvi has lost.
+- 116 more `qagents.prompts` constants, each with a docstring, for texts that were built
+  inline. With their default values every text reads as before, apart from the refusals above.
+  - The `as_tool()` result layout: `EXTERNAL_AGENT_ERROR_RESULT` (`"{message}\n\n[{footer}]"`,
+    every turn that did not complete) and `EXTERNAL_AGENT_STOPPED_WITH_TEXT`
+    (`"{message}\n\n{text}"`, a stopped turn that has text); `EXTERNAL_AGENT_RESULT` is not
+    reused for them.
+  - Joiners and markers: `EXTERNAL_AGENT_DESCRIPTION_WITH_HINT`,
+    `EXTERNAL_AGENT_TEXT_BLOCK_SEPARATOR`, `EXTERNAL_AGENT_TASK_SEPARATOR`,
+    `EXTERNAL_AGENT_LINE_SHORTENED`, `EXTERNAL_AGENT_FOOTER_TOOL_COUNT`,
+    `EXTERNAL_AGENT_FOOTER_LIST_SEPARATOR`, `EXTERNAL_AGENT_NO_ARGUMENTS`,
+    `EXTERNAL_AGENT_DECLINED_REASON`, `EXTERNAL_TOOL_DESCRIPTION`, `EXTERNAL_TOOL_NEVER_RUN`,
+    `EXTERNAL_SETUP_LIST_SEPARATOR` and `EXTERNAL_SETUP_LIST_NONE`.
+  - ACP: the tool-call content placeholders (`ACP_DIFF_PLACEHOLDER`,
+    `ACP_TERMINAL_PLACEHOLDER`, `ACP_MEDIA_PLACEHOLDER`, `ACP_RESOURCE_LINK_PLACEHOLDER`,
+    `ACP_RESOURCE_PLACEHOLDER`, `ACP_TOOL_CONTENT_SEPARATOR`), `ACP_JSONRPC_ERROR`, and the
+    first lines of the ACP client's setup errors, which the model can read inside
+    `EXTERNAL_AGENT_UNAVAILABLE` (`ACP_SETUP_FAILED`, `ACP_STOPPED_AFTER_HANDSHAKE`,
+    `ACP_HANDSHAKE_*`, `ACP_AUTH_*`, `ACP_SERVER*`,
+    `ACP_PROTOCOL_VERSION`, `ACP_NO_WORKING_DIRECTORY`, `ACP_PROMPT_NEEDS_AUTH`,
+    `ACP_SESSION_*`, `ACP_CONFIG_*`, `ACP_NO_*_OPTION`).
+  - Devvi: `DEVVI_UNKNOWN_TURN_END`, `DEVVI_ERROR_WITHOUT_MESSAGE`, and the first lines of the
+    launcher, patch, start and `expose_tools` errors (`DEVVI_NODE_*`, `DEVVI_CLI_*`,
+    `DEVVI_VERSION_*`, `DEVVI_PATCH_*`, `DEVVI_MCP_*`, `DEVVI_DID_NOT_START`,
+    `DEVVI_EXPOSE_*` and others). The developer detail after the first line stays in the code.
+  - The MCP tool server: `TOOL_SERVER_DUPLICATE_NAME`, `TOOL_SERVER_DEFERRED_TOOL`,
+    `TOOL_SERVER_NOT_A_TOOL`, and `UNKNOWN_TOOL_SEPARATOR`, `UNKNOWN_TOOL_NONE`,
+    `APPROVAL_ARGUMENTS_CHANGED_RESULT` and `TOOL_FAILED_EXCEPTION`; the agent loop and
+    fan-out task failures now use the shared constants too.
+  - Shared transport setup and replies: `EXTERNAL_PROCESS_*` and `EXTERNAL_RPC_*`.
+- The Devvi SDK re-attach also finds a task of several text parts in Devvi's session log (it
+  matches the text Devvi logged), so after a crash such a prompt is not sent a second time.
+- A text shortened with `EXTERNAL_AGENT_LINE_SHORTENED` leaves only the marker when the
+  limit is shorter than the marker; otherwise the marker counts toward the limit.
 
 ### Not in this version
 

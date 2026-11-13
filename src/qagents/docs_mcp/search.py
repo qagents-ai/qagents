@@ -3,11 +3,16 @@
 Tokens are lowercase words. Identifiers are kept whole and also split into their parts, so
 ``requires_approval`` matches ``requires_approval``, ``approval`` and ``requires``, and
 ``ScriptedModel`` matches ``scriptedmodel``, ``scripted`` and ``model``. Hyphenated words
-also give their joined form (``sub-agent`` gives ``subagent``). A light suffix stemmer
-folds plurals and verb endings (``approvals``, ``approved`` and ``approve`` all match).
+also give their joined form (``sub-agent`` gives ``subagent``), and an acronym gives its
+joined form with the next part (``SQLiteStore`` gives ``sqlite``). A light suffix stemmer
+folds plurals and verb endings (``approvals``, ``approved`` and ``approve`` all match;
+``retries`` and ``retried`` too; ``code`` and ``coding``).
 
-A few query words used by other frameworks are expanded to the words the qagents docs use
-(`SYNONYMS`); expansions count half as much as the words typed.
+A few query words used by other frameworks, or by people new to agents, are expanded to the
+words the qagents docs use (`SYNONYMS`, `PHRASES`); expansions count half as much as the
+words typed. The word the whole corpus is about (``agent``, `SUBJECT_WORDS`) counts little
+next to other words, so ``agent tools`` is a question about tools. `BM25Index` says how the
+rest of the ranking works: titles and headings, priors, and names.
 """
 
 from __future__ import annotations
@@ -88,10 +93,28 @@ SYNONYMS: dict[str, tuple[str, ...]] = {
     "retry": ("modelretry", "retry_ambiguous"),
     "idempotency": ("operation_id", "idempotent"),
     "crash": ("resume", "recover", "journal"),
+    "replay": ("cassette",),
+    "vcr": ("cassette",),
+    "die": ("crash", "resume", "recover"),
+    "define": ("decorate",),
+    "decorator": ("decorate",),
+    "exception": ("error",),
+    "history": ("conversation", "session"),
+    "wait": ("pause",),
+    "block": ("output_guardrails", "guardrail"),  # a guardrail ends a run "blocked"
+    "frontend": ("front", "browser", "agui"),
+    "terminal": ("cli", "command"),
+    "cli": ("command", "line"),
 }
 """Query expansions, keyed and valued by stemmed tokens. Each expansion counts half."""
 
 _EXPANSION_WEIGHT = 0.5
+
+SUBJECT_WORDS = frozenset({"agent", "qagent"})
+"""Stemmed words that name what the whole corpus is about. In ``agent tools`` or ``test my
+agent`` the word ``agent`` says what the question is about, not which page answers it,
+so next to other words it counts `SUBJECT_WEIGHT` (alone, it counts in full)."""
+SUBJECT_WEIGHT = 0.25
 
 
 def stem(word: str) -> str:
@@ -100,6 +123,8 @@ def stem(word: str) -> str:
         return word
     if word.endswith("ies") and len(word) > 4:
         word = word[:-3] + "y"
+    elif word.endswith("ied"):  # retried, denied; died
+        return word[:-3] + "y" if len(word) > 4 else word[:-1]
     elif word.endswith("sses"):
         word = word[:-2]
     elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
@@ -112,7 +137,7 @@ def stem(word: str) -> str:
         word = word[:-2]
         if len(word) > 2 and word[-1] == word[-2] and word[-1] not in "lsz":
             word = word[:-1]
-    if word.endswith("e") and len(word) > 4:
+    if word.endswith("e") and len(word) > 3:  # code, coding and coded: "cod"
         word = word[:-1]
     return word
 
@@ -143,6 +168,10 @@ def _word_tokens(word: str) -> tuple[str, ...]:
             part = part.lower()
             if len(part) > 1 and part not in STOPWORDS:
                 tokens.append(stem(part))
+        for first, second in zip(parts, parts[1:], strict=False):
+            acronym = len(first) > 1 and first.isupper() and second.istitle()
+            if acronym and (first + second).lower() != lower:  # SQLiteStore: also "sqlite"
+                tokens.append(stem((first + second).lower()))
     return tuple(tokens)
 
 
@@ -162,8 +191,22 @@ PHRASES: dict[str, str] = {
     "tool approval": "requires_approval approval",
     "max iterations": "max_turns limits",
     "final answer": "output output_type",
+    "hello world": "quickstart first agent",
+    "as a tool": "as_tool",
+    "as they arrive": "stream text_delta",
+    "as it arrives": "stream text_delta",
+    "as it is generated": "stream text_delta",
+    "token by token": "stream text_delta",
+    "word by word": "stream text_delta",
+    "without an api key": "key scriptedmodel offline",
+    "without a key": "key scriptedmodel offline",
+    "no api key": "key scriptedmodel offline",
 }
-"""Phrases that mean one qagents idea. A phrase in a query is replaced by these words."""
+"""Phrases that mean one qagents idea. A phrase in a query is replaced by these words.
+
+Each entry is an idiom, not a question: ``as a tool`` is how people say `Agent.as_tool`,
+and ``token by token`` how they ask for streaming. Words that are ambiguous on their own
+(``hand`` in ``by hand``) are not expanded."""
 
 _STEMMED_SYNONYMS = {stem(key): value for key, value in SYNONYMS.items()}
 _IDENTIFIER = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|\w*_\w*|[A-Z][a-z0-9]+[A-Z]\w*")
@@ -175,7 +218,8 @@ class Query:
 
     terms: dict[str, float]
     typed: frozenset[str]
-    """Tokens the user typed (or a phrase stood for), as opposed to expansions."""
+    """Tokens the user typed (or a phrase stood for), as opposed to expansions. Their weight
+    in `terms` is 1, or `SUBJECT_WEIGHT` for a subject word next to other words."""
     full_names: frozenset[str]
     """Identifier-like words as typed, lowercased, without a ``qagents.`` prefix."""
     last_names: frozenset[str]
@@ -183,6 +227,9 @@ class Query:
     names_code: bool
     """Whether the query names code (``Agent.run``, ``max_turns``, ``ScriptedModel``, or a
     single word) rather than asking a question in prose."""
+    plain_word: bool
+    """Whether the query is one plain word (``tools``, ``hooks``, ``ACP``): it may name a
+    module or a function, but it is as likely to name the idea a guide page explains."""
     phrase: str
     expansions: dict[str, frozenset[str]] = field(default_factory=dict)
     """For each typed token, the tokens it was expanded to."""
@@ -222,6 +269,8 @@ def parse_query(text: str) -> Query:
     last: set[str] = set()
     words = [word.strip(".") for word in re.findall(r"[A-Za-z_][\w.]*", text)]
     words = [word for word in words if word]
+    if len(words) > 1 and _HYPHENATED.fullmatch(text.strip()):
+        words = [text.strip().replace("-", "")]  # one hyphenated name: AG-UI, sub-agent
     # A single word is a name; in a longer query only identifier-like words are.
     named = words if len(words) == 1 else [w for w in words if _IDENTIFIER.fullmatch(w)]
     for word in named:
@@ -229,12 +278,22 @@ def parse_query(text: str) -> Query:
         full.add(word)
         last.add(word.rsplit(".", 1)[-1])
     names_code = bool(named)
+    plain_word = (
+        len(words) == 1 and words[0].isalpha() and (words[0].islower() or words[0].isupper())
+    )
     typed = frozenset(token for token, weight in weights.items() if weight == 1.0)
-    return Query(weights, typed, frozenset(full), frozenset(last), names_code, phrase, expansions)
+    if typed - SUBJECT_WORDS:
+        for token in typed & SUBJECT_WORDS:
+            weights[token] = SUBJECT_WEIGHT
+    return Query(
+        weights, typed, frozenset(full), frozenset(last), names_code, plain_word, phrase,
+        expansions,
+    )  # fmt: skip
 
 
 def query_terms(query: str) -> dict[str, float]:
-    """The weighted tokens of a query: typed words weigh 1, expansions 0.5."""
+    """The weighted tokens of a query: typed words weigh 1 (a subject word next to others
+    `SUBJECT_WEIGHT`), expansions 0.5."""
     return parse_query(query).terms
 
 
@@ -258,6 +317,21 @@ class SearchDoc:
     """Exact names that make this the best answer, for example ``("scriptedmodel",)``."""
     extra: str = ""
     """Text that is searched but not shown in snippets."""
+    heading: str = ""
+    """The section's own heading. A query that says what it says ranks the section higher
+    (`BM25Index.HEADING_WEIGHT`)."""
+    titles: tuple[str, ...] = ()
+    """Titles above it: the page's title and nav title for a section, the description for
+    an example. They count half as much as a heading of its own."""
+    topic: str = ""
+    """Words that say what the page is about (``Devvi as a coding worker``), for a page on
+    one integration. With `off_topic`, a query that says none of them weighs it less. Words
+    common to the whole corpus are left out (`BM25Index.UBIQUITOUS`)."""
+    topic_words: str = ""
+    """More words that name the page's topic, though the page may not use them (``codex``),
+    all kept."""
+    off_topic: float = 1.0
+    """The weight of this document for a query that does not mention its `topic`."""
 
 
 @dataclass
@@ -268,7 +342,20 @@ class Hit:
 
 
 class BM25Index:
-    """An Okapi BM25 index with a title boost, an exact-name boost and per-kind priors."""
+    """An Okapi BM25 index with a title boost, a heading match, an exact-name boost and
+    per-kind priors.
+
+    A document's score is its BM25 score times:
+
+    - its prior (`SearchDoc.boost`), and `SearchDoc.off_topic` for a page on one
+      integration when the query does not name that integration;
+    - how much of the query it covers, each typed word weighted by its IDF, so a document
+      with every rare word wins but missing a word the whole corpus uses (``agent``) costs
+      little. A page on one integration covers the words that name its topic
+      (`SearchDoc.topic_words`) though it may not use them;
+    - how well the query and one of its headings say the same thing (`HEADING_WEIGHT`);
+    - the exact-name boost, when the query names an object or an example.
+    """
 
     TITLE_WEIGHT = 3
     """How many times the title's tokens count."""
@@ -277,6 +364,22 @@ class BM25Index:
     had it, so a one-line docstring does not outrank the page that explains the idea."""
     PROSE_API_FACTOR = 0.6
     """API entries count this much for a question written in prose, unless they are named."""
+    NAME_FACTOR = 4.0
+    """An object whose full name the query is (``Agent.resume``, ``ScriptedModel``)."""
+    LAST_NAME_FACTOR = 1.5
+    """An object whose last name the query mentions, or whose name is the one plain word the
+    query is when a guide section is named by that word too (``tools`` names
+    `Toolkit.tools`, but it is also the idea the page ``Tools`` explains). A plain word that
+    names no section (``evals``, ``postgres``) gets `NAME_FACTOR`."""
+    UBIQUITOUS = 0.5
+    """A word in more than this share of the guide sections (``agent``, ``tool``) says
+    nothing about a page's topic: a query with only such words is about the core."""
+    HEADING_WEIGHT = 2.0
+    """A section whose heading is exactly the query scores ``1 + HEADING_WEIGHT`` times as
+    much; a partial match scores in proportion to the share of the query's words the
+    heading has times the share of the heading's words the query has (`_heading_match`).
+    The titles above it (`SearchDoc.titles`) count half. A page titled ``Tools`` answers
+    ``tools`` better than a long section that uses the word often."""
 
     def __init__(self, docs: Sequence[SearchDoc], *, k1: float = 1.2, b: float = 0.75) -> None:
         self.docs = list(docs)
@@ -284,6 +387,9 @@ class BM25Index:
         self.b = b
         self._postings: dict[str, list[tuple[int, int]]] = defaultdict(list)
         self._lengths: list[int] = []
+        self._headings = [
+            tuple(_Heading.of(text) for text in (doc.heading, *doc.titles)) for doc in self.docs
+        ]
         for index, doc in enumerate(self.docs):
             counts = Counter(tokenize(doc.text))
             counts.update(tokenize(doc.extra))
@@ -294,6 +400,23 @@ class BM25Index:
                 self._postings[token].append((index, count))
         total = sum(self._lengths)
         self._average = total / len(self._lengths) if self._lengths else 0.0
+        sections = sum(1 for doc in self.docs if doc.kind == "docs")
+        common = sections * self.UBIQUITOUS
+
+        def in_sections(token: str) -> int:
+            return sum(1 for i, _ in self._postings.get(token, ()) if self.docs[i].kind == "docs")
+
+        self._topics = [
+            frozenset(t for t in tokenize(doc.topic) if in_sections(t) <= common)
+            | frozenset(tokenize(doc.topic_words))
+            for doc in self.docs
+        ]
+        # the tokens of the one-word headings and titles of the guide pages (``Tools``,
+        # ``Hooks``): the ideas a guide section is named by
+        self._guide_words = frozenset().union(
+            *(h.tokens for doc, hs in zip(self.docs, self._headings, strict=True)
+              if doc.kind == "docs" for h in hs if len(h.words) == 1)
+        )  # fmt: skip
 
     def __len__(self) -> int:
         return len(self.docs)
@@ -322,11 +445,13 @@ class BM25Index:
         floor = self._average * self.MIN_LENGTH
         scores: dict[int, float] = defaultdict(float)
         matched: dict[int, set[str]] = defaultdict(set)
+        idfs: dict[str, float] = {}
         for term, weight in terms.items():
             postings = self._postings.get(term)
             if not postings:
                 continue
             idf = math.log(1 + (count - len(postings) + 0.5) / (len(postings) + 0.5))
+            idfs[term] = idf
             for index, tf in postings:
                 length = max(self._lengths[index], floor)
                 norm = (
@@ -338,25 +463,39 @@ class BM25Index:
                 matched[index].add(term)
 
         typed = parsed.typed
+        typed_weight = sum(idfs.get(term, 0.0) * terms[term] for term in typed)
+        # one plain word that names a guide section too (``tools``) may mean the idea the
+        # section explains, not the object; one that names no section (``evals``) is the
+        # object's name
+        name_factor = (
+            self.LAST_NAME_FACTOR
+            if parsed.plain_word and typed <= self._guide_words
+            else self.NAME_FACTOR
+        )
         hits: list[Hit] = []
         for index, score in scores.items():
             doc = self.docs[index]
             if allowed is not None and doc.kind not in allowed:
                 continue
             score *= doc.boost
-            if typed:
-                found = matched[index]
+            if doc.off_topic != 1.0 and not self._topics[index] & typed:
+                score *= doc.off_topic
+            if typed_weight:
+                found = matched[index] | self._topics[index]  # a page covers its topic
                 covered = sum(
-                    1.0 if term in found else 0.5 if parsed.expansions.get(term, set()) & found
-                    else 0.0
+                    idfs.get(term, 0.0) * terms[term]
+                    * (1.0 if term in found else 0.5 if parsed.expansions.get(term, set()) & found
+                       else 0.0)
                     for term in typed
                 )  # fmt: skip
-                score *= 0.5 + covered / len(typed)  # documents with every typed word rank first
+                score *= 0.5 + covered / typed_weight  # documents with every rare word first
+            if typed:
+                score *= 1 + self.HEADING_WEIGHT * self._heading_match(index, parsed)
             names = set(doc.names)
             if names & parsed.full_names:
-                score *= 4.0
+                score *= name_factor
             elif names & parsed.last_names:
-                score *= 1.5
+                score *= self.LAST_NAME_FACTOR
             elif doc.kind == "api" and not parsed.names_code:
                 score *= self.PROSE_API_FACTOR
             if len(parsed.phrase) > 6 and " " in parsed.phrase:
@@ -365,6 +504,36 @@ class BM25Index:
             hits.append(Hit(doc, score, matched[index] & set(typed)))
         hits.sort(key=lambda hit: (-hit.score, hit.doc.cite))
         return self._diverse(hits, limit, per_group, single_kind=allowed is not None), len(hits)
+
+    def _heading_match(self, index: int, query: Query) -> float:
+        """How well the query and the best of a document's headings say the same thing, from
+        0 (no shared word) to 1 (the same words): the share of the query's words the heading
+        has times the share of the heading's words the query has. Titles count half.
+
+        A query word whose expansion is in the heading (``hand`` and ``Handoffs``) counts
+        half, and a subject word (`SUBJECT_WORDS`) counts as little in the heading as in the
+        query."""
+        typed, terms = query.typed, query.terms
+        total = sum(terms[term] for term in typed)
+        said = frozenset(terms)  # the typed words and their expansions
+        best = 0.0
+        for position, heading in enumerate(self._headings[index]):
+            if not heading.tokens or not heading.tokens & said:
+                continue
+            in_query = 0.0
+            for term in typed:
+                if term in heading.tokens:
+                    in_query += terms[term]
+                elif query.expansions.get(term, frozenset()) & heading.tokens:
+                    in_query += terms[term] * _EXPANSION_WEIGHT
+            shared = sum(
+                SUBJECT_WEIGHT if word & SUBJECT_WORDS else 1.0
+                for word in heading.words
+                if word & said
+            )
+            match = in_query / total * shared / heading.weight
+            best = max(best, match if position == 0 else match / 2)
+        return best
 
     def _diverse(
         self, hits: list[Hit], limit: int, per_group: int, *, single_kind: bool
@@ -393,6 +562,23 @@ class BM25Index:
             chosen.extend(overflow[: limit - len(chosen)])
         chosen.sort(key=lambda hit: -hit.score)
         return chosen
+
+
+@dataclass(frozen=True)
+class _Heading:
+    """A heading's words that carry meaning, each as the set of its search tokens."""
+
+    words: tuple[frozenset[str], ...]
+    tokens: frozenset[str]
+    """Every token of every word."""
+    weight: float
+    """How many words it has, a subject word (`SUBJECT_WORDS`) counting `SUBJECT_WEIGHT`."""
+
+    @classmethod
+    def of(cls, text: str) -> _Heading:
+        words = tuple(frozenset(t) for t in map(_word_tokens, _WORD.findall(text)) if t)
+        weight = sum(SUBJECT_WEIGHT if word & SUBJECT_WORDS else 1.0 for word in words)
+        return cls(words, frozenset().union(*words), weight)
 
 
 def snippet(text: str, terms: Iterable[str], *, width: int = 280) -> str:

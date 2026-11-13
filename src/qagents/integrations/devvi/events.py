@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ... import prompts
 from ...external import ExternalOutcome, ExternalStatus
 from ...messages import Message, Part, ReasoningPart, TextPart, ToolCallPart, Usage
 
@@ -229,7 +230,8 @@ def turn_end_outcome(reason: Mapping[str, Any] | None) -> ExternalOutcome:
     | ``interrupted`` | ``interrupted`` | ``interrupted`` (``raw["ambiguous"]``) |
     | anything else | ``error`` | the kind |
 
-    ``raw["agent_stop_reason"]`` is Devvi's ``kind`` (see `TURN_END_KINDS`).
+    ``raw["agent_stop_reason"]`` is Devvi's ``kind`` (see `TURN_END_KINDS`). Without a
+    ``kind`` the ``stop_reason`` is `prompts.DEVVI_UNKNOWN_TURN_END`.
     """
     kind = reason.get("kind") if isinstance(reason, Mapping) else None
     raw: dict[str, Any] = {"agent_stop_reason": kind} if isinstance(kind, str) else {}
@@ -245,9 +247,14 @@ def turn_end_outcome(reason: Mapping[str, Any] | None) -> ExternalOutcome:
         code = failure.get("code") if isinstance(failure, Mapping) else None
         if isinstance(code, str):
             raw["error_code"] = code
-        text = message if isinstance(message, str) and message.strip() else "error"
+        text = (
+            message
+            if isinstance(message, str) and message.strip()
+            else prompts.DEVVI_ERROR_WITHOUT_MESSAGE
+        )
         return ExternalOutcome(status="error", stop_reason=text, raw=raw)
-    return ExternalOutcome(status="error", stop_reason=str(kind or "unknown turn end"), raw=raw)
+    stop_reason = str(kind or prompts.DEVVI_UNKNOWN_TURN_END)
+    return ExternalOutcome(status="error", stop_reason=stop_reason, raw=raw)
 
 
 # --- small helpers -----------------------------------------------------------------------------

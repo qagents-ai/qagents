@@ -834,9 +834,56 @@ async def test_the_turn_projects_onto_ag_ui(tmp_path: Path) -> None:
             stream = to_agui_events(lead.stream("go"), thread_id="t", run_id="r", subagents=mode)
             return [event async for event in stream]
 
+    def check_rules(events: list[dict[str, Any]]) -> None:
+        """The AG-UI event rules, on the whole stream: the run starts first and ends last,
+        exactly once; every tool call's ARGS, END and RESULT follow its START (same id),
+        ARGS before END, START and END once each; every text message is START, CONTENT...,
+        END under one id; every reasoning phase is REASONING_START, its reasoning messages
+        (START, CONTENT..., END under the phase's id), REASONING_END. Text, reasoning
+        message and reasoning phase ids are tracked apart, so an event of one family never
+        passes on an open id of another, and nothing is left open."""
+        types = [event["type"] for event in events]
+        assert types[0] == "RUN_STARTED" and types.count("RUN_STARTED") == 1
+        ends = [kind for kind in types if kind in ("RUN_FINISHED", "RUN_ERROR")]
+        assert ends == ["RUN_FINISHED"] and types[-1] == "RUN_FINISHED"
+        calls: dict[str, str] = {}  # id -> "started" | "ended"
+        opened: dict[tuple[str, str], str] = {}  # (family, id) -> "open" | "closed"
+        families = {"TEXT_MESSAGE": "text", "REASONING_MESSAGE": "reasoning message"}
+        for event in events:
+            kind = event["type"]
+            if kind == "TOOL_CALL_START":
+                assert event["toolCallId"] not in calls, event
+                calls[event["toolCallId"]] = "started"
+            elif kind == "TOOL_CALL_ARGS":
+                assert calls.get(event["toolCallId"]) == "started", event
+            elif kind == "TOOL_CALL_END":
+                assert calls.get(event["toolCallId"]) == "started", event
+                calls[event["toolCallId"]] = "ended"
+            elif kind == "TOOL_CALL_RESULT":
+                assert calls.get(event["toolCallId"]) == "ended", event
+            elif kind == "REASONING_START":
+                assert ("reasoning", event["messageId"]) not in opened, event
+                opened["reasoning", event["messageId"]] = "open"
+            elif kind == "REASONING_END":
+                assert opened.get(("reasoning", event["messageId"])) == "open", event
+                message = opened.get(("reasoning message", event["messageId"]))
+                assert message in (None, "closed"), event  # its message ended first
+                opened["reasoning", event["messageId"]] = "closed"
+            elif (family := families.get(kind.rsplit("_", 1)[0])) is not None:
+                key = (family, event["messageId"])
+                if family == "reasoning message":  # only inside its open reasoning phase
+                    assert opened.get(("reasoning", event["messageId"])) == "open", event
+                if kind.endswith("_START"):
+                    assert key not in opened, event
+                    opened[key] = "open"
+                else:
+                    assert opened.get(key) == "open", event
+                    if kind.endswith("_END"):
+                        opened[key] = "closed"
+        assert set(calls.values()) <= {"ended"} and set(opened.values()) <= {"closed"}
+
     native = await kinds("native")
-    types = [event["type"] for event in native]
-    assert types[0] == "RUN_STARTED" and types[-1] == "RUN_FINISHED"
+    check_rules(native)
     started = next(event for event in native if event["type"] == "SUBAGENT_STARTED")
     assert started["subagentRunId"].startswith("ext:fake-session-1:")
     tagged = [e for e in native if e.get("subagentRunId") == started["subagentRunId"]]
@@ -847,13 +894,14 @@ async def test_the_turn_projects_onto_ag_ui(tmp_path: Path) -> None:
         "REASONING_MESSAGE_END",
         "REASONING_END",
     ]
-    # TOOL_CALL_START/ARGS/END of inner calls are left out of the comparison: the projector
-    # starts tool calls from model_responded, which ACP has not (foundation gap, edit 8).
-    inner = [e["type"] for e in tagged if e["type"] not in ("TOOL_CALL_START", "TOOL_CALL_ARGS")]
-    inner = [kind for kind in inner if kind != "TOOL_CALL_END"]
-    assert inner == [
+    # The agent's own tool call arrives without a model response (ACP has none): the
+    # projector announces it from tool_call_started.
+    assert [e["type"] for e in tagged] == [
         "SUBAGENT_STARTED",
         *reasoning,
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
         "TOOL_CALL_RESULT",
         *reasoning,
         "TEXT_MESSAGE_START",
@@ -861,12 +909,15 @@ async def test_the_turn_projects_onto_ag_ui(tmp_path: Path) -> None:
         "TEXT_MESSAGE_END",
         "SUBAGENT_FINISHED",
     ]
+    start = next(e for e in tagged if e["type"] == "TOOL_CALL_START")
+    assert (start["toolCallId"], start["toolCallName"]) == (APPROVED_CALL, "coder.bash")
     result = next(e for e in tagged if e["type"] == "TOOL_CALL_RESULT")
     assert (result["toolCallId"], result["content"]) == (APPROVED_CALL, "escalated\n")
     text = next(e for e in tagged if e["type"] == "TEXT_MESSAGE_CONTENT")
     assert text["delta"] == "DONE"
 
     custom = await kinds("custom")
+    check_rules(custom)
     values = [e["value"] for e in custom if e["type"] == "CUSTOM" and e["name"] == "subagent_event"]
     inner_types = [value["event"]["type"] for value in values]
     assert inner_types[0] == "run_started"

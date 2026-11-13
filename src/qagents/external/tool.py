@@ -96,7 +96,9 @@ def _build_tool(
     arguments = create_model(f"{label}_arguments", __config__=ConfigDict(extra="forbid"), **fields)
     text = description or agent.description or prompts.EXTERNAL_AGENT_DESCRIPTION.format(name=label)
     if continuable and description is None:
-        text = f"{text} {prompts.EXTERNAL_AGENT_CONTINUE_HINT}"
+        text = prompts.EXTERNAL_AGENT_DESCRIPTION_WITH_HINT.format(
+            description=text, hint=prompts.EXTERNAL_AGENT_CONTINUE_HINT
+        )
     return Tool(
         call_external,
         name=label,
@@ -139,10 +141,17 @@ async def _call(
         if recorded.get("is_error"):
             raise ExternalToolError(recorded["content"], metadata=recorded.get("metadata"))
         return _tool_value(recorded["content"], False, recorded.get("metadata") or {})
-    if session is not None and session not in _opened_sessions(ctx, label):
+    opened = _opened_sessions(ctx, label) if session is not None else set()
+    if session is not None and session not in opened:
         # Only sessions this tool opened in this qagents session continue: an id the model
-        # made up, or one of another tool, workspace or conversation, is refused.
-        unknown = prompts.DEVVI_UNKNOWN_SESSION.format(session=session)
+        # made up, or one of another tool, workspace or conversation, is refused. With the
+        # list full, older sessions may have been dropped from it: the text says so.
+        template = (
+            prompts.EXTERNAL_AGENT_FORGOTTEN_SESSION
+            if len(opened) >= _MAX_REMEMBERED_SESSIONS
+            else prompts.EXTERNAL_AGENT_UNKNOWN_SESSION
+        )
+        unknown = template.format(session=session, name=label, limit=_MAX_REMEMBERED_SESSIONS)
         raise ExternalToolError(
             prompts.EXTERNAL_AGENT_FAILED.format(name=label, error=unknown),
             metadata={"unknown_session": session},
@@ -283,8 +292,14 @@ def _tool_outcome(
             name=label, reason=result.stop_reason or result.status
         )
         if result.text.strip():
-            message = f"{message}\n\n{result.text.strip()}"
-    return f"{message}\n\n[{footer}]", True, metadata
+            message = prompts.EXTERNAL_AGENT_STOPPED_WITH_TEXT.format(
+                message=message, text=result.text.strip()
+            )
+    return (
+        prompts.EXTERNAL_AGENT_ERROR_RESULT.format(message=message, footer=footer),
+        True,
+        metadata,
+    )
 
 
 def _open_breaker(broken: dict[str, str], run_id: str, message: str) -> None:
@@ -296,10 +311,13 @@ def _open_breaker(broken: dict[str, str], run_id: str, message: str) -> None:
 
 def _first_line(text: str, limit: int = 300) -> str:
     """The first line of ``text``, without closing punctuation (the templates end their own
-    sentence), shortened to ``limit`` characters."""
+    sentence), shortened to ``limit`` characters with `prompts.EXTERNAL_AGENT_LINE_SHORTENED`."""
     stripped = (text or "").strip()
     line = stripped.splitlines()[0].rstrip(" .!?") if stripped else ""
-    return line if len(line) <= limit else line[: limit - 3] + "..."
+    if len(line) <= limit:
+        return line
+    marker = prompts.EXTERNAL_AGENT_LINE_SHORTENED
+    return line[: max(limit - len(marker), 0)] + marker
 
 
 def _depth_refusal(parent: RunContext[Any] | None, label: str) -> str | None:

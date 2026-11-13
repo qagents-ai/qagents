@@ -450,7 +450,9 @@ class DevviAgent(ExternalAgent):
             label = name or _tool_safe(self.name)
             description = prompts.DEVVI_DESCRIPTION.format(name=label)
             if continuable:
-                description = f"{description} {base_prompts.EXTERNAL_AGENT_CONTINUE_HINT}"
+                description = base_prompts.EXTERNAL_AGENT_DESCRIPTION_WITH_HINT.format(
+                    description=description, hint=base_prompts.EXTERNAL_AGENT_CONTINUE_HINT
+                )
         return super().as_tool(
             name=name,
             description=description,

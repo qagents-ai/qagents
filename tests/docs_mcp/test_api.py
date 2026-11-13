@@ -251,3 +251,48 @@ def test_a_missing_extra_falls_back_to_the_source(service, monkeypatch):
     assert "is not installed), so this comes from the source" in text
     assert "pip install 'qagents[mcp]'" in text
     assert "Source: `src/qagents/toolkits/mcp.py:" in text
+
+
+EXTERNAL_CONSTANTS = {
+    "APPROVAL_KEY": ("permissions.py", "``ToolResultPart.metadata`` key of an `ExternalApproval`"),
+    "CHECKPOINT_KIND": ("contract.py", "Journal entry kind for facts a tool call records"),
+    "ExternalStatus": ("contract.py", "How an external turn ended."),
+    "PermissionPosture": ("permissions.py", "What a permission request that needs a human gets"),
+    "STATE_GRANTS": ("tool.py", "``ctx.state`` key: permission requests that paused the run"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(EXTERNAL_CONSTANTS))
+def test_a_re_exported_constant_shows_its_attribute_docstring(service, name):
+    """A str or a ``Literal`` has no ``__module__``: its entry is found in the module that
+    defines it, which holds the same object."""
+    module, doc = EXTERNAL_CONSTANTS[name]
+    text = service.get_api(f"qagents.external.{name}")
+    assert text.startswith(f"# qagents.external.{name} (attribute)"), text[:200]
+    assert f"Source: `src/qagents/external/{module}:" in text
+    assert doc in text and "No docstring." not in text
+
+
+def test_a_module_lists_its_constants_with_their_docstrings(service):
+    text = service.get_api("qagents.external")
+    for name, (_, doc) in EXTERNAL_CONSTANTS.items():
+        line = next(line for line in text.splitlines() if line.startswith(f"- `{name}` "))
+        assert line.startswith(f"- `{name}` (attribute): {doc}"), line
+
+
+def test_a_prompt_constant_shows_its_docstring(service):
+    text = service.get_api("qagents.prompts.OUTPUT_TOOL_ACCEPTED")
+    assert "OUTPUT_TOOL_ACCEPTED = 'Final answer accepted.'" in text
+    assert "Result of a final-answer call that passed validation." in text
+    assert "Source: `src/qagents/prompts.py:" in text and "No docstring." not in text
+
+
+def test_a_constant_is_not_given_the_docstring_of_another_object(service):
+    """A re-exported name counts only when the defining module holds the very same object."""
+    import qagents.external.permissions as permissions
+
+    lookup = service.lookup
+    external = sys.modules["qagents.external"]
+    assert lookup.module_attribute_entry(external, "APPROVAL_KEY", "another value") is None
+    found = lookup.module_attribute_entry(external, "APPROVAL_KEY", permissions.APPROVAL_KEY)
+    assert found is not None and found.path == "qagents.external.permissions.APPROVAL_KEY"

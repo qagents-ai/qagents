@@ -29,8 +29,9 @@ advertised, so Devvi answers its own question tool with "no provider".
 
 Workspaces: Devvi's ``session/resume`` takes no ``cwd``. It restores the stored session
 with its own directory, and its log store finds a session id in any project folder of the
-home, which every `DevviAgent` with the same home shares. So a session id the calling
-model passes (``session=``) could make this agent work in another agent's workspace,
+home, which every `DevviAgent` with the same home shares. So a session id passed as
+``session=`` (by your code, or by the calling model for a session that an ``as_tool()``
+tool of the same name opened) could make this agent work in another agent's workspace,
 outside this agent's workspace lock, change tracking and rules. Before resuming, the
 stored log's header ``cwd`` is compared with the turn's workspace (``normcase`` and
 ``realpath``); a session of another workspace is refused without being opened
@@ -97,7 +98,7 @@ from .._jsonrpc import INVALID_PARAMS, JsonRpcError, JsonRpcPeer
 from .._process import ManagedProcess
 from . import logs
 from ._aio import settle
-from .events import SessionEventMapper, TokenPricing, user_receipt
+from .events import SessionEventMapper, TokenPricing, content_text, user_receipt
 from .launcher import DevviLaunch
 
 logger = logging.getLogger("qagents.integrations.devvi")
@@ -285,15 +286,15 @@ class SdkConnection:
             tail = process.stderr_tail()
             await connection.stop(shutdown_timeout=0, grace=1.0)
             if isinstance(error, JsonRpcError):
-                why = f"initialize failed: {error.message}"
+                why = prompts.DEVVI_INITIALIZE_FAILED.format(message=error.message)
             elif isinstance(error, ExternalAgentTimeoutError):
-                why = f"it did not answer initialize within {timeout:g} seconds"
+                why = prompts.DEVVI_INITIALIZE_TIMEOUT.format(seconds=timeout)
             elif isinstance(error, ExternalAgentConnectionError):
-                why = f"it stopped during start ({error.reason})"
+                why = prompts.DEVVI_STOPPED_DURING_START.format(reason=error.reason)
             else:
                 raise
             raise ExternalAgentConfigurationError(
-                f"Devvi did not start: {why}.\n"
+                f"{prompts.DEVVI_DID_NOT_START.format(why=why)}\n"
                 f"Command: {' '.join(launch.argv(PROFILE))}\nstderr: {tail}",
                 stderr_tail=tail,
             ) from error
@@ -301,8 +302,7 @@ class SdkConnection:
         if not isinstance(info, Mapping):
             await connection.stop(shutdown_timeout=0, grace=1.0)
             raise ExternalAgentConfigurationError(
-                "Devvi did not start: its initialize answer has no serverInfo.\n"
-                f"Answer: {str(answer)[:300]}"
+                f"{prompts.DEVVI_NO_SERVER_INFO}\nAnswer: {str(answer)[:300]}"
             )
         connection.server_info = dict(info)
         connection.ready_s = time.monotonic() - began
@@ -499,6 +499,10 @@ class SdkTransport:
             if repeat and not resumed:
                 return self._session_gone(turn, session_id)
             if turn.session is not None and not resumed:
+                # A session the caller passed that Devvi does not have. Through as_tool(),
+                # a session the tool never opened is refused before this, with
+                # EXTERNAL_AGENT_UNKNOWN_SESSION. This one comes from developer code, or is
+                # one the tool opened that Devvi no longer has (see DEVVI_UNKNOWN_SESSION).
                 return ExternalOutcome(
                     status="error",
                     stop_reason=prompts.DEVVI_UNKNOWN_SESSION.format(session=turn.session),
@@ -758,7 +762,15 @@ class SdkTransport:
             # baseline their text cannot be told apart from this call's.
             turn.raw["reattach"] = "unknown"
             return [{"type": "text", "text": unknown}, *_images(blocks)]
-        sent = [turn.prompt_text, base_prompts.EXTERNAL_AGENT_RESUME, unknown]
+        # The first attempt sent the task's text parts as blocks of one message, and Devvi
+        # logs that message's text with its blocks joined as they are (`content_text`), not
+        # with the blank line of ``prompt_text``: both are matched.
+        sent = [
+            turn.prompt_text,
+            content_text(blocks),
+            base_prompts.EXTERNAL_AGENT_RESUME,
+            unknown,
+        ]
         record = logs.find_prompt_turn(log, message_id=message_id, prompts=sent, after=after)
         if record is None:
             if message_id is not None:  # Devvi took the prompt, yet its log does not show it
@@ -922,5 +934,10 @@ def _images(blocks: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _first_line(text: str, limit: int = 300) -> str:
+    """The first line of ``text``, cut to ``limit`` characters with
+    `prompts.EXTERNAL_AGENT_LINE_SHORTENED`: it becomes a stop reason the model reads."""
     line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
-    return line if len(line) <= limit else line[: limit - 3] + "..."
+    if len(line) <= limit:
+        return line
+    marker = base_prompts.EXTERNAL_AGENT_LINE_SHORTENED
+    return line[: max(limit - len(marker), 0)] + marker

@@ -275,7 +275,7 @@ class JsonRpcPeer:
                 raise
             self._give_up(request_id)
             raise ExternalAgentTimeoutError(
-                f"{self.name} did not answer {method!r} within {timeout:g} seconds."
+                prompts.EXTERNAL_RPC_TIMEOUT.format(name=self.name, method=method, seconds=timeout)
             ) from None
         except asyncio.CancelledError:
             self._give_up(request_id)
@@ -468,7 +468,9 @@ class JsonRpcPeer:
         if "method" in message:
             if not isinstance(method, str):
                 if "id" in message:
-                    await self._answer_error(message["id"], INVALID_REQUEST, "Invalid Request")
+                    await self._answer_error(
+                        message["id"], INVALID_REQUEST, prompts.EXTERNAL_RPC_INVALID_REQUEST
+                    )
                 self._malformed_line(line, "its method is not a string")
                 return
             self._malformed_run = 0
@@ -562,7 +564,7 @@ class JsonRpcPeer:
         handler = self._requests.get(method)
         try:
             if handler is None:
-                missing = f"Method not found: {method}"
+                missing = prompts.EXTERNAL_RPC_METHOD_NOT_FOUND.format(method=method)
                 await self._answer_error(request_id, METHOD_NOT_FOUND, missing)
                 return
             try:
@@ -574,19 +576,25 @@ class JsonRpcPeer:
                 if _key(request_id) not in self._cancelled_by_peer or self._closed:
                     raise
                 self._cancelled_by_peer.discard(_key(request_id))
-                await self._answer_error(request_id, REQUEST_CANCELLED, "Request cancelled")
+                await self._answer_error(
+                    request_id, REQUEST_CANCELLED, prompts.EXTERNAL_RPC_REQUEST_CANCELLED
+                )
                 return
             except Exception as error:
                 logger.exception("Handler of request %r from %s raised", method, self.name)
                 await self._answer_error(
-                    request_id, INTERNAL_ERROR, f"Internal error: {type(error).__name__}"
+                    request_id,
+                    INTERNAL_ERROR,
+                    prompts.EXTERNAL_RPC_INTERNAL_ERROR.format(type=type(error).__name__),
                 )
                 return
             try:
                 await self._answer(request_id, result=result)
             except (TypeError, ValueError) as error:  # the result is not JSON
                 logger.error("Result of %r for %s is not JSON: %s", method, self.name, error)
-                await self._answer_error(request_id, INTERNAL_ERROR, "Internal error: bad result")
+                await self._answer_error(
+                    request_id, INTERNAL_ERROR, prompts.EXTERNAL_RPC_BAD_RESULT
+                )
         except ExternalAgentConnectionError:
             return  # closed while answering: nobody is left to answer
 

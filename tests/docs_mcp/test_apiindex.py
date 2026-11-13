@@ -86,3 +86,37 @@ def test_lazy_names_and_extended_all(tmp_path):
     found = publics(package)
     assert found["qagents.core.Extra"] == "qagents.Extra"
     assert found["qagents.toolkits.mcp.Toolkit"] == "qagents.Toolkit"
+
+
+def test_attribute_comments_document_constants(tmp_path):
+    """``#:`` comments above an assignment, or after it on its line, are its docstring; a
+    string literal after it wins."""
+    core = [
+        "#: The default port.",
+        "#: Change it with ``--port``.",
+        "PORT = 8080",
+        'HOST = "localhost"  #: Where the server listens.',
+        'NAME = "core"  #: Not this one.',
+        "'The name, from the string.'",
+        "# an ordinary comment is not documentation",
+        "PLAIN = 1",
+        'GREETING = "Γειά σου"  #: The Greek greeting.',
+        'ARROW = "→"  #: An arrow.',
+        "",
+        "",
+        "class Server:",
+        "    'A server.'",
+        "",
+        "    #: Seconds before a request times out.",
+        "    timeout: float = 5.0",
+    ]
+    package = write(tmp_path / "qagents", {"__init__.py": "", "core.py": "\n".join(core) + "\n"})
+    docs = {entry.path: entry.doc for entry in build_api_index(package, package.parent)}
+    assert docs["qagents.core.PORT"] == "The default port.\nChange it with ``--port``."
+    assert docs["qagents.core.HOST"] == "Where the server listens."
+    assert docs["qagents.core.NAME"] == "The name, from the string."
+    assert "qagents.core.PLAIN" not in docs  # an undocumented constant is not listed
+    # non-ASCII text before the comment: the column ast gives is a byte offset
+    assert docs["qagents.core.GREETING"] == "The Greek greeting."
+    assert docs["qagents.core.ARROW"] == "An arrow."
+    assert docs["qagents.core.Server.timeout"] == "Seconds before a request times out."

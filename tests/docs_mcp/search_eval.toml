@@ -1,0 +1,574 @@
+# Questions a newcomer or a coding agent types into `search`, with the answers that should
+# come first. Read by tests/docs_mcp/test_search_eval.py: the opt-in benchmark
+# (`pytest tests/docs_mcp -m docs_benchmark`) reports top-1 and top-3 hit rates over all of
+# them, and the default suite pins the questions listed in `PINNED` there.
+#
+# `expected` lists acceptable first answers. Each one is a page (`concepts/tools.md`, any of
+# its sections matches), a section (`concepts/tools.md#flags`), an example file
+# (`examples/patterns/supervisor.py`) or an API source file (`src/qagents/evals.py`, any
+# object defined in it matches). `style` is `bare` (a few words), `natural` (a sentence) or
+# `synonym` (words the docs do not use for the idea).
+
+# --- getting started --------------------------------------------------------------------
+
+[[question]]
+topic = "getting started"
+style = "bare"
+query = "getting started"
+expected = ["getting-started.md"]
+
+[[question]]
+topic = "getting started"
+style = "natural"
+query = "how do I install qagents"
+expected = ["getting-started.md#install", "README.md#install"]
+
+[[question]]
+topic = "getting started"
+style = "synonym"
+query = "hello world agent"
+expected = ["getting-started.md", "examples/quickstart.py"]
+
+[[question]]
+topic = "getting started"
+style = "natural"
+query = "can I try an agent without an API key"
+expected = ["getting-started.md#see-it-run-without-a-key", "testing.md"]
+
+[[question]]
+topic = "getting started"
+style = "bare"
+query = "first agent"
+expected = ["getting-started.md"]
+
+# --- tools ------------------------------------------------------------------------------
+
+[[question]]
+topic = "tools"
+style = "bare"
+query = "agent tools"
+expected = ["concepts/tools.md", "getting-started.md"]
+
+[[question]]
+topic = "tools"
+style = "natural"
+query = "how do I make an agent with tools"
+expected = ["concepts/tools.md", "getting-started.md"]
+
+[[question]]
+topic = "tools"
+style = "bare"
+query = "tools"
+expected = ["concepts/tools.md"]
+
+[[question]]
+topic = "tools"
+style = "bare"
+query = "define a tool"
+expected = ["concepts/tools.md"]
+
+[[question]]
+topic = "tools"
+style = "synonym"
+query = "give my agent a python function it can call"
+expected = ["concepts/tools.md"]
+
+[[question]]
+topic = "tools"
+style = "natural"
+query = "how do I give a tool a timeout"
+expected = ["concepts/tools.md#flags"]
+
+[[question]]
+topic = "tools"
+style = "natural"
+query = "write a tool by hand"
+expected = ["concepts/tools.md"]
+
+[[question]]
+topic = "tools"
+style = "natural"
+query = "what does the model see when a tool raises an exception"
+expected = ["concepts/tools.md#results-and-errors"]
+
+[[question]]
+topic = "tools"
+style = "natural"
+query = "ready-made tools for files and shell commands"
+expected = ["toolkits.md"]
+
+# --- sessions and resume ----------------------------------------------------------------
+
+[[question]]
+topic = "sessions and resume"
+style = "natural"
+query = "resume a run after the process crashed"
+expected = ["concepts/sessions.md#resuming", "concepts/sessions.md#what-is-guaranteed"]
+
+[[question]]
+topic = "sessions and resume"
+style = "natural"
+query = "keep the conversation going between runs"
+expected = ["getting-started.md#keep-the-conversation", "concepts/sessions.md"]
+
+[[question]]
+topic = "sessions and resume"
+style = "synonym"
+query = "chat history memory"
+expected = ["concepts/sessions.md", "getting-started.md#keep-the-conversation"]
+
+[[question]]
+topic = "sessions and resume"
+style = "bare"
+query = "idempotency key"
+expected = ["concepts/sessions.md#idempotency"]
+
+# --- permissions and approvals ----------------------------------------------------------
+
+[[question]]
+topic = "permissions and approvals"
+style = "natural"
+query = "require approval before a tool runs"
+expected = ["concepts/permissions.md"]
+
+[[question]]
+topic = "permissions and approvals"
+style = "natural"
+query = "deny a tool call depending on its arguments"
+expected = ["concepts/permissions.md#decisions-that-depend-on-the-arguments"]
+
+[[question]]
+topic = "permissions and approvals"
+style = "bare"
+query = "permissions"
+expected = ["concepts/permissions.md"]
+
+[[question]]
+topic = "permissions and approvals"
+style = "synonym"
+query = "human in the loop"
+expected = ["concepts/permissions.md", "examples/patterns/human_in_the_loop.py"]
+
+# --- pauses -----------------------------------------------------------------------------
+
+[[question]]
+topic = "pauses"
+style = "natural"
+query = "pause a run and continue it later"
+expected = ["concepts/permissions.md#pause-and-resume", "concepts/sessions.md#resuming"]
+
+[[question]]
+topic = "pauses"
+style = "natural"
+query = "wait for a person to approve and then resume"
+expected = ["concepts/permissions.md#pause-and-resume"]
+
+# --- state ------------------------------------------------------------------------------
+
+[[question]]
+topic = "state"
+style = "natural"
+query = "share state between tool calls"
+expected = ["src/qagents/tools.py", "concepts/tools.md#the-run-context"]
+
+[[question]]
+topic = "state"
+style = "natural"
+query = "pass a database connection to my tools"
+expected = ["concepts/tools.md#the-run-context"]
+
+# --- guardrails -------------------------------------------------------------------------
+
+[[question]]
+topic = "guardrails"
+style = "bare"
+query = "guardrails"
+expected = ["src/qagents/agent.py", "src/qagents/errors.py", "examples/patterns/content_flow.py"]
+
+[[question]]
+topic = "guardrails"
+style = "natural"
+query = "block an answer that leaks secrets"
+expected = ["src/qagents/agent.py", "src/qagents/errors.py", "concepts/structured-output.md"]
+
+# --- structured output ------------------------------------------------------------------
+
+[[question]]
+topic = "structured output"
+style = "bare"
+query = "structured output"
+expected = ["concepts/structured-output.md"]
+
+[[question]]
+topic = "structured output"
+style = "natural"
+query = "return a pydantic object instead of text"
+expected = ["concepts/structured-output.md"]
+
+[[question]]
+topic = "structured output"
+style = "synonym"
+query = "json response format"
+expected = ["concepts/structured-output.md"]
+
+# --- streaming --------------------------------------------------------------------------
+
+[[question]]
+topic = "streaming"
+style = "bare"
+query = "streaming"
+expected = ["concepts/streaming.md"]
+
+[[question]]
+topic = "streaming"
+style = "natural"
+query = "show tokens as they arrive"
+expected = ["concepts/streaming.md", "getting-started.md#stream-the-answer"]
+
+[[question]]
+topic = "streaming"
+style = "natural"
+query = "stop an agent that is already running"
+expected = ["concepts/streaming.md#cancel"]
+
+# --- multi-agent and handoffs -----------------------------------------------------------
+
+[[question]]
+topic = "multi-agent"
+style = "bare"
+query = "multiple agents"
+expected = ["concepts/multi-agent.md"]
+
+[[question]]
+topic = "multi-agent"
+style = "natural"
+query = "hand the conversation off to another agent"
+expected = ["concepts/multi-agent.md#handoffs"]
+
+[[question]]
+topic = "multi-agent"
+style = "natural"
+query = "use one agent as a tool of another"
+expected = ["concepts/multi-agent.md#sub-agents"]
+
+[[question]]
+topic = "multi-agent"
+style = "synonym"
+query = "supervisor with worker agents"
+expected = ["concepts/multi-agent.md#sub-agents", "examples/patterns/supervisor.py"]
+
+# --- workflows --------------------------------------------------------------------------
+
+[[question]]
+topic = "workflows"
+style = "bare"
+query = "workflow steps"
+expected = ["concepts/multi-agent.md#workflows"]
+
+[[question]]
+topic = "workflows"
+style = "synonym"
+query = "deterministic pipeline of llm calls"
+expected = ["concepts/multi-agent.md#workflows"]
+
+# --- runtime and recovery ---------------------------------------------------------------
+
+[[question]]
+topic = "runtime and recovery"
+style = "natural"
+query = "what happens if the process dies during a tool call"
+expected = ["concepts/sessions.md#what-is-guaranteed", "concepts/sessions.md#resuming", "design.md#guarantees"]
+
+[[question]]
+topic = "runtime and recovery"
+style = "natural"
+query = "run agents in the background and recover them on another worker"
+expected = ["src/qagents/runtime.py"]
+
+[[question]]
+topic = "runtime and recovery"
+style = "natural"
+query = "is a failed model request retried"
+expected = ["concepts/loop.md#retries-and-billing"]
+
+[[question]]
+topic = "runtime and recovery"
+style = "natural"
+query = "limit the number of turns"
+expected = ["concepts/loop.md#limits"]
+
+# --- stores and Postgres ----------------------------------------------------------------
+
+[[question]]
+topic = "stores"
+style = "natural"
+query = "store sessions in postgres"
+expected = ["concepts/sessions.md#stores", "src/qagents/stores/postgres.py"]
+
+[[question]]
+topic = "stores"
+style = "bare"
+query = "sqlite store"
+expected = ["concepts/sessions.md#stores", "src/qagents/session.py"]
+
+[[question]]
+topic = "stores"
+style = "bare"
+query = "postgres"
+expected = ["src/qagents/stores/postgres.py:1", "concepts/sessions.md#stores"]
+
+# --- tracing and MLflow -----------------------------------------------------------------
+
+[[question]]
+topic = "tracing"
+style = "bare"
+query = "tracing"
+expected = ["concepts/hooks.md#tracing"]
+
+[[question]]
+topic = "tracing"
+style = "bare"
+query = "opentelemetry"
+expected = ["concepts/hooks.md#tracing", "src/qagents/tracing.py"]
+
+[[question]]
+topic = "tracing"
+style = "natural"
+query = "log my agent runs to mlflow"
+expected = ["src/qagents/integrations/mlflow.py", "examples/patterns/mlflow_tracing.py"]
+
+# --- AG-UI ------------------------------------------------------------------------------
+
+[[question]]
+topic = "AG-UI"
+style = "bare"
+query = "AG-UI"
+expected = ["src/qagents/integrations/agui.py"]
+
+[[question]]
+topic = "AG-UI"
+style = "synonym"
+query = "connect a copilotkit frontend"
+expected = ["src/qagents/integrations/agui.py"]
+
+[[question]]
+topic = "AG-UI"
+style = "bare"
+query = "agui"
+expected = ["src/qagents/integrations/agui.py:1"]
+
+# --- model providers --------------------------------------------------------------------
+
+[[question]]
+topic = "model providers"
+style = "bare"
+query = "model providers"
+expected = ["providers.md"]
+
+[[question]]
+topic = "model providers"
+style = "natural"
+query = "use a QCloud model"
+expected = ["providers.md#qcloud", "getting-started.md#your-first-agent-on-qcloud"]
+
+[[question]]
+topic = "model providers"
+style = "synonym"
+query = "use claude"
+expected = ["providers.md", "src/qagents/models/anthropic.py"]
+
+[[question]]
+topic = "model providers"
+style = "natural"
+query = "run against a local model on ollama or vllm"
+expected = ["providers.md#openai-compatible-servers"]
+
+[[question]]
+topic = "model providers"
+style = "natural"
+query = "write my own model provider"
+expected = ["providers.md#writing-a-provider", "examples/custom_provider.py"]
+
+# --- MCP toolkits -----------------------------------------------------------------------
+
+[[question]]
+topic = "MCP toolkits"
+style = "natural"
+query = "use tools from an MCP server"
+expected = ["src/qagents/toolkits/mcp.py", "examples/patterns/mcp_tools.py", "README.md#tools"]
+
+[[question]]
+topic = "MCP toolkits"
+style = "bare"
+query = "mcp toolkit"
+expected = ["src/qagents/toolkits/mcp.py", "examples/patterns/mcp_tools.py", "README.md#tools"]
+
+# --- external agents --------------------------------------------------------------------
+
+[[question]]
+topic = "external agents"
+style = "bare"
+query = "external agents"
+expected = ["concepts/external-agents.md"]
+
+[[question]]
+topic = "external agents"
+style = "synonym"
+query = "drive another coding agent such as claude code"
+expected = ["concepts/external-agents.md", "integrations/acp.md"]
+
+[[question]]
+topic = "external agents"
+style = "natural"
+query = "run claude code as a sub-agent"
+expected = ["concepts/external-agents.md", "integrations/acp.md", "integrations/devvi.md"]
+
+[[question]]
+topic = "external agents"
+style = "synonym"
+query = "delegate coding work to codex"
+expected = ["concepts/external-agents.md", "integrations/acp.md", "integrations/devvi.md"]
+
+[[question]]
+topic = "external agents"
+style = "natural"
+query = "let claude code edit files for me"
+expected = ["concepts/external-agents.md", "integrations/acp.md", "integrations/devvi.md"]
+
+[[question]]
+topic = "external agents"
+style = "synonym"
+query = "an agent that writes code"
+expected = ["concepts/external-agents.md", "integrations/acp.md", "integrations/devvi.md"]
+
+[[question]]
+topic = "external agents"
+style = "bare"
+query = "gemini cli"
+expected = ["concepts/external-agents.md", "integrations/acp.md", "integrations/devvi.md"]
+
+[[question]]
+topic = "external agents"
+style = "natural"
+query = "use codex as a worker"
+expected = ["concepts/external-agents.md", "integrations/acp.md", "integrations/devvi.md"]
+
+[[question]]
+topic = "external agents"
+style = "bare"
+query = "ACP"
+expected = ["integrations/acp.md"]
+
+# --- Devvi ------------------------------------------------------------------------------
+
+[[question]]
+topic = "Devvi"
+style = "bare"
+query = "devvi"
+expected = ["integrations/devvi.md"]
+
+[[question]]
+topic = "Devvi"
+style = "natural"
+query = "let devvi write the code for my agent"
+expected = ["integrations/devvi.md"]
+
+# --- the MCP tool server ----------------------------------------------------------------
+
+[[question]]
+topic = "MCP tool server"
+style = "natural"
+query = "expose my qagents tools to another agent over MCP"
+expected = ["integrations/mcp-server.md"]
+
+[[question]]
+topic = "MCP tool server"
+style = "bare"
+query = "mcp server"
+expected = ["integrations/mcp-server.md"]
+
+# --- the CLI ----------------------------------------------------------------------------
+
+[[question]]
+topic = "CLI"
+style = "natural"
+query = "chat with an agent from the terminal"
+expected = ["src/qagents/cli.py"]
+
+[[question]]
+topic = "CLI"
+style = "bare"
+query = "qagents cli"
+expected = ["src/qagents/cli.py", "coding-agents.md#without-mcp-the-command-line"]
+
+# --- testing and cassettes --------------------------------------------------------------
+
+[[question]]
+topic = "testing"
+style = "natural"
+query = "test my agent without calling a real model"
+expected = ["testing.md"]
+
+[[question]]
+topic = "testing"
+style = "synonym"
+query = "mock the llm in unit tests"
+expected = ["testing.md"]
+
+[[question]]
+topic = "testing"
+style = "natural"
+query = "record model responses once and replay them"
+expected = ["src/qagents/models/recording.py"]
+
+[[question]]
+topic = "testing"
+style = "bare"
+query = "cassette"
+expected = ["src/qagents/models/recording.py"]
+
+# --- evals ------------------------------------------------------------------------------
+
+[[question]]
+topic = "evals"
+style = "bare"
+query = "evals"
+expected = ["src/qagents/evals.py:1"]
+
+[[question]]
+topic = "evals"
+style = "natural"
+query = "score my agent on a dataset of cases"
+expected = ["src/qagents/evals.py", "examples/patterns/evals_compare.py"]
+
+# --- the rest of the guides -------------------------------------------------------------
+
+[[question]]
+topic = "loop"
+style = "synonym"
+query = "set the system prompt"
+expected = ["concepts/loop.md#instructions"]
+
+[[question]]
+topic = "hooks"
+style = "bare"
+query = "hooks"
+expected = ["concepts/hooks.md"]
+
+[[question]]
+topic = "hooks"
+style = "natural"
+query = "conversation gets too long for the context window"
+expected = ["concepts/hooks.md#long-conversations"]
+
+[[question]]
+topic = "serving"
+style = "natural"
+query = "serve an agent over http with fastapi"
+expected = ["serving.md"]
+
+[[question]]
+topic = "docs for coding agents"
+style = "natural"
+query = "add the qagents docs server to claude code"
+expected = ["coding-agents.md#claude-code"]

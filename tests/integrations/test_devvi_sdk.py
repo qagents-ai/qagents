@@ -782,6 +782,37 @@ async def test_continuing_an_unknown_session_is_an_error_without_a_prompt(tmp_pa
     assert "session/prompt" not in methods(record)
 
 
+async def test_the_model_reads_unknown_session_when_devvi_lost_a_session_the_tool_opened(
+    tmp_path: Path,
+) -> None:
+    """The tool opened a session, then Devvi lost it (``--missing``: every resume answers
+    "not found"). The model's continue call passes the tool's own check and reaches Devvi,
+    so the model reads `DEVVI_UNKNOWN_SESSION` inside `EXTERNAL_AGENT_FAILED`, and the
+    troubleshooting table of docs/integrations/devvi.md lists that text."""
+    agent, record = sdk_agent(tmp_path, "text-turn.notifications.jsonl", "--missing")
+    session = Session()
+    async with agent:
+        first = await Agent(
+            ScriptedModel([call("coder", task="Do it."), "ok"]),
+            tools=[agent.as_tool(name="coder")],
+        ).run("go", session=session)
+        opened = tool_results(first)[0].metadata["external"]["session_id"]
+        second = await Agent(
+            ScriptedModel([call("coder", task="Again.", session=opened), "ok"]),
+            tools=[agent.as_tool(name="coder")],
+        ).run("go", session=session)
+    refused = tool_results(second)[-1]
+    gone = texts.DEVVI_UNKNOWN_SESSION.format(session=opened)
+    model_reads = texts.EXTERNAL_AGENT_FAILED.format(name="coder", error=gone)
+    assert refused.is_error
+    assert refused.content.split("\n\n")[0] == model_reads
+    assert "unknown_session" not in (refused.metadata or {})  # not the tool's own refusal
+    assert methods(record).count("session/prompt") == 1  # only the first call's task
+    docs = Path(__file__).parents[2] / "docs" / "integrations" / "devvi.md"
+    quoted = model_reads.replace(opened, "qa-...")
+    assert f"| the model reads `{quoted}` |" in docs.read_text(encoding="utf-8")
+
+
 async def test_a_session_that_cannot_be_reopened_is_an_error(tmp_path: Path) -> None:
     agent, _ = sdk_agent(tmp_path, "text-turn.notifications.jsonl", "--missing")
     async with agent:
@@ -1078,7 +1109,7 @@ async def test_a_session_of_another_workspace_is_refused_before_devvi_opens_it(
     assert refused.raw["session_cwd"] == str(tmp_path / "ws_b")
     # Through the tool, the model may continue only sessions that tool opened: refused even
     # before the workspace check, since this tool never opened b's session.
-    unknown = devvi_texts.DEVVI_UNKNOWN_SESSION.format(session=first.session_id)
+    unknown = texts.EXTERNAL_AGENT_UNKNOWN_SESSION.format(session=first.session_id, name="coder")
     assert tool_results(through_tool)[0].content == texts.EXTERNAL_AGENT_FAILED.format(
         name="coder", error=unknown
     )
@@ -1245,6 +1276,50 @@ def test_reattach_matches_a_prompt_by_text_only_after_the_baseline(
         assert plan == blocks and mapper.replayed == []
     else:
         assert plan is None and mapper.replayed[-1] == "turn/end"
+
+
+def test_reattach_finds_a_task_of_several_text_parts_by_the_text_devvi_logged(
+    tmp_path: Path,
+) -> None:
+    """A task in two text parts goes out as two text blocks of one message, and Devvi logs
+    that message's text with the blocks joined as they are. A repeat whose message id was
+    never journaled finds the turn by that text, so it does not send the task again."""
+    root, cwd, session = tmp_path / "sessions", str(tmp_path / "ws"), "qa-own"
+    task = [TextPart(text="Fix the bug."), TextPart(text="Then run the tests.")]
+    blocks = content_blocks(task)
+    assert [block["type"] for block in blocks] == ["text", "text"]
+    path = logs.session_log_path(root, session, cwd)
+    path.parent.mkdir(parents=True)
+    header = {"type": "session", "version": 4, "id": session, "cwd": cwd, "createdAt": 1}
+    items = turn(step(), assistant("Fixed."), prompt="", token="msg-1")
+    events = [item["params"]["event"] for item in items if item.get("method") == "session.event"]
+    events[0]["data"]["inserted"][0]["content"] = blocks  # the message as it was sent
+    path.write_text("".join(json.dumps(row) + "\n" for row in [header, *events]), "utf-8")
+
+    class Turn:
+        prompt_text = devvi_texts.EXTERNAL_AGENT_TASK_SEPARATOR.join(p.text for p in task)
+        suggested_session_id = session
+        checkpoints: dict[str, Any] = {"external_session": {"session_id": session, "cwd": cwd}}
+
+        def __init__(self) -> None:
+            self.raw: dict[str, Any] = {}
+
+        @contextlib.contextmanager
+        def replaying(self, *, since: Any = None) -> Any:
+            yield
+
+    class Mapper:
+        def __init__(self) -> None:
+            self.replayed: list[str] = []
+
+        def handle_event(self, session_id: str, event: dict[str, Any]) -> None:
+            self.replayed.append(event["type"])
+
+    turn_, mapper = Turn(), Mapper()
+    transport = SdkTransport(SdkSettings(), launch=None, sessions_root=lambda _: root)  # type: ignore[arg-type]
+    plan = transport._reattach(turn_, session, cwd, root, mapper, blocks)  # type: ignore[arg-type]
+    assert turn_.raw["reattach"] == "finished"  # not "not_sent": the task is not sent again
+    assert plan is None and mapper.replayed[-1] == "turn/end"
 
 
 TEXT_TURN = SDK_FIXTURES / "text-turn.session.v4.jsonl"

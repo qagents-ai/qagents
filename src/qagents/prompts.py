@@ -83,6 +83,13 @@ OUTPUT_TOOL_DUPLICATE = "Only one final answer can be given per turn; this call 
 
 UNKNOWN_TOOL = "There is no tool named {name!r}. Available tools: {available}."
 
+UNKNOWN_TOOL_SEPARATOR = ", "
+"""Joins the tool names in the ``available`` of `UNKNOWN_TOOL`, in the agent loop and
+the MCP tool server."""
+
+UNKNOWN_TOOL_NONE = "none"
+"""The ``available`` of `UNKNOWN_TOOL` when the agent loop or MCP tool server has no tool."""
+
 INVALID_ARGUMENTS_JSON = (
     "The arguments for {name!r} were not a valid JSON object ({error}). "
     "Call the tool again with a valid JSON object."
@@ -121,6 +128,11 @@ APPROVAL_ARGUMENTS_CHANGED = (
 )
 """Put before the result of a call that ran with arguments an approver edited
 (``Approval.arguments``), so the model does not report its own arguments as executed."""
+
+APPROVAL_ARGUMENTS_CHANGED_RESULT = "{note}\n{content}"
+"""A tool result whose call ran with edited arguments: ``note`` is
+`APPROVAL_ARGUMENTS_CHANGED`, ``content`` the tool's result. The agent loop uses it for
+model calls and `RunContext.call_tool`; the MCP tool server uses it for standalone calls."""
 
 UNSIGNABLE_CALL = (
     "its arguments hold a value that cannot be written as standard JSON (NaN, an infinity, an "
@@ -164,6 +176,11 @@ TOOL_WAITED_FOR_EARLIER = (
 the thread of an earlier sync call that timed out and still runs, and never started."""
 
 TOOL_FAILED = "{name!r} failed: {error}"
+
+TOOL_FAILED_EXCEPTION = "{type}: {error}"
+"""The exception detail in tool failures and fan-out task failures: ``type`` is the
+exception's class name, ``error`` its message (possibly empty). Shared by the agent loop,
+the MCP tool server and `fan_out`, including the loop's invalid-metadata detail."""
 
 TOOL_INTERRUPTED = (
     "{name!r} had started when the run stopped, and it never reported a result. "
@@ -441,6 +458,11 @@ EXTERNAL_AGENT_CONTINUE_HINT = (
 )
 """Appended to the tool description when the tool is continuable (it takes ``session``)."""
 
+EXTERNAL_AGENT_DESCRIPTION_WITH_HINT = "{description} {hint}"
+"""The description of a continuable tool built without ``description=``: ``description`` is
+the agent's description or `EXTERNAL_AGENT_DESCRIPTION` (`DEVVI_DESCRIPTION` for
+``DevviAgent.as_tool()``), ``hint`` is `EXTERNAL_AGENT_CONTINUE_HINT`."""
+
 EXTERNAL_AGENT_TASK_DESCRIPTION = "The complete task, self-contained."
 """Description of the ``task`` parameter."""
 
@@ -455,6 +477,29 @@ EXTERNAL_AGENT_SESSION_DESCRIPTION = (
 EXTERNAL_AGENT_RESULT = "{text}\n\n[{footer}]"
 """A finished turn: the external agent's final text, then the footer in brackets."""
 
+EXTERNAL_AGENT_ERROR_RESULT = "{message}\n\n[{footer}]"
+"""A turn that did not complete: the error or stop message (`EXTERNAL_AGENT_FAILED`,
+`EXTERNAL_AGENT_STOPPED`, `EXTERNAL_AGENT_INTERRUPTED`, ...), then the footer in brackets."""
+
+EXTERNAL_AGENT_STOPPED_WITH_TEXT = "{message}\n\n{text}"
+"""A stopped turn's message (`EXTERNAL_AGENT_STOPPED`), then the text the agent wrote before
+it stopped. `EXTERNAL_AGENT_ERROR_RESULT` adds the footer after it."""
+
+EXTERNAL_AGENT_TEXT_BLOCK_SEPARATOR = "\n\n"
+"""Goes between two committed blocks of the external agent's text (text with another message
+id than the text before it, ``ExternalTurnContext.text_delta``): in the turn's final text,
+which the calling model reads in `EXTERNAL_AGENT_RESULT`, and at the start of the second
+block's ``text_delta`` event. The ACP and Devvi adapters give each committed block its own
+id."""
+
+EXTERNAL_AGENT_LINE_SHORTENED = "..."
+"""Ends a text that was cut short (the marker counts toward the limit): an error or stop
+reason cut to 300 characters before it goes into `EXTERNAL_AGENT_FAILED` or
+`EXTERNAL_AGENT_UNAVAILABLE` (Devvi's SDK transport cuts its error messages the same way),
+and a permission request's detail cut to 80 characters (``ExternalPermission.detail``, in
+the footer and in `EXTERNAL_AGENT_APPROVED` and `EXTERNAL_AGENT_DECLINED`). A limit shorter
+than the marker leaves the marker alone."""
+
 EXTERNAL_AGENT_NO_TEXT = "({name} wrote no final message.)"
 """Stands for the final text when the turn ended without one."""
 
@@ -468,7 +513,13 @@ EXTERNAL_AGENT_STATUS = "{status} ({reason})"
 """The status in the footer when the turn did not simply complete."""
 
 EXTERNAL_AGENT_FOOTER_TOOLS = "{count} tool calls ({summary})"
-"""Footer part: how many tools the external agent called, by name, most used first."""
+"""Footer part: how many tools the external agent called, by name, most used first.
+``summary`` is `EXTERNAL_AGENT_FOOTER_TOOL_COUNT` per tool, joined with
+`EXTERNAL_AGENT_FOOTER_LIST_SEPARATOR`."""
+
+EXTERNAL_AGENT_FOOTER_TOOL_COUNT = "{tool} {count}"
+"""One tool in the ``summary`` of `EXTERNAL_AGENT_FOOTER_TOOLS`: the external agent's own
+tool name and how often the turn called it."""
 
 EXTERNAL_AGENT_FOOTER_ONE_TOOL = "1 tool call ({summary})"
 """Footer part for exactly one tool call."""
@@ -485,11 +536,20 @@ EXTERNAL_AGENT_FOOTER_ONE_REFUSED = "1 permission refused ({items})"
 EXTERNAL_AGENT_FOOTER_REFUSED_ITEM = "{tool}: {detail}"
 """One refused request in the footer. ``detail`` is the command or the shortened arguments."""
 
+EXTERNAL_AGENT_NO_ARGUMENTS = "(no arguments)"
+"""The ``detail`` of a permission request without arguments (``ExternalPermission.detail``),
+in `EXTERNAL_AGENT_FOOTER_REFUSED_ITEM` and in the approval texts
+(`EXTERNAL_AGENT_APPROVED`, `EXTERNAL_AGENT_DECLINED`, ...)."""
+
 EXTERNAL_AGENT_FOOTER_CHANGED = "changed: {files}"
 """Footer part: files the turn changed in the workspace (when changes are tracked)."""
 
 EXTERNAL_AGENT_FOOTER_MORE = "{count} more"
 """Ends a footer list that was cut short (refused requests after 5, changed files after 20)."""
+
+EXTERNAL_AGENT_FOOTER_LIST_SEPARATOR = ", "
+"""Joins the items of a footer list: the tool counts, the refused requests and the changed
+files, and `EXTERNAL_AGENT_FOOTER_MORE` after the last one shown."""
 
 EXTERNAL_AGENT_FOOTER_SEPARATOR = "; "
 """Joins the parts of the footer."""
@@ -540,7 +600,20 @@ EXTERNAL_AGENT_UNAVAILABLE = (
     "{name} again; do the task another way or report the problem."
 )
 """A failure that will repeat (authentication, billing, a missing credential, a setup error).
-Further calls in the same run fail at once with this text."""
+Further calls in the same run fail at once with this text. For a setup error
+(`ExternalAgentConfigurationError`) ``error`` is its first line: the ACP and Devvi adapters
+build it from the setup texts in their sections below; the lines after it, for the
+developer, are only in the log and in ``str(error)``."""
+
+EXTERNAL_SETUP_LIST_SEPARATOR = ", "
+"""Joins the items of a list in the first line of a setup error of the ACP and Devvi
+adapters: the authentication methods, config options and values a session offers, the Devvi
+versions qagents was tested with, the permission modes, and where a patch holds a
+credential."""
+
+EXTERNAL_SETUP_LIST_NONE = "none"
+"""Stands for an empty list in a setup error (an agent that offers no authentication method,
+a session that offers no config option)."""
 
 EXTERNAL_AGENT_TOO_DEEP = (
     "{name} was not started: runs may nest at most {limit} levels deep, and this one would be "
@@ -555,6 +628,26 @@ EXTERNAL_AGENT_UNMETERED = (
 """The parent run has ``max_total_tokens`` or ``max_cost_usd`` and the external agent reports
 no token usage (ACP agents). The developer can pass ``allow_unmetered=True``."""
 
+EXTERNAL_AGENT_UNKNOWN_SESSION = (
+    "session {session} was not opened by {name} in this conversation; leave session out to "
+    "start a new one"
+)
+"""`EXTERNAL_AGENT_FAILED`'s error when the calling model passes a session that this
+``as_tool()`` tool did not open or continue in this qagents session
+(``ctx.state['qagents.external.sessions']``), while the tool keeps fewer than 50 sessions
+there: none was dropped yet, so the session is surely not one of its own. The agent is not
+reached. Sessions passed by developer code (``ExternalAgent.run(task, session=...)``) are
+not refused."""
+
+EXTERNAL_AGENT_FORGOTTEN_SESSION = (
+    "session {session} is not among the last {limit} sessions that {name} opened or "
+    "continued in this conversation, which are the only ones it can continue; leave session "
+    "out to start a new one"
+)
+"""`EXTERNAL_AGENT_UNKNOWN_SESSION` once the tool keeps its full ``limit`` (50) of sessions:
+only the latest ones are kept, so the session may be one the tool opened earlier and then
+dropped, or one it never opened. The agent is not reached either way."""
+
 # --- two-phase approval across a pause (on_permission="pause") ------------------
 
 EXTERNAL_AGENT_APPROVED = (
@@ -568,7 +661,13 @@ EXTERNAL_AGENT_DECLINED = (
     "Declined: {name} may not run {tool} {detail}{reason}. Call {name} again with "
     "session={session} and say what to do instead, or do the task another way."
 )
-"""Result of the paused call when the human declined. ``reason`` is empty or `` (why)``."""
+"""Result of the paused call when the human declined. ``reason`` is empty or
+`EXTERNAL_AGENT_DECLINED_REASON`."""
+
+EXTERNAL_AGENT_DECLINED_REASON = " ({reason})"
+"""The ``reason`` of `EXTERNAL_AGENT_DECLINED`, `EXTERNAL_AGENT_DECLINED_NO_SESSION` and
+`EXTERNAL_AGENT_DECLINED_GENERIC` when the human gave one (``ExternalApproval(...,
+reason=...)``); ``reason`` here is the human's text. Without one they get an empty string."""
 
 EXTERNAL_AGENT_APPROVED_NO_SESSION = (
     "Approved: {name} may run {tool} {detail} once. Call {name} again to continue."
@@ -617,6 +716,15 @@ EXTERNAL_AGENT_RESUME = (
 """Sent to the external agent when a repeated call (after a crash and a resume) re-attaches
 to a turn that had not finished. Adapters that re-attach use it."""
 
+EXTERNAL_AGENT_TASK_SEPARATOR = "\n\n"
+"""Joins the text parts of a task given as several parts into
+``ExternalTurnContext.prompt_text``: the ``task`` of `ACP_RESUME_TASK` and
+`DEVVI_RESUME_UNKNOWN`, which the external agent reads when a call is repeated after a
+crash, and the task `ScriptedExternalAgent` records. A first attempt sends each part as its
+own block and does not use it. Devvi's SDK transport, re-attaching after a crash, looks for
+the earlier prompt in Devvi's log by ``prompt_text`` and by the text of the blocks it sent
+(which Devvi logs with nothing between them), so a new value does not stop that match."""
+
 # --- reasons recorded with each permission decision ----------------------------
 
 EXTERNAL_PERMISSION_NO_APPROVER = "it needs approval, and nobody can approve it during the turn"
@@ -649,6 +757,101 @@ EXTERNAL_PERMISSION_NO_OPTION = "the agent offered no option to allow it once"
 EXTERNAL_PERMISSION_UNREADABLE = "the agent's input for the tool could not be read"
 """The request is about a tool call whose latest input is not a JSON object, so the rules
 cannot check what would run. It is answered as cancelled (fail closed)."""
+
+EXTERNAL_TOOL_DESCRIPTION = "Tool {tool!r} of the external agent {agent!r}."
+"""Description of the `ExternalTool` that stands for an external agent's tool in a permission
+decision: ``tool`` is the agent's own tool name, ``agent`` the prefix. No qagents model is
+offered this tool; ``can_use_tool`` and ``on_ask`` receive it, and an approver that asks a
+model hands the model this text."""
+
+EXTERNAL_TOOL_NEVER_RUN = "This stands for a tool of an external agent; qagents never runs it."
+"""The `ToolError` an `ExternalTool` raises if anything runs it. Nothing in qagents does: it
+only stands for the external agent's tool in permission decisions."""
+
+# --- shared process setup and JSON-RPC replies ---------------------------------
+# Setup error first lines reach the calling model through EXTERNAL_AGENT_UNAVAILABLE.
+
+EXTERNAL_PROCESS_ENV_NAME = (
+    "Environment variable name {name!r} is not valid: use a non-empty string without '='."
+)
+"""A child process environment has an invalid variable name."""
+
+EXTERNAL_PROCESS_ENV_VALUE = "Environment variable {name} must be a string, not {type}."
+"""A child process environment value is not a string; only its type is shown."""
+
+EXTERNAL_PROCESS_COMMAND_INVALID = (
+    "The command must be a non-empty list of strings, not {command!r}."
+)
+"""The command given to the shared process launcher is empty or holds non-strings."""
+
+EXTERNAL_PROCESS_FILE_MISSING = "Cannot start {program!r}: no such file."
+"""The explicitly named executable path does not exist."""
+
+EXTERNAL_PROCESS_PATH_GIVEN = "the PATH given to the process"
+"""The searched location in `EXTERNAL_PROCESS_PROGRAM_MISSING` with an explicit PATH."""
+
+EXTERNAL_PROCESS_PATH_DEFAULT = "PATH"
+"""The searched location in `EXTERNAL_PROCESS_PROGRAM_MISSING` with the default PATH."""
+
+EXTERNAL_PROCESS_PROGRAM_MISSING = (
+    "Cannot start {program!r}: it was not found on {where}. Give its absolute path, or "
+    "add its directory to PATH."
+)
+"""An executable name was not found in the child process's search path."""
+
+EXTERNAL_PROCESS_SHIM = (
+    "Cannot start {program!r}: it is a {suffix} shim, which Windows runs through cmd.exe. "
+    "Run the script it wraps instead, for example ['node', '<path to the package>/bin.js']."
+)
+"""A Windows command resolves to a batch shim, which the launcher refuses."""
+
+EXTERNAL_PROCESS_FILE_KIND = "a {suffix} file"
+"""A file with an unsupported extension in `EXTERNAL_PROCESS_WINDOWS_FILE`."""
+
+EXTERNAL_PROCESS_EXTENSIONLESS = "a file without an extension"
+"""An extensionless file in `EXTERNAL_PROCESS_WINDOWS_FILE`."""
+
+EXTERNAL_PROCESS_WINDOWS_FILE = (
+    "Cannot start {program!r}: it is {kind}, and Windows starts only .exe and .com "
+    "programs. Run it with its interpreter, for example ['node', {program!r}] for a .js file."
+)
+"""A Windows command is a script or another file that cannot be started directly."""
+
+EXTERNAL_PROCESS_NOT_EXECUTABLE = (
+    "Cannot start {program!r}: it is not executable. Make it executable (chmod +x), or "
+    "run it with its interpreter, for example ['node', '<path>/bin.js']."
+)
+"""A POSIX command path exists but is not executable."""
+
+EXTERNAL_PROCESS_CWD = "Cannot start {name}: the working directory {cwd!r} does not exist."
+"""The requested child process working directory is not a directory."""
+
+EXTERNAL_PROCESS_NO_SUBPROCESSES = (
+    "Cannot start {name}: this event loop cannot run subprocesses. On Windows use the "
+    "default Proactor event loop (do not set WindowsSelectorEventLoopPolicy)."
+)
+"""The current event loop cannot start child processes."""
+
+EXTERNAL_PROCESS_START_FAILED = "Cannot start {name}: {error}"
+"""The operating system refused to start the child process."""
+
+EXTERNAL_RPC_TIMEOUT = "{name} did not answer {method!r} within {seconds:g} seconds."
+"""A JSON-RPC request timed out; adapters may expose this text as a stop reason."""
+
+EXTERNAL_RPC_INVALID_REQUEST = "Invalid Request"
+"""The error message sent to a JSON-RPC peer for an invalid request method."""
+
+EXTERNAL_RPC_METHOD_NOT_FOUND = "Method not found: {method}"
+"""The error message sent to a JSON-RPC peer when no handler owns its method."""
+
+EXTERNAL_RPC_REQUEST_CANCELLED = "Request cancelled"
+"""The error message sent when the peer cancels a request handler."""
+
+EXTERNAL_RPC_INTERNAL_ERROR = "Internal error: {type}"
+"""A handler failed; the peer receives the exception type, without its private message."""
+
+EXTERNAL_RPC_BAD_RESULT = "Internal error: bad result"
+"""The handler's result cannot be encoded as JSON; the result itself is not sent."""
 
 # --- why a connection broke (ExternalAgentConnectionError.reason) ---------------
 # Short phrases, never with the process's stderr. They become the ``stop_reason`` of an
@@ -717,6 +920,24 @@ TOOL_SERVER_CANNOT_DEFER = (
 which an MCP caller cannot wait for. Deferred tools (``deferred=True``) are refused when
 the server is built."""
 
+# Why a set of tools cannot be served (`ConfigurationError`, when the server starts). The
+# developer reads them when building a server; Devvi's ``expose_tools`` starts one for each
+# turn, so the calling model reads them too, inside `DEVVI_EXPOSE_FAILED`.
+
+TOOL_SERVER_DUPLICATE_NAME = "Two served tools are named {name!r}. Rename one with @tool(name=...)."
+"""Two of the served tools have the same name."""
+
+TOOL_SERVER_DEFERRED_TOOL = (
+    "Tool {name!r} is deferred (its result comes from agent.resume), so it cannot be served "
+    "over MCP: an MCP caller waits for the result of its call."
+)
+"""A served tool is deferred (``deferred=True``)."""
+
+TOOL_SERVER_NOT_A_TOOL = (
+    "{item!r} is not a tool. Serve a function, a Tool, a Toolkit, an Agent or a list of them."
+)
+"""Something given as a tool is none of the kinds the server takes; ``item`` is its repr."""
+
 # --- ACP agents (qagents.integrations.acp) ------------------------------------
 # The calling model reads the reasons below inside the tool result of an external agent
 # used as a tool (``ExternalAgent.as_tool()``), for example
@@ -761,9 +982,161 @@ ACP_RESUME_TASK = "{resume}\n\n{task}"
 """Prompt of a repeated call whose earlier attempt had already sent the task: ``resume`` is
 ``EXTERNAL_AGENT_RESUME``, ``task`` the task as the calling model wrote it."""
 
+ACP_JSONRPC_ERROR = "JSON-RPC error {code}"
+"""The agent's error, when it answered a request with an error that has no message and no
+``data``: ``code`` is the JSON-RPC error code. It becomes the ``stop_reason`` of a failed
+``session/prompt`` or ``session/new`` (the calling model reads it inside
+`EXTERNAL_AGENT_FAILED`), the ``reason`` of `ACP_CANNOT_CONTINUE`, or part of an
+authentication error."""
+
+# The result of each of the ACP agent's own tool calls is the text of its ``content``, with
+# a short bracketed note for what is not text (the bytes never go in). It is the ``content``
+# of the ``tool_call_finished`` event, which the AG-UI adapter passes on as a
+# ``TOOL_CALL_RESULT``; a client that sends its messages back puts it before a model.
+
+ACP_TOOL_CONTENT_SEPARATOR = "\n"
+"""Joins the pieces of a tool call's ``content``: its text blocks and the notes below."""
+
+ACP_DIFF_PLACEHOLDER = "[diff: {path}]"
+"""Stands for a ``diff`` in a tool call's content; ``path`` is the changed file."""
+
+ACP_TERMINAL_PLACEHOLDER = "[terminal: {terminal}]"
+"""Stands for a ``terminal`` in a tool call's content; ``terminal`` is its ``terminalId``."""
+
+ACP_MEDIA_PLACEHOLDER = "[{kind}: {mime_type}]"
+"""Stands for an image or audio block: ``kind`` is ``image`` or ``audio``, ``mime_type`` the
+block's ``mimeType``."""
+
+ACP_RESOURCE_LINK_PLACEHOLDER = "[resource_link: {uri}]"
+"""Stands for a ``resource_link`` block; ``uri`` is the linked resource."""
+
+ACP_RESOURCE_PLACEHOLDER = "[resource: {uri}]"
+"""Stands for an embedded ``resource`` without text (a blob); ``uri`` is the resource's.
+A resource with text is shown as its text."""
+
+# Setup errors (`ExternalAgentConfigurationError`) while the ACP agent starts or a turn sets
+# up its session. Through ``as_tool()`` the calling model reads the first line as the
+# ``error`` of `EXTERNAL_AGENT_UNAVAILABLE`; what follows it (the agent's stderr, the error
+# underneath) is for the developer. Lists are joined with `EXTERNAL_SETUP_LIST_SEPARATOR`.
+
+ACP_SETUP_FAILED = "{name}: {summary}."
+"""The first line of a failure while the agent starts: ``name`` is the agent's, ``summary``
+one of the ``ACP_HANDSHAKE_*`` and ``ACP_AUTH_*`` texts, `ACP_STOPPED_AFTER_HANDSHAKE`,
+`ACP_PROTOCOL_VERSION`, or an MCP server problem (`ACP_SERVER_NOT_SUPPORTED`,
+`ACP_SERVER_UNKNOWN_TYPE`) without its final period."""
+
+ACP_STOPPED_AFTER_HANDSHAKE = "stopped right after the ACP handshake"
+"""``summary``: the connection closed right after the agent answered ``initialize``."""
+
+ACP_HANDSHAKE_REFUSED = "refused the ACP handshake (initialize): {message}"
+"""``summary``: the agent answered ``initialize`` with an error; ``message`` is its text."""
+
+ACP_HANDSHAKE_TIMEOUT = "did not answer the ACP handshake (initialize) within {seconds:g} seconds"
+"""``summary``: no answer to ``initialize`` within ``handshake_timeout_s`` (``seconds``)."""
+
+ACP_HANDSHAKE_STOPPED = "stopped during the ACP handshake ({reason})"
+"""``summary``: the connection broke during ``initialize``; ``reason`` is an
+``EXTERNAL_REASON_*`` text."""
+
+ACP_HANDSHAKE_BAD_ANSWER = "answered initialize with {answer!r}"
+"""``summary``: the answer to ``initialize`` is not an object; ``answer`` is what came."""
+
+ACP_PROTOCOL_VERSION = (
+    "speaks ACP protocol version {version!r}; qagents speaks version {supported}. Use a "
+    "release of the agent that supports ACP v1"
+)
+"""``summary``: the agent's ``protocolVersion`` (``version``) is not the one qagents speaks
+(``supported``)."""
+
+ACP_AUTH_METHOD_UNKNOWN = "offers no authentication method {method!r} (it offers: {offered})"
+"""``summary``: ``auth_method=`` names a method the agent does not offer; ``offered`` lists
+the ids of those it does."""
+
+ACP_AUTH_METHOD_TERMINAL = (
+    "authentication method {method!r} runs interactively in a terminal, which qagents cannot "
+    "do; log in to the agent yourself first"
+)
+"""``summary``: the method ``auth_method=`` names is of type ``terminal``."""
+
+ACP_AUTH_FAILED = "authentication with {method!r} failed: {message}"
+"""``summary``: the agent answered ``authenticate`` with an error; ``message`` is its text."""
+
+ACP_AUTH_UNFINISHED = "authentication with {method!r} did not finish"
+"""``summary``: ``authenticate`` got no answer in time, or the connection broke."""
+
+ACP_SERVER_NOT_SUPPORTED = (
+    "MCP server {server!r} uses {transport}, which the agent does not support (its "
+    "mcpCapabilities.{transport} is not true)."
+)
+"""An MCP server of ``mcp_servers=`` over ``http`` or ``sse`` (``transport``) that the agent
+does not take. Fixed servers are checked when the agent starts (inside `ACP_SETUP_FAILED`),
+servers a function gives for a turn when the turn starts (inside `ACP_SERVERS_FAILED`)."""
+
+ACP_SERVER_UNKNOWN_TYPE = (
+    "mcp_servers holds {type}; use MCPServerStdio, MCPServerHTTP or an ACP McpServer mapping."
+)
+"""An item of ``mcp_servers=`` that is no MCP server; ``type`` is its class name."""
+
+ACP_SERVERS_NOT_A_LIST = "mcp_servers must give a list of MCP servers, not {type}."
+"""The function given as ``mcp_servers=`` returned something that is not a list."""
+
+ACP_SERVERS_FAILED = "{name}: {error}"
+"""The MCP servers a function (``mcp_servers=``) gave for a turn cannot be sent: ``error`` is
+`ACP_SERVERS_NOT_A_LIST`, `ACP_SERVER_UNKNOWN_TYPE` or `ACP_SERVER_NOT_SUPPORTED`."""
+
+ACP_NO_WORKING_DIRECTORY = (
+    "{name}: an ACP session needs a working directory. Build the agent with workspace= (or "
+    "cwd=), or pass cwd= to stream() or run()."
+)
+"""A turn with no working directory: the agent was built without ``workspace=``."""
+
+ACP_PROMPT_NEEDS_AUTH = "{name} needs authentication: {error}"
+"""A turn's ``stop_reason`` when the agent answered ``session/prompt`` with "authentication
+required" (``error`` is its message). The turn fails as unavailable, so the calling model
+reads it inside `EXTERNAL_AGENT_UNAVAILABLE` and stops calling the agent."""
+
+ACP_SESSION_NEW_REFUSED = "{name} refused session/new: {message}"
+"""The agent refused ``session/new`` as invalid (an MCP server that did not start, a refused
+directory); ``message`` is its text."""
+
+ACP_SESSION_NEEDS_AUTH = (
+    "{name} needs authentication ({error}). Log in to the agent yourself, or pass "
+    "auth_method= with one of the methods it offers: {offered}."
+)
+"""The agent answered ``session/new`` with "authentication required": ``error`` is its
+message, ``offered`` the ids of its methods, or `EXTERNAL_SETUP_LIST_NONE`."""
+
+ACP_NO_MODEL_OPTION = (
+    "{name}: model={model!r} was asked for, but the session offers no model option."
+)
+"""``model=`` is set, and the session has no config option of the ``model`` category."""
+
+ACP_NO_CONFIG_OPTION = (
+    "{name}: the session offers no config option {option!r} (it offers: {offered})."
+)
+"""``config_options=`` names an option the session does not have; ``offered`` lists the ids
+it has, or is `EXTERNAL_SETUP_LIST_NONE`."""
+
+ACP_CONFIG_NOT_OFFERED = (
+    "{name}: {what} {wanted!r} is not offered by the session (it offers: {offered})."
+)
+"""The value asked for (``wanted``) is none of the option's values; ``what`` is
+`ACP_CONFIG_MODEL` or `ACP_CONFIG_OPTION`, ``offered`` the names of the values."""
+
+ACP_CONFIG_FAILED = "{name}: setting {what} to {value!r} failed: {message}"
+"""The agent refused ``session/set_config_option``: ``what`` is `ACP_CONFIG_MODEL` or
+`ACP_CONFIG_OPTION`, ``message`` the agent's text."""
+
+ACP_CONFIG_MODEL = "model"
+"""The ``what`` of `ACP_CONFIG_NOT_OFFERED` and `ACP_CONFIG_FAILED` for ``model=``."""
+
+ACP_CONFIG_OPTION = "option {option!r}"
+"""The ``what`` of `ACP_CONFIG_NOT_OFFERED` and `ACP_CONFIG_FAILED` for an option of
+``config_options=``; ``option`` is its id."""
+
 # --- Devvi (qagents.integrations.devvi) ---------------------------------------
 # The calling model reads the reasons below inside the tool result of
-# `DevviAgent.as_tool()` (for example ``"coder failed: session qa-5f0c does not exist ..."``),
+# `DevviAgent.as_tool()` (for example ``"coder failed: cannot reopen session qa-5f0c: ..."``),
 # and the tool description. Devvi's model reads `DEVVI_RESUME_UNKNOWN` as its prompt when a
 # call is repeated after a crash and the earlier attempt cannot be found in Devvi's log.
 
@@ -779,8 +1152,14 @@ DEVVI_NEEDS_PRICING = "it has no token prices, so the cost budget of this run ca
 ``Limits.max_cost_usd``. The calling model reads it inside `EXTERNAL_AGENT_UNAVAILABLE`."""
 
 DEVVI_UNKNOWN_SESSION = "session {session} does not exist; leave session out to start a new one"
-"""A turn's ``stop_reason`` when the calling model asked to continue a session that Devvi
-does not have. The calling model reads it inside `EXTERNAL_AGENT_FAILED`."""
+"""A turn's ``stop_reason`` on the SDK transport (``integrations/devvi/sdk.py``, ``run_turn``)
+when the session to continue does not exist in Devvi. Either developer code passed it
+(``DevviAgent.run(task, session=...)``), or the calling model continued a session that its
+``as_tool()`` tool opened and Devvi no longer has (its log was removed, the agent now uses
+another home or sessions root, or Devvi died before it wrote the session). In the second case
+the calling model reads it inside `EXTERNAL_AGENT_FAILED`. A session the tool never opened is
+refused before Devvi is reached, with `EXTERNAL_AGENT_UNKNOWN_SESSION` (or
+`EXTERNAL_AGENT_FORGOTTEN_SESSION`)."""
 
 DEVVI_RESUME_FAILED = "cannot reopen session {session}: {reason}"
 """A turn's ``stop_reason`` when Devvi refused ``session/resume`` for another reason than a
@@ -788,6 +1167,14 @@ missing session. ``reason`` is Devvi's own error message."""
 
 DEVVI_NO_TURN_END = "the agent went idle without ending its turn"
 """A turn's ``stop_reason`` when Devvi reported the session idle but no ``turn/end`` arrived."""
+
+DEVVI_UNKNOWN_TURN_END = "unknown turn end"
+"""A turn's ``stop_reason`` when Devvi's ``turn/end`` names no ``reason.kind`` (a kind
+qagents does not know is passed on as it is). The turn ends as ``error``."""
+
+DEVVI_ERROR_WITHOUT_MESSAGE = "error"
+"""A turn's ``stop_reason`` when Devvi's ``turn/end`` has the kind ``error`` and no message.
+The turn ends as ``error``; the calling model reads it inside `EXTERNAL_AGENT_FAILED`."""
 
 DEVVI_IMAGE_URL = (
     "images must be inline data (PNG, JPEG, WebP or GIF); image URLs are not supported"
@@ -825,3 +1212,150 @@ DEVVI_WORKSPACE_UNKNOWN = (
 )
 """A turn's ``stop_reason`` when Devvi resumed a session whose log qagents cannot read and
 Devvi did not say where the session works (``session/working-directory/get``)."""
+
+# Setup errors (`ExternalAgentConfigurationError`) while a Devvi agent starts: the launcher
+# (Node, the CLI, versions, the environment, patches) and both transports. Through
+# ``as_tool()`` the calling model reads the first line as the ``error`` of
+# `EXTERNAL_AGENT_UNAVAILABLE`; the lines after it (what to set, the command, the stderr) are
+# for the developer. Lists are joined with `EXTERNAL_SETUP_LIST_SEPARATOR`.
+
+DEVVI_NODE_NOT_FOUND = "Node.js was not found, so the Devvi CLI cannot start."
+"""No ``node=``, no ``QAGENTS_NODE``, and no ``node`` on ``PATH``."""
+
+DEVVI_NODE_EMPTY = "node= must not be empty."
+"""``node=`` is an empty sequence."""
+
+DEVVI_NODE_NOT_FOUND_AT = "Node.js was not found at {program!r} (from {source})."
+"""The Node program named by ``source`` (``node=``, ``QAGENTS_NODE`` or ``PATH``) does not
+exist."""
+
+DEVVI_NODE_SHIM = "Node at {path!r} is a {suffix} shim, which Windows runs through cmd.exe."
+"""Node resolves to a ``.cmd`` or ``.bat`` file (``suffix``) on Windows."""
+
+DEVVI_COMMAND_EMPTY = "command= must not be empty."
+"""``command=`` is an empty sequence."""
+
+DEVVI_CLI_NOT_FOUND = "The Devvi CLI was not found."
+"""No ``devvi_bin=``, no ``QAGENTS_DEVVI_BIN``, and no ``devvi`` on ``PATH``."""
+
+DEVVI_CLI_NOT_FOUND_AT = "The Devvi CLI was not found at {path!r}{where} (from {source})."
+"""The CLI named by ``source`` (``argument`` or ``QAGENTS_DEVVI_BIN``) does not exist;
+``where`` is `DEVVI_CLI_ON_PATH` for a bare name, else empty."""
+
+DEVVI_CLI_ON_PATH = " on PATH"
+"""The ``where`` of `DEVVI_CLI_NOT_FOUND_AT` for a bare name, which is looked up on ``PATH``."""
+
+DEVVI_CLI_SHIM = (
+    "{path} is a {suffix} shim that Windows would run through cmd.exe, and it does not say "
+    "which script it starts."
+)
+"""The CLI is a ``.cmd`` or ``.bat`` shim whose script qagents cannot find."""
+
+DEVVI_CLI_NOT_RUNNABLE = "{path} cannot be started on Windows (it is not a .exe or a .js file)."
+"""The CLI is neither an executable nor a script on Windows."""
+
+DEVVI_NODE_VERSION_UNREADABLE = "Could not read the Node version from {text!r}."
+"""``node --version`` printed no version; ``text`` is the start of what it printed."""
+
+DEVVI_NODE_TOO_OLD = "Node {version} is too old for Devvi, which needs >= {minimum}."
+"""Node is older than Devvi needs; both versions are dotted (``24.9.0``)."""
+
+DEVVI_VERSION_NOT_PRINTED = "`devvi --version` printed {text!r}, which is not a version."
+"""``devvi --version`` printed no version; ``text`` is the start of what it printed."""
+
+DEVVI_VERSION_UNREADABLE = "Devvi version {version!r} cannot be read."
+"""A Devvi version that is not ``major.minor.patch``."""
+
+DEVVI_VERSION_UNTESTED = "Devvi {version} is not a version qagents was tested with ({tested})."
+"""A Devvi release qagents was not written against; ``tested`` lists
+`DEVVI_TESTED_VERSION` for each tested release line."""
+
+DEVVI_TESTED_VERSION = "{major}.{minor}.x"
+"""One tested Devvi release line in the ``tested`` of `DEVVI_VERSION_UNTESTED`."""
+
+DEVVI_PERMISSION_MODE_UNKNOWN = "permission_mode must be one of {modes}, not {mode!r}."
+"""``permission_mode=`` is not one of Devvi's modes (``modes``, listed)."""
+
+DEVVI_VARIABLE_RESERVED = (
+    "{name} is set by qagents: use home= for the Devvi home and permission_mode= for "
+    "DSH_PERMISSION_MODE."
+)
+"""``env=`` or ``env_passthrough=`` names a variable the launcher sets itself."""
+
+DEVVI_NO_SUBPROCESSES = (
+    "This event loop cannot run subprocesses. On Windows use the default Proactor event loop."
+)
+"""The running event loop cannot start the version probes."""
+
+DEVVI_CANNOT_START = "Cannot start {program!r}: {error}"
+"""A version probe could not be started; ``error`` is the operating system's message."""
+
+DEVVI_NODE_DID_NOT_START = "Node did not start (`node --version` failed)."
+"""``node --version`` exited with an error."""
+
+DEVVI_CLI_DID_NOT_START = "The Devvi CLI did not start: `devvi --version` {how}."
+"""``devvi --version`` failed: ``how`` is `DEVVI_PROBE_TIMEOUT` or `DEVVI_PROBE_EXIT`."""
+
+DEVVI_PROBE_TIMEOUT = "did not finish in time"
+"""The ``how`` of `DEVVI_CLI_DID_NOT_START` when the probe ran out of time."""
+
+DEVVI_PROBE_EXIT = "exited with code {code}"
+"""The ``how`` of `DEVVI_CLI_DID_NOT_START` when the probe exited with an error code."""
+
+DEVVI_PATCH_FILE_MISSING = "The Devvi patch file {path!r} does not exist."
+"""A patch file given in ``patches=`` does not exist."""
+
+DEVVI_MCP_PROGRAM_NOT_FOUND = (
+    "The MCP server program {program!r} was not found; give its absolute path."
+)
+"""The program of a stdio MCP server row (an ``expose_tools`` server on the SDK transport, or
+`mcp_stdio_row`) does not exist."""
+
+DEVVI_MCP_SECRET_ENV = (
+    "The MCP server {name!r} would get {key} through a patch file, which is written to disk."
+)
+"""A stdio MCP server row would write a variable whose name looks like a credential (``key``)
+into a patch file."""
+
+DEVVI_MCP_SERVER_NAME = (
+    "MCP server name {name!r} is not valid: use 1-32 letters, digits, '_' or '-'."
+)
+"""An MCP server row whose name Devvi would not take."""
+
+DEVVI_PATCH_ROW_TYPE = "Devvi patch row {index} must be a mapping, not {type}."
+"""A patch row that is not a mapping; ``type`` is its class name."""
+
+DEVVI_PATCH_ROWS_JSON = "Devvi patch rows must be JSON: {error}"
+"""Patch rows that cannot be written as JSON; ``error`` is the encoder's message."""
+
+DEVVI_PATCH_SECRET = "A Devvi patch would hold a credential in clear text (at {where})."
+"""A patch row holds a value that looks like a credential; ``where`` lists up to five paths
+to it (never the value)."""
+
+DEVVI_DID_NOT_START = "Devvi did not start: {why}."
+"""The SDK transport could not start Devvi: ``why`` is `DEVVI_INITIALIZE_FAILED`,
+`DEVVI_INITIALIZE_TIMEOUT` or `DEVVI_STOPPED_DURING_START`."""
+
+DEVVI_INITIALIZE_FAILED = "initialize failed: {message}"
+"""The ``why`` of `DEVVI_DID_NOT_START`: Devvi answered ``initialize`` with an error."""
+
+DEVVI_INITIALIZE_TIMEOUT = "it did not answer initialize within {seconds:g} seconds"
+"""The ``why`` of `DEVVI_DID_NOT_START`: no answer to ``initialize`` in time."""
+
+DEVVI_STOPPED_DURING_START = "it stopped during start ({reason})"
+"""The ``why`` of `DEVVI_DID_NOT_START`: the connection broke; ``reason`` is an
+``EXTERNAL_REASON_*`` text."""
+
+DEVVI_NO_SERVER_INFO = "Devvi did not start: its initialize answer has no serverInfo."
+"""The SDK transport's ``initialize`` answer has no ``serverInfo``."""
+
+DEVVI_EXPOSE_NEEDS_HTTP = (
+    "{name}: expose_tools serves in-process tools over MCP Streamable HTTP, which this Devvi "
+    "does not support (its mcpCapabilities.http is not true)."
+)
+"""The ACP transport with in-process ``expose_tools``, and a Devvi that does not take MCP
+servers over HTTP."""
+
+DEVVI_EXPOSE_FAILED = "{name}: expose_tools: {error}"
+"""The in-process tool server of a turn (ACP transport, ``expose_tools``) did not start:
+``error`` is a ``TOOL_SERVER_*`` setup text such as `TOOL_SERVER_DUPLICATE_NAME`."""

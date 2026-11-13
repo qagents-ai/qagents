@@ -1790,6 +1790,50 @@ def test_the_summary_names_the_first_changed_files_and_counts_them() -> None:
     assert "4980 more" in result.footer("coder")  # the footer names 20
 
 
+def test_the_error_result_layout_comes_from_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from qagents.external.tool import _tool_outcome
+
+    monkeypatch.setattr(texts, "EXTERNAL_AGENT_ERROR_RESULT", "<{message}|{footer}>")
+    monkeypatch.setattr(texts, "EXTERNAL_AGENT_STOPPED_WITH_TEXT", "{message} / {text}")
+    stopped = ExternalResult(
+        status="cancelled", stop_reason="timeout", text="  half done  \n", session_id="s-1"
+    )
+    content, is_error, _ = _tool_outcome("coder", stopped)
+    message = texts.EXTERNAL_AGENT_STOPPED.format(name="coder", reason="timeout")
+    assert is_error and content == f"<{message} / half done|{stopped.footer('coder')}>"
+    failed = ExternalResult(status="error", stop_reason="disk full", session_id="s-1")
+    content, is_error, _ = _tool_outcome("coder", failed)
+    message = texts.EXTERNAL_AGENT_FAILED.format(name="coder", error="disk full")
+    assert is_error and content == f"<{message}|{failed.footer('coder')}>"
+
+
+def test_a_long_error_is_shortened_with_the_marker_from_prompts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qagents.external.tool import _tool_outcome
+
+    failed = ExternalResult(status="error", stop_reason="x" * 400, session_id="s-1")
+    content, _, _ = _tool_outcome("coder", failed)
+    default = content.split("\n\n")[0]
+    assert default == texts.EXTERNAL_AGENT_FAILED.format(name="coder", error="x" * 297 + "...")
+    monkeypatch.setattr(texts, "EXTERNAL_AGENT_LINE_SHORTENED", " [cut]")
+    content, _, _ = _tool_outcome("coder", failed)
+    error = content.split("\n\n")[0].removeprefix("coder failed: ")
+    assert error == "x" * 294 + " [cut]" and len(error) == 300
+
+
+def test_the_continue_hint_is_joined_by_the_template_in_prompts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default = ScriptedExternalAgent([["done"]], name="coder", description="Codes.").as_tool()
+    assert default.description == f"Codes. {texts.EXTERNAL_AGENT_CONTINUE_HINT}"
+    monkeypatch.setattr(texts, "EXTERNAL_AGENT_DESCRIPTION_WITH_HINT", "{description}\n{hint}")
+    built = ScriptedExternalAgent([["done"]], name="coder", description="Codes.").as_tool()
+    assert built.description == f"Codes.\n{texts.EXTERNAL_AGENT_CONTINUE_HINT}"
+    given = ScriptedExternalAgent([["done"]], name="coder").as_tool(description="Mine.")
+    assert given.description == "Mine."  # a description you pass is used as it is
+
+
 def test_diff_paths_are_split_to_fit_the_command_line() -> None:
     import qagents.external.changes as ext
 
@@ -1848,7 +1892,7 @@ async def test_the_model_continues_only_sessions_this_tool_opened() -> None:
     session = Session()
     result = await Agent(model, tools=[external.as_tool()]).run("go", session=session)
     refused, started, continued = tool_results(result)
-    unknown = texts.DEVVI_UNKNOWN_SESSION.format(session="made-up-1")
+    unknown = texts.EXTERNAL_AGENT_UNKNOWN_SESSION.format(session="made-up-1", name="coder")
     assert refused.is_error
     assert refused.content == texts.EXTERNAL_AGENT_FAILED.format(name="coder", error=unknown)
     assert refused.metadata == {"unknown_session": "made-up-1"}
@@ -1862,12 +1906,50 @@ async def test_the_model_continues_only_sessions_this_tool_opened() -> None:
         tools=[other.as_tool()],
     )
     (foreign,) = tool_results(await later.run("again", session=session))[-1:]
-    assert foreign.is_error and "session coder-1 does not exist" in foreign.content
+    assert foreign.is_error
+    assert foreign.content == texts.EXTERNAL_AGENT_FAILED.format(
+        name="reviewer",
+        error=texts.EXTERNAL_AGENT_UNKNOWN_SESSION.format(session="coder-1", name="reviewer"),
+    )
     assert other.calls == []
 
     # Code that continues a session itself may pass any id.
     direct = await coder(["mine"]).run("t", session="made-up-2")
     assert direct.status == "completed" and direct.session_id == "made-up-2"
+
+
+async def test_a_session_dropped_from_the_full_list_is_not_called_never_opened() -> None:
+    """The tool keeps its latest 50 sessions. Once the list is full, an older session the
+    tool did open may have been dropped, so its refusal must not say it was never opened."""
+
+    @qagents_tool
+    def fill(ctx: RunContext) -> str:
+        """Stand for 50 sessions the coder tool opened earlier in this conversation."""
+        old = [{"session_id": f"old-{i}", "cwd": None, "backend": None} for i in range(50)]
+        ctx.state[STATE_SESSIONS] = {"coder": old}
+        return "filled"
+
+    external = coder(["new"], ["kept"])
+    model = ScriptedModel(
+        [
+            call("fill"),
+            call("coder", task="Start."),  # opens coder-1: old-0 drops out of the list
+            call("coder", task="Go on.", session="old-0"),  # this tool opened it, earlier
+            call("coder", task="Go on.", session="old-1"),  # still kept: it continues
+            "Done.",
+        ]
+    )
+    result = await Agent(model, tools=[fill, external.as_tool()]).run("go")
+    _, started, dropped, kept = tool_results(result)
+    assert not started.is_error and not kept.is_error
+    forgotten = texts.EXTERNAL_AGENT_FORGOTTEN_SESSION.format(
+        session="old-0", name="coder", limit=50
+    )
+    assert dropped.is_error
+    assert dropped.content == texts.EXTERNAL_AGENT_FAILED.format(name="coder", error=forgotten)
+    assert "was not opened by" not in dropped.content
+    assert dropped.metadata == {"unknown_session": "old-0"}
+    assert [c.session for c in external.calls] == [None, "old-1"]  # never reached for old-0
 
 
 async def test_the_footer_of_a_turn_that_never_began_names_no_session() -> None:
@@ -1937,3 +2019,194 @@ def test_opt_in_markers_need_an_explicit_selection() -> None:
     assert selected_markers("not devvi_live") == set()
     assert selected_markers("devvi_fake and not devvi_mock") == {"devvi_fake"}
     assert selected_markers("") == set()
+
+
+# -- texts of the second literals pass ------------------------------------------------------------
+
+
+def test_the_three_cutters_agree_when_the_marker_is_longer_than_the_limit(monkeypatch) -> None:
+    """``ExternalPermission.detail``, the tool's ``_first_line`` and Devvi's ``_first_line``
+    cut with the same marker; with a limit shorter than the marker, all three leave the
+    marker alone (a negative slice would keep almost the whole text)."""
+    from qagents.external.tool import _first_line as tool_first_line
+    from qagents.integrations.devvi import sdk as devvi_sdk
+
+    marker = " [shortened]"
+    monkeypatch.setattr(texts, "EXTERNAL_AGENT_LINE_SHORTENED", marker)
+    record = ExternalPermission(
+        tool="c.bash",
+        external_tool="bash",
+        arguments={"command": "x" * 40},
+        outcome="deny",
+        decided_by="r",
+    )
+    assert record.detail(10) == marker
+    assert tool_first_line("y" * 40, 10) == marker
+    assert devvi_sdk._first_line("z" * 40, 10) == marker
+    assert record.detail(20) == '"xxxxxxx' + marker  # the marker counts toward the limit
+    assert devvi_sdk._first_line("z" * 40, 20) == "z" * 8 + marker
+
+
+@pytest.mark.devvi_fake
+async def test_new_values_of_the_moved_texts_reach_their_readers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A sample of the texts the second pass moved to the prompts module, at least one from
+    every module it changed: a new value reaches what the calling model, the external agent
+    or the MCP client reads. Where that is cheap, the check is on the end text: the calling
+    model's tool result, or the MCP client's call result."""
+    from qagents.external.tool import _tool_outcome
+    from qagents.integrations.acp import mapping
+    from qagents.integrations.devvi import DevviAgent, launcher, patches
+    from qagents.integrations.devvi import events as devvi_events
+    from qagents.integrations.mcp_server import collect_tools, tool_server
+
+    from . import fixture_tools as fx
+    from .fakes.devvi import acp_agent, sdk_agent
+    from .test_devvi_acp import HANDSHAKE, initialize_answer
+    from .test_devvi_acp import write_script as acp_script
+    from .test_mcp_server import mcp_client, text_of
+
+    for name, value in {
+        "EXTERNAL_AGENT_TEXT_BLOCK_SEPARATOR": " // ",  # external/turn.py
+        "EXTERNAL_AGENT_FOOTER_LIST_SEPARATOR": " | ",  # external/contract.py
+        "EXTERNAL_AGENT_LINE_SHORTENED": "~",  # external/permissions.py
+        "EXTERNAL_AGENT_DECLINED_REASON": " because {reason}",
+        "DEVVI_ERROR_WITHOUT_MESSAGE": "failed quietly",  # devvi/events.py
+        "ACP_TERMINAL_PLACEHOLDER": "<t {terminal}>",  # acp/mapping.py
+        "ACP_MEDIA_PLACEHOLDER": "<{kind} {mime_type}>",
+        "ACP_RESOURCE_LINK_PLACEHOLDER": "<link {uri}>",
+        "ACP_RESOURCE_PLACEHOLDER": "<res {uri}>",
+        "ACP_SETUP_FAILED": "{name} would not start ({summary})",  # acp/client.py
+        "ACP_PROTOCOL_VERSION": "ACP {version} is not {supported}",
+        "DEVVI_EXPOSE_NEEDS_HTTP": "{name} has no MCP over HTTP",  # devvi/acp.py
+        "DEVVI_DID_NOT_START": "Devvi stayed down: {why}",  # devvi/sdk.py
+        "DEVVI_INITIALIZE_FAILED": "init said {message}",
+        "DEVVI_CLI_DID_NOT_START": "no CLI ({how})",  # devvi/launcher.py
+        "DEVVI_PROBE_EXIT": "code {code}",
+        "EXTERNAL_SETUP_LIST_SEPARATOR": " + ",
+        "DEVVI_PERMISSION_MODE_UNKNOWN": "modes: {modes}",
+        "DEVVI_PATCH_ROW_TYPE": "row {index} is a {type}",  # devvi/patches.py
+        "TOOL_SERVER_DUPLICATE_NAME": "twice: {name}",  # mcp_server.py
+        "UNKNOWN_TOOL_SEPARATOR": " / ",
+        "UNKNOWN_TOOL_NONE": "nothing",
+        "TOOL_FAILED_EXCEPTION": "<{type}> {error}",
+    }.items():
+        monkeypatch.setattr(texts, name, value)
+
+    async def first_result(agent: Any, name: str) -> str:
+        """What the calling model reads from one call of ``agent.as_tool()``."""
+        model = ScriptedModel([call(name, task="Go."), "Done."])
+        lead = Agent(model, tools=[agent.as_tool()], limits=Limits(max_turns=4))
+        try:
+            return tool_results(await lead.run("go"))[0].content
+        finally:
+            await agent.aclose()
+
+    # The calling model's tool result: committed text blocks, refused requests (one cut
+    # short), and the footer's lists.
+    external = coder(
+        [
+            "First.",
+            "Second.",
+            PermissionStep("bash", {"command": "y" * 200}),
+            PermissionStep("edit"),
+        ]
+    )
+    content = await first_result(external, "coder")
+    assert content.startswith("First. // Second.")
+    refused = content.split("2 permissions refused (")[1]
+    assert refused.startswith('bash: "' + "y" * 78 + "~ | edit: (no arguments))")
+    footer = ExternalResult(status="completed", changed_files=["a.py", "b.py"]).footer("coder")
+    assert "changed: a.py | b.py" in footer
+
+    # A paused request declined with a reason, answered through the pending input.
+    pending = PendingInput(
+        tool_call_id="c1",
+        name="coder",
+        reason="permission",
+        metadata={"agent": "coder", "tool": "coder.bash", "external_session": "s-1"},
+    )
+    declined = ExternalApproval.for_input(pending, False, reason="too risky").content
+    assert "because too risky." in declined
+
+    # Devvi: a turn end of kind "error" without a message, as the calling model reads it.
+    outcome = devvi_events.turn_end_outcome({"kind": "error", "error": {}})
+    result = ExternalResult(status=outcome.status, stop_reason=outcome.stop_reason)
+    assert _tool_outcome("coder", result)[0].startswith("coder failed: failed quietly")
+
+    # ACP: the notes in a tool call's result content.
+    pieces = [
+        {"type": "terminal", "terminalId": "t1"},
+        {"type": "content", "content": {"type": "image", "mimeType": "image/png"}},
+        {"type": "content", "content": {"type": "resource_link", "uri": "file:///a"}},
+        {"type": "content", "content": {"type": "resource", "resource": {"uri": "file:///b"}}},
+    ]
+    assert mapping.content_text(pieces).split("\n") == [
+        "<t t1>",
+        "<image image/png>",
+        "<link file:///a>",
+        "<res file:///b>",
+    ]
+
+    # Setup errors, as the calling model reads them through as_tool(). The ACP client: an
+    # agent that speaks another protocol version.
+    answer = initialize_answer()
+    answer["result"]["protocolVersion"] = 2
+    for folder in ("v2", "http", "sdk", "ws"):
+        (tmp_path / folder).mkdir()
+    old = acp_agent(tmp_path / "v2", acp_script(tmp_path / "v2.jsonl", [HANDSHAKE[0], answer]))
+    assert (await first_result(old, "coder")).startswith(
+        "coder is unavailable: coder would not start (ACP 2 is not 1)"
+    )
+    # Devvi over ACP, with in-process tools and no MCP over HTTP.
+    rows = [HANDSHAKE[0], initialize_answer(mcpCapabilities={})]
+    no_http = acp_agent(
+        tmp_path / "http",
+        acp_script(tmp_path / "http.jsonl", rows),
+        expose_tools=[fx.lookup_customer],
+    )
+    assert (await first_result(no_http, "coder")).startswith(
+        "coder is unavailable: coder has no MCP over HTTP"
+    )
+    # Devvi's SDK transport: initialize refused.
+    sdk, _ = sdk_agent(tmp_path / "sdk", None, "--fail-initialize", "no adapter", name="coder")
+    assert (await first_result(sdk, "coder")).startswith(
+        "coder is unavailable: Devvi stayed down: init said no adapter"
+    )
+    # The launcher: `devvi --version` exits with an error.
+    broken_cli = DevviAgent(
+        workspace=tmp_path / "ws",
+        transport="sdk",
+        command=[sys.executable, "-c", "import sys; sys.exit(2)"],
+        home=tmp_path / "home",
+        name="coder",
+    )
+    assert (await first_result(broken_cli, "coder")).startswith(
+        "coder is unavailable: no CLI (code 2)"
+    )
+    with pytest.raises(ExternalAgentConfigurationError, match=r"^modes: read-only \+ "):
+        launcher.build_environment(tmp_path, permission_mode="none", environ={})
+    # Patch rows, and the tools a server is asked to serve.
+    with pytest.raises(ExternalAgentConfigurationError, match="^row 0 is a int$"):
+        patches.check_rows([5])
+    with pytest.raises(ConfigurationError, match="^twice: lookup_customer$"):
+        await collect_tools([fx.lookup_customer, fx.lookup_customer])
+
+    # The MCP tool server: an unknown tool (with tools and without), and a tool that raised.
+    @qagents_tool
+    def explode() -> str:
+        """Fail with an exception that is not a ToolError."""
+        raise ValueError("bad input")
+
+    async with (
+        tool_server([fx.lookup_customer, explode]) as server,
+        mcp_client(server.url, server.headers) as client,
+    ):
+        unknown = await client.call_tool("nope", {})
+        raised = await client.call_tool("explode", {})
+    assert text_of(unknown).endswith("Available tools: lookup_customer / explode.")
+    assert text_of(raised) == "'explode' failed: <ValueError> bad input"
+    async with tool_server([]) as server, mcp_client(server.url, server.headers) as client:
+        empty = await client.call_tool("nope", {})
+    assert text_of(empty).endswith("Available tools: nothing.")

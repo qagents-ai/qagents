@@ -70,7 +70,7 @@ def build_api_index(package_dir: Path, display_root: Path) -> list[ApiEntry]:
             shown = file.relative_to(display_root).as_posix()
         except ValueError:
             shown = file.as_posix()
-        entries.extend(_module_entries(tree, module, shown, aliases))
+        entries.extend(_module_entries(tree, module, shown, aliases, source.splitlines()))
     return entries
 
 
@@ -185,15 +185,15 @@ def _public_name(path: str, aliases: dict[str, str]) -> str:
 
 
 def _module_entries(
-    tree: ast.Module, module: str, file: str, aliases: dict[str, str]
+    tree: ast.Module, module: str, file: str, aliases: dict[str, str], lines: list[str]
 ) -> Iterator[ApiEntry]:
     yield ApiEntry(
         module, _public_name(module, aliases), "module", "", ast.get_docstring(tree) or "",
         file, 1,
     )  # fmt: skip
-    for node, doc in _with_attribute_docs(tree.body):
+    for node, doc in _with_attribute_docs(tree.body, lines):
         if isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
-            yield from _class_entries(node, f"{module}.{node.name}", file, aliases)
+            yield from _class_entries(node, f"{module}.{node.name}", file, aliases, lines)
         elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             if node.name.startswith("_"):
                 continue
@@ -214,7 +214,7 @@ def _module_entries(
 
 
 def _class_entries(
-    node: ast.ClassDef, path: str, file: str, aliases: dict[str, str]
+    node: ast.ClassDef, path: str, file: str, aliases: dict[str, str], lines: list[str]
 ) -> Iterator[ApiEntry]:
     init = next(
         (
@@ -229,7 +229,7 @@ def _class_entries(
         ast.get_docstring(node) or "", file, node.lineno,
         bases=tuple(ast.unparse(base) for base in node.bases),
     )  # fmt: skip
-    for item, doc in _with_attribute_docs(node.body):
+    for item, doc in _with_attribute_docs(node.body, lines):
         if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef):
             if item.name.startswith("_"):
                 continue
@@ -255,19 +255,50 @@ def _class_entries(
                 )  # fmt: skip
 
 
-def _with_attribute_docs(body: list[ast.stmt]) -> Iterator[tuple[ast.stmt, str | None]]:
-    """Each statement with the string literal right after it, the attribute docstring."""
+def _with_attribute_docs(
+    body: list[ast.stmt], lines: list[str]
+) -> Iterator[tuple[ast.stmt, str | None]]:
+    """Each statement with its documentation, when it is an assignment that has one.
+
+    Two conventions document an attribute (both are Sphinx's): the string literal right
+    after the assignment, or ``#:`` comments, on the lines right above it or after it on
+    its last line. The string literal wins when there are both.
+
+    Args:
+        body: The statements of a module or a class.
+        lines: The lines of the source file, for the comments.
+    """
     for index, node in enumerate(body):
         doc = None
-        if isinstance(node, ast.Assign | ast.AnnAssign) and index + 1 < len(body):
-            following = body[index + 1]
+        if isinstance(node, ast.Assign | ast.AnnAssign):
+            following = body[index + 1] if index + 1 < len(body) else None
             if (
                 isinstance(following, ast.Expr)
                 and isinstance(following.value, ast.Constant)
                 and isinstance(following.value.value, str)
             ):
                 doc = inspect.cleandoc(following.value.value)
+            else:
+                doc = _comment_doc(node, lines)
         yield node, doc
+
+
+def _comment_doc(node: ast.stmt, lines: list[str]) -> str | None:
+    """The text of the ``#:`` comments that document an assignment, if it has any."""
+    found: list[str] = []
+    above = node.lineno - 2  # the line above, 0-based
+    while 0 <= above < len(lines) and lines[above].lstrip().startswith("#:"):
+        found.insert(0, lines[above].lstrip()[2:])
+        above -= 1
+    end = (node.end_lineno or node.lineno) - 1
+    if not found and node.end_col_offset is not None and 0 <= end < len(lines):
+        # end_col_offset counts UTF-8 bytes, not characters; only a comment can follow
+        line = lines[end].encode("utf-8")
+        rest = line[node.end_col_offset :].decode("utf-8", errors="replace").strip()
+        if rest.startswith("#:"):
+            found.append(rest[2:])
+    text = "\n".join(line.removeprefix(" ") for line in found).strip()
+    return text or None
 
 
 def _assigned_names(node: ast.stmt) -> list[str]:

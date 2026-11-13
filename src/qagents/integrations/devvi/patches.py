@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from ... import prompts
 from ...external import ExternalAgentConfigurationError
 from .._process import find_program
 
@@ -158,15 +159,15 @@ def mcp_stdio_row(
         resolved = find_program(program)
     if resolved is None:
         raise ExternalAgentConfigurationError(
-            f"The MCP server program {program!r} was not found; give its absolute path."
+            prompts.DEVVI_MCP_PROGRAM_NOT_FOUND.format(program=program)
         )
     variables = {str(key): str(value) for key, value in (env or {}).items()}
     for key in variables:
         if SECRET_NAME.search(key):
             raise ExternalAgentConfigurationError(
-                f"The MCP server {name!r} would get {key} through a patch file, which is "
-                "written to disk.\nGive the server its credential another way (its own "
-                "configuration file), or use the ACP transport, which passes env in memory."
+                f"{prompts.DEVVI_MCP_SECRET_ENV.format(name=name, key=key)}\nGive the server "
+                "its credential another way (its own configuration file), or use the ACP "
+                "transport, which passes env in memory."
             )
     config: dict[str, Any] = {
         "transport": "stdio",
@@ -353,18 +354,22 @@ def check_rows(rows: Sequence[Any]) -> list[PatchRow]:
     for index, row in enumerate(rows):
         if not isinstance(row, Mapping):
             raise ExternalAgentConfigurationError(
-                f"Devvi patch row {index} must be a mapping, not {type(row).__name__}."
+                prompts.DEVVI_PATCH_ROW_TYPE.format(index=index, type=type(row).__name__)
             )
         checked.append(dict(row))
     try:
         json.dumps(checked)
     except (TypeError, ValueError) as error:
-        raise ExternalAgentConfigurationError(f"Devvi patch rows must be JSON: {error}") from error
+        raise ExternalAgentConfigurationError(
+            prompts.DEVVI_PATCH_ROWS_JSON.format(error=error)
+        ) from error
     secrets = find_secrets(checked)
     if secrets:
         raise ExternalAgentConfigurationError(
-            "A Devvi patch would hold a credential in clear text (at "
-            f"{', '.join(secrets[:5])}).\nPatch files are written to disk: reference "
+            prompts.DEVVI_PATCH_SECRET.format(
+                where=prompts.EXTERNAL_SETUP_LIST_SEPARATOR.join(secrets[:5])
+            )
+            + "\nPatch files are written to disk: reference "
             "credentials by environment variable name (apiKeyEnv) and list the name in "
             "env_passthrough=."
         )
@@ -409,6 +414,4 @@ def _same_text(path: Path, text: str) -> bool:
 
 def _check_server_name(name: str) -> None:
     if not SERVER_NAME.match(name or ""):
-        raise ExternalAgentConfigurationError(
-            f"MCP server name {name!r} is not valid: use 1-32 letters, digits, '_' or '-'."
-        )
+        raise ExternalAgentConfigurationError(prompts.DEVVI_MCP_SERVER_NAME.format(name=name))

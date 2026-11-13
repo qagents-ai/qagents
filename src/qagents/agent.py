@@ -2191,7 +2191,9 @@ class _Run:
                 if self.agent.output_mode == "tool":
                     available.append(self.agent.output_tool_name)
                 refusal = prompts.UNKNOWN_TOOL.format(
-                    name=call.name, available=", ".join(available) or "none"
+                    name=call.name,
+                    available=prompts.UNKNOWN_TOOL_SEPARATOR.join(available)
+                    or prompts.UNKNOWN_TOOL_NONE,
                 )
             elif (
                 budget is not None and call.id not in self._counted and len(self._counted) >= budget
@@ -2483,7 +2485,10 @@ class _Run:
             note = prompts.APPROVAL_ARGUMENTS_CHANGED.format(
                 arguments=json.dumps(call.arguments, ensure_ascii=False, default=str)
             )
-            result = result.model_copy(update={"content": f"{note}\n{result.content}"})
+            content = prompts.APPROVAL_ARGUMENTS_CHANGED_RESULT.format(
+                note=note, content=result.content
+            )
+            result = result.model_copy(update={"content": content})
         # State before result: after a crash, a recorded result implies its state.
         if (updated := await self._save_state()) is not None:
             queue.put_nowait(updated)
@@ -2582,12 +2587,16 @@ class _Run:
         except asyncio.CancelledError as error:
             if _cancelled_from_outside():
                 raise
-            content = prompts.TOOL_FAILED.format(name=call.name, error=f"CancelledError: {error}")
+            content = prompts.TOOL_FAILED.format(
+                name=call.name,
+                error=prompts.TOOL_FAILED_EXCEPTION.format(type="CancelledError", error=error),
+            )
             metadata["exception"] = "CancelledError"
         except Exception as error:
             logger.exception("Tool %s raised", call.name)
             content = prompts.TOOL_FAILED.format(
-                name=call.name, error=f"{type(error).__name__}: {error}"
+                name=call.name,
+                error=prompts.TOOL_FAILED_EXCEPTION.format(type=type(error).__name__, error=error),
             )
             metadata["exception"] = type(error).__name__
         if metadata and (problem := _not_json(metadata)) is not None:
@@ -3020,7 +3029,10 @@ class _Run:
                         note = prompts.APPROVAL_ARGUMENTS_CHANGED.format(
                             arguments=json.dumps(call.arguments, ensure_ascii=False, default=str)
                         )
-                        result = result.model_copy(update={"content": f"{note}\n{result.content}"})
+                        content = prompts.APPROVAL_ARGUMENTS_CHANGED_RESULT.format(
+                            note=note, content=result.content
+                        )
+                        result = result.model_copy(update={"content": content})
                 # State before result: after a crash, a recorded result implies its state.
                 if (updated := await self._save_state_now()) is not None:
                     emit(updated)
@@ -3443,7 +3455,7 @@ def _not_json(value: Any) -> str | None:
     try:
         json.dumps(to_jsonable_python(value), allow_nan=False)
     except (PydanticSerializationError, TypeError, ValueError) as error:
-        return f"{type(error).__name__}: {error}"
+        return prompts.TOOL_FAILED_EXCEPTION.format(type=type(error).__name__, error=error)
     return None
 
 

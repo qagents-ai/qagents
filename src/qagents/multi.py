@@ -183,7 +183,7 @@ async def _run_task(agent: Agent, ctx: RunContext[Any], label: str, task: str) -
         return {"task": task, "error": too_deep}
     except Exception as error:  # one broken task must not take the others down
         logger.exception("Child run %s of tool call %s raised", label, ctx.tool_call_id)
-        problem = f"{type(error).__name__}: {error}"
+        problem = prompts.TOOL_FAILED_EXCEPTION.format(type=type(error).__name__, error=error)
         return {
             "task": task,
             "error": prompts.FAN_OUT_TASK_FAILED.format(name=agent.name, error=problem),

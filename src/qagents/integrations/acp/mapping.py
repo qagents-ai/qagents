@@ -169,7 +169,7 @@ def error_text(error: JsonRpcError) -> str:
                 return data[key].strip()
     if data is not None:
         return str(data)
-    return error.message or f"JSON-RPC error {error.code}"
+    return error.message or _prompts.ACP_JSONRPC_ERROR.format(code=error.code)
 
 
 def outcome_for_prompt_error(error: JsonRpcError, *, cancelling: bool) -> ExternalOutcome:
@@ -231,8 +231,9 @@ def _image_data(part: ImagePart) -> tuple[str, str]:
 def content_text(content: Any) -> str:
     """The text of a tool call's ``content`` list (ACP ``ToolCallContent``), for its result.
 
-    Text blocks are joined with newlines; a diff, a terminal or a non-text block
-    becomes a short bracketed note (``[diff: path]``), without its bytes.
+    Text blocks are joined with newlines (`prompts.ACP_TOOL_CONTENT_SEPARATOR`); a diff, a
+    terminal or a non-text block becomes a short bracketed note (``[diff: path]``, the
+    ``ACP_*_PLACEHOLDER`` texts), without its bytes.
     """
     if not isinstance(content, list):
         return ""
@@ -248,10 +249,11 @@ def content_text(content: Any) -> str:
                 if text:
                     pieces.append(text)
         elif kind == "diff":
-            pieces.append(f"[diff: {item.get('path', '')}]")
+            pieces.append(_prompts.ACP_DIFF_PLACEHOLDER.format(path=item.get("path", "")))
         elif kind == "terminal":
-            pieces.append(f"[terminal: {item.get('terminalId', '')}]")
-    return "\n".join(pieces)
+            terminal = item.get("terminalId", "")
+            pieces.append(_prompts.ACP_TERMINAL_PLACEHOLDER.format(terminal=terminal))
+    return _prompts.ACP_TOOL_CONTENT_SEPARATOR.join(pieces)
 
 
 def _block_text(block: Mapping[str, Any]) -> str:
@@ -260,15 +262,15 @@ def _block_text(block: Mapping[str, Any]) -> str:
         text = block.get("text")
         return text if isinstance(text, str) else ""
     if kind in ("image", "audio"):
-        return f"[{kind}: {block.get('mimeType', '')}]"
+        return _prompts.ACP_MEDIA_PLACEHOLDER.format(kind=kind, mime_type=block.get("mimeType", ""))
     if kind == "resource_link":
-        return f"[resource_link: {block.get('uri', '')}]"
+        return _prompts.ACP_RESOURCE_LINK_PLACEHOLDER.format(uri=block.get("uri", ""))
     if kind == "resource":
         resource = block.get("resource")
         if isinstance(resource, Mapping) and isinstance(resource.get("text"), str):
             return resource["text"]
         uri = resource.get("uri", "") if isinstance(resource, Mapping) else ""
-        return f"[resource: {uri}]"
+        return _prompts.ACP_RESOURCE_PLACEHOLDER.format(uri=uri)
     return ""
 
 

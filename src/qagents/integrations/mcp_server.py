@@ -171,14 +171,9 @@ async def collect_tools(items: Iterable[Any]) -> list[Tool]:
     names: dict[str, Tool] = {}
     for tool in found:
         if tool.name in names:
-            raise ConfigurationError(
-                f"Two served tools are named {tool.name!r}. Rename one with @tool(name=...)."
-            )
+            raise ConfigurationError(prompts.TOOL_SERVER_DUPLICATE_NAME.format(name=tool.name))
         if tool.deferred:
-            raise ConfigurationError(
-                f"Tool {tool.name!r} is deferred (its result comes from agent.resume), so it "
-                "cannot be served over MCP: an MCP caller waits for the result of its call."
-            )
+            raise ConfigurationError(prompts.TOOL_SERVER_DEFERRED_TOOL.format(name=tool.name))
         names[tool.name] = tool
     return found
 
@@ -195,10 +190,7 @@ def _flatten(items: Iterable[Any]) -> list[Tool | Toolkit]:
         elif isinstance(item, Iterable) and not isinstance(item, str | bytes):
             flat.extend(_flatten(item))
         else:
-            raise ConfigurationError(
-                f"{item!r} is not a tool. Serve a function, a Tool, a Toolkit, an Agent or a "
-                "list of them."
-            )
+            raise ConfigurationError(prompts.TOOL_SERVER_NOT_A_TOOL.format(item=item))
     return flat
 
 
@@ -337,7 +329,8 @@ async def _invoke(
     except Exception as error:
         logger.exception("Served tool %s raised", call.name)
         content = prompts.TOOL_FAILED.format(
-            name=call.name, error=f"{type(error).__name__}: {error}"
+            name=call.name,
+            error=prompts.TOOL_FAILED_EXCEPTION.format(type=type(error).__name__, error=error),
         )
         metadata["exception"] = type(error).__name__
     return ToolResultPart(
@@ -550,7 +543,8 @@ def _note_edit(result: ToolResultPart, verdict: _Verdict) -> ToolResultPart:
     note = prompts.APPROVAL_ARGUMENTS_CHANGED.format(
         arguments=json.dumps(verdict.call.arguments, ensure_ascii=False, default=str)
     )
-    return result.model_copy(update={"content": f"{note}\n{result.content}"})
+    content = prompts.APPROVAL_ARGUMENTS_CHANGED_RESULT.format(note=note, content=result.content)
+    return result.model_copy(update={"content": content})
 
 
 class _BoundCalls(_Calls):
@@ -632,7 +626,7 @@ class _Dispatcher:
     async def handle(self, name: str, arguments: Mapping[str, Any]) -> mcp_types.CallToolResult:
         tool = self.tools.get(name)
         if tool is None:
-            available = ", ".join(self.tools) or "none"
+            available = prompts.UNKNOWN_TOOL_SEPARATOR.join(self.tools) or prompts.UNKNOWN_TOOL_NONE
             return _mcp_result(prompts.UNKNOWN_TOOL.format(name=name, available=available), True)
         # The call runs in a plain asyncio task, outside the SDK's cancel scopes, so that a
         # cancelled request can still journal its result.

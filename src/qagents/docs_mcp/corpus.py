@@ -12,6 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 
 from . import markdown, prompts
 from .apiindex import ApiEntry, build_api_index
@@ -30,8 +31,72 @@ PRIORS = {
     SKILL_PATH: 0.6,
 }
 """Search weight of each kind of page; API entries and examples have their own below."""
+PREFIX_PRIORS = {
+    "reference/": 0.6,
+    "research.md": 0.6,
+}
+"""Search weight of docs pages by path (a folder ends with ``/``), when `PRIORS` has none.
+The API reference pages hold only ``::: name`` lines (the objects themselves are indexed as
+API entries), and the research report is mostly in Greek."""
+
+
+@dataclass(frozen=True)
+class OffTopic:
+    """How a page on one integration weighs for a query that does not name its topic."""
+
+    weight: float
+    """The page's search weight for such a query."""
+    words: str = ""
+    """Words that name the topic, though the page may not use them (``codex``)."""
+    titles: bool = True
+    """Whether the words of the page's titles and file name name its topic too (those not
+    common to the whole corpus)."""
+
+
+_CODING_AGENTS = "coding coder claude codex gemini"
+"""What people call the coding agents that the external-agent pages put to work, and that
+the tool server serves tools to."""
+OFF_TOPIC_PRIORS = {
+    "concepts/external-agents.md": OffTopic(0.5, f"acp devvi worker drive {_CODING_AGENTS}"),
+    "integrations/acp.md": OffTopic(0.5, f"external worker drive {_CODING_AGENTS}"),
+    "integrations/devvi.md": OffTopic(0.5, f"external worker drive {_CODING_AGENTS}"),
+    "integrations/mcp-server.md": OffTopic(0.5, f"expose external {_CODING_AGENTS}"),
+    "integrations/": OffTopic(0.5),
+    "coding-agents.md": OffTopic(0.5, "docs documentation llms", titles=False),
+}
+"""The pages on one integration, by path (a folder ends with ``/``), and what names their
+topic (`OffTopic`).
+
+These pages use the core words, ``agent``, ``tool``, ``session``, ``resume``, about their
+own topic, so a plain question about the core (``agent tools``) would otherwise land on
+them. A question about their topic names it and finds them at full weight: a word of the
+page's title or file name (``devvi``, ``acp``, ``mcp``, ``external``), or one of its
+`OffTopic.words`. The external-agent pages are about putting another coding agent to work,
+so the agents people name for that (Claude Code, Codex, Gemini CLI) name their topic. The
+page on the docs server is about the docs: the coding agents in its title are its readers,
+and a question about driving Claude Code is not about it."""
 API_PRIOR = 0.85
 EXAMPLE_PRIOR = 0.9
+
+
+_T = TypeVar("_T")
+
+
+def _by_prefix(path: str, table: dict[str, _T]) -> _T | None:
+    """The value of the first key that is the path, or a folder (``.../``) holding it."""
+    for prefix, prior in table.items():
+        if path == prefix or (prefix.endswith("/") and path.startswith(prefix)):
+            return prior
+    return None
+
+
+def page_prior(path: str) -> float:
+    """The search weight of a page: `PRIORS`, then `PREFIX_PRIORS`, else 1."""
+    if path in PRIORS:
+        return PRIORS[path]
+    prior = _by_prefix(path, PREFIX_PRIORS)
+    return PRIORS["docs"] if prior is None else prior
+
 
 _DIRECTIVE = re.compile(r"^:::\s+([\w.]+)\s*$")
 _SNIPPET = re.compile(r"""^[ \t]*-{2}8<-{2}[ \t]+["']([^"']+)["'][ \t]*$""")
@@ -324,13 +389,27 @@ def _qagents_names(tree: ast.Module) -> tuple[str, ...]:
 def _page_docs(pages: dict[str, Page]) -> list[SearchDoc]:
     docs: list[SearchDoc] = []
     for page in pages.values():
-        prior = PRIORS.get(page.path, PRIORS["docs"])
+        prior = page_prior(page.path)
+        name = Path(page.path).stem.replace("-", " ")  # mcp-server.md: "mcp server"
+        if page.path in EXTRA_PAGES or name == "index":
+            name = ""
+        # page.title is never empty: a page without an H1 is titled by its file name
+        titles = tuple(dict.fromkeys(t for t in (page.title, page.nav_title, name) if t))
+        off_topic = _by_prefix(page.path, OFF_TOPIC_PRIORS) or OffTopic(1.0)
+        topic = " ".join(titles) if off_topic.weight != 1.0 and off_topic.titles else ""
         for section in page.sections:
             body = "\n".join(
                 page.lines[section.start + (1 if section.level else 0) : section.body_end]
             )
             if not body.strip() and section.level != 1:
                 continue
+            # a section of only ``::: name`` lines says nothing of its own: its title is not
+            # matched as a heading, so the API entries it lists rank above it
+            stub = bool(body.strip()) and all(
+                not line.strip() or _DIRECTIVE.match(line.strip()) for line in body.splitlines()
+            )
+            heading = section.title if section.level > 1 else titles[0]
+            above = titles if section.level > 1 else titles[1:]
             trail = " > ".join(section.trail) if section.trail else page.title
             title = trail if section.level else page.title
             anchor = section.anchor if section.level > 1 else ""
@@ -350,6 +429,11 @@ def _page_docs(pages: dict[str, Page]) -> list[SearchDoc]:
                     group=page.path,
                     boost=prior,
                     extra=page.summary if section.level <= 1 else "",
+                    heading="" if stub else heading,
+                    titles=() if stub else above,
+                    topic=topic,
+                    topic_words=off_topic.words,
+                    off_topic=off_topic.weight,
                 )
             )
     return docs
@@ -372,6 +456,7 @@ def _example_docs(examples: dict[str, Example]) -> list[SearchDoc]:
                 boost=EXAMPLE_PRIOR,
                 names=(example.short.lower(), example.name.lower()),
                 extra=" ".join(example.uses),
+                titles=(example.description,),
             )
         )
     return docs

@@ -3,7 +3,8 @@
 [AG-UI](https://docs.ag-ui.com) is the event protocol that CopilotKit and other
 agent front ends read. `to_agui_events` projects a qagents event stream onto
 it, and `agui_sse` encodes the result as server-sent events for an HTTP
-response:
+response. To connect a CopilotKit frontend, serve the AG-UI stream over HTTP
+with `agui_sse`:
 
     from fastapi.responses import StreamingResponse
     from qagents.integrations.agui import AGUI_MEDIA_TYPE, agui_sse

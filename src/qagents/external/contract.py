@@ -181,9 +181,13 @@ class ExternalResult(BaseModel):
         else:  # no session was opened: there is nothing to pass back as session=
             start = prompts.EXTERNAL_AGENT_FOOTER_NO_SESSION.format(name=name, status=status)
         parts = [start]
+        separator = prompts.EXTERNAL_AGENT_FOOTER_LIST_SEPARATOR
         counts = Counter(call.name for call in self.tool_calls)
         if counts:
-            summary = ", ".join(f"{tool} {count}" for tool, count in counts.most_common())
+            summary = separator.join(
+                prompts.EXTERNAL_AGENT_FOOTER_TOOL_COUNT.format(tool=tool, count=count)
+                for tool, count in counts.most_common()
+            )
             total = sum(counts.values())
             template = (
                 prompts.EXTERNAL_AGENT_FOOTER_ONE_TOOL
@@ -195,14 +199,15 @@ class ExternalResult(BaseModel):
             parts.append(prompts.EXTERNAL_AGENT_FOOTER_NO_TOOLS)
         refused = [item for item in self.permissions if not item.approved]
         if refused:
-            items = ", ".join(
+            shown = [
                 prompts.EXTERNAL_AGENT_FOOTER_REFUSED_ITEM.format(
                     tool=item.external_tool, detail=item.detail()
                 )
                 for item in refused[:5]
-            )
+            ]
             if len(refused) > 5:
-                items += ", " + prompts.EXTERNAL_AGENT_FOOTER_MORE.format(count=len(refused) - 5)
+                shown.append(prompts.EXTERNAL_AGENT_FOOTER_MORE.format(count=len(refused) - 5))
+            items = separator.join(shown)
             template = (
                 prompts.EXTERNAL_AGENT_FOOTER_ONE_REFUSED
                 if len(refused) == 1
@@ -210,10 +215,11 @@ class ExternalResult(BaseModel):
             )
             parts.append(template.format(count=len(refused), items=items))
         if self.changed_files:
-            files = ", ".join(self.changed_files[:20])
+            names = self.changed_files[:20]
             if len(self.changed_files) > 20:
                 more = len(self.changed_files) - 20
-                files += ", " + prompts.EXTERNAL_AGENT_FOOTER_MORE.format(count=more)
+                names = [*names, prompts.EXTERNAL_AGENT_FOOTER_MORE.format(count=more)]
+            files = separator.join(names)
             parts.append(prompts.EXTERNAL_AGENT_FOOTER_CHANGED.format(files=files))
         return prompts.EXTERNAL_AGENT_FOOTER_SEPARATOR.join(parts)
 

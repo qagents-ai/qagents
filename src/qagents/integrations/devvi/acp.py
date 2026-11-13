@@ -174,8 +174,7 @@ class DevviACPAgent(ACPAgent):
         tail = process.stderr_tail() if process is not None else ""
         await self.disconnect()
         raise ExternalAgentConfigurationError(
-            f"{self.name}: expose_tools serves in-process tools over MCP Streamable HTTP, "
-            "which this Devvi does not support (its mcpCapabilities.http is not true).\n"
+            f"{acp_prompts.DEVVI_EXPOSE_NEEDS_HTTP.format(name=self.name)}\n"
             "Expose importable tools ('package.module:attr') instead: they run over stdio.",
             stderr_tail=tail or None,
         )
@@ -213,7 +212,9 @@ class DevviACPAgent(ACPAgent):
         try:
             await server.start()
         except ConfigurationError as error:
-            raise ExternalAgentConfigurationError(f"{self.name}: expose_tools: {error}") from error
+            raise ExternalAgentConfigurationError(
+                acp_prompts.DEVVI_EXPOSE_FAILED.format(name=self.name, error=error)
+            ) from error
         key = id(turn)
         self._tool_servers[key] = server
         try:

@@ -45,6 +45,36 @@ are never recorded.
 A compactor's own model request (the summary of `SummarizingCompactor`) goes
 through the run's hooks, so it has a ``chat`` span of its own.
 
+An external agent used as a tool (`ExternalAgent.as_tool`: Devvi, an ACP agent)
+runs its own loop, so its model requests and tools get no spans of their own.
+Its permission decisions and the end of its turn are span events on the
+``execute_tool`` span of the call that ran it (on the run span when the event
+names no such call), so a trace shows who approved what and how the turn ended:
+
+    execute_tool coder
+      event qagents.external.permission_decided   coder.bash: allow, by on_ask
+      event qagents.external.turn_finished        completed, end_turn, tokens
+
+A permission event has the tool's name, the answer (``outcome``, ``approved``),
+what the rules said and who decided; the arguments and the reason only with
+``record_content``. A turn event has the status, the session, the backend, the
+token usage and the number of tool calls and changed files. Its stop reason is
+recorded when it is a known word: one of `qagents.external.STOP_REASONS`, a reason
+qagents gives a cancelled turn (``permission``, ``closed``) or a word an adapter passes
+through (ACP's ``max_turn_requests``, Devvi's ``forked``, ``blocked`` and
+``interrupted``). Any other stop reason, such as an error turn's (the agent's message),
+and the changed paths are recorded only with ``record_content``. A field of the wrong
+type (a custom adapter's own ``turn_finished`` data) is left out; it never fails the run.
+
+A tool span stays open until its ``tool_call_finished`` event, so the events of the
+turn that are still on their way reach it. It ends at the time its tool returned, and
+the events that arrive after that time are stamped with it, so they fall inside the span.
+A calling run that is cancelled or times out during the turn ends the span before the
+turn reports its end: that span has no ``turn_finished`` event.
+
+`qagents.integrations.mlflow.MLflowHooks` does not record these events; export the
+spans of `OTelHooks` to MLflow's ``/v1/traces`` endpoint to see them there.
+
 Every span a run opened is ended when the run ends, however it ends. A tool
 call that paused the run for input (``DeferToolCall``) ends its span without
 an error and with ``qagents.tool.deferred`` set; the run span of a paused run
@@ -54,11 +84,14 @@ has ``qagents.status`` ``"paused"`` and lists the waiting calls.
 from __future__ import annotations
 
 import json
+import math
+import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from .errors import ConfigurationError
-from .events import InputRequired
+from .events import ExternalAgentEvent, InputRequired, SubagentEvent, ToolCallFinished
 from .hooks import Hooks
 from .messages import ToolCallPart, ToolResultPart
 from .models.base import ModelRequest, ModelResponse
@@ -93,14 +126,64 @@ ATTR = {
     "pending_approvals": "qagents.pending_approvals",
     "pending_inputs": "qagents.pending_inputs",
     "error_type": "error.type",
+    "external_tool": "qagents.external.permission.tool",
+    "external_tool_call_id": "qagents.external.permission.tool_call_id",
+    "external_outcome": "qagents.external.permission.outcome",
+    "external_approved": "qagents.external.permission.approved",
+    "external_decision": "qagents.external.permission.decision",
+    "external_decided_by": "qagents.external.permission.decided_by",
+    "external_arguments": "qagents.external.permission.arguments",
+    "external_reason": "qagents.external.permission.reason",
+    "external_status": "qagents.external.status",
+    "external_stop_reason": "qagents.external.stop_reason",
+    "external_session": "qagents.external.session_id",
+    "external_backend": "qagents.external.backend",
+    "external_tool_calls": "qagents.external.tool_calls",
+    "external_changed_files": "qagents.external.changed_files",
+    "external_changed_files_count": "qagents.external.changed_files_count",
 }
 """Span attribute names, in one place so a renamed convention is a one-line change."""
+
+EVENTS = {
+    "permission_decided": "qagents.external.permission_decided",
+    "turn_finished": "qagents.external.turn_finished",
+}
+"""Span event names, by the ``kind`` of the external agent's event they record."""
+
+_EXTERNAL_STOP_WORDS = frozenset(
+    {"permission", "closed", "max_turn_requests", "forked", "blocked", "interrupted"}
+)
+"""Stop reasons besides ``STOP_REASONS`` that are words, not content, so a span records them
+without ``record_content``. qagents' reasons for a cancelled turn: ``permission`` (the turn
+paused the calling run for a permission), ``closed`` (the agent was closed). The words an
+adapter passes through: ACP's ``max_turn_requests``
+(`qagents.integrations.acp.mapping.STOP_REASONS`) and Devvi's ``forked``, ``blocked`` and
+``interrupted`` (`qagents.integrations.devvi.events.TURN_END_KINDS`)."""
 
 UNFINISHED = "the run ended before this finished"
 """Status description of a span that its run left open (a failure or a cancellation)."""
 
 TOOL_FAILED = "the tool reported an error"
 """Status description of a failed tool call when content is not recorded."""
+
+
+def _number(value: Any) -> float | None:
+    """``value`` as a finite number, or None when it is not one (a bool, a string, NaN)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _count(value: Any) -> int | None:
+    """``value`` as a count of tokens, calls or files, or None when it is not a number."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    number = _number(value)
+    return int(number) if number is not None else None
 
 
 @dataclass
@@ -112,6 +195,10 @@ class _OpenRun:
     chat: Any = None
     tools: dict[str, Any] = field(default_factory=dict)
     """Open ``execute_tool`` spans by tool call id."""
+    finishing: dict[str, tuple[Any, int]] = field(default_factory=dict)
+    """``execute_tool`` spans whose tool returned, with the time it did (nanoseconds), by
+    tool call id. Each ends at its ``tool_call_finished`` event: the events an external
+    agent's turn sent before that event are still on their way to `OTelHooks.on_event`."""
 
 
 class OTelHooks(Hooks):
@@ -122,8 +209,11 @@ class OTelHooks(Hooks):
             from the globally configured tracer provider.
         record_content: Put messages, tool arguments and tool results on the
             spans, and the text of errors (a failed tool's result, the message
-            and stack trace of the exception that ended a run). Off by default
-            because they often contain personal data.
+            and stack trace of the exception that ended a run). For an external
+            agent: the arguments and reason of each permission decision, the
+            paths its turn changed and a stop reason that is not a known word
+            (an error turn's message). Off by default because they often contain
+            personal data.
 
     Raises:
         ConfigurationError: OpenTelemetry is not installed.
@@ -233,6 +323,7 @@ class OTelHooks(Hooks):
         span = run.tools.pop(call.id, None) if run is not None else None
         if span is None:
             return
+        returned = time.time_ns()
         if result.is_error:
             text = result.content[:200] if self._record_content else TOOL_FAILED
             span.set_status(self._trace.StatusCode.ERROR, text)
@@ -240,16 +331,111 @@ class OTelHooks(Hooks):
                 span.set_attribute(ATTR["error_type"], str(result.metadata["exception"]))
         if self._record_content:
             span.set_attribute(ATTR["tool_result"], result.content)
-        span.end()
+        assert run is not None
+        run.finishing[call.id] = (span, returned)  # ended by its tool_call_finished
 
     async def on_event(self, ctx: RunContext[Any], event: Any) -> None:
-        # A tool that raised DeferToolCall ran before_tool but gets no after_tool.
-        if isinstance(event, InputRequired):
+        if isinstance(event, ToolCallFinished):
+            run = self._runs.get(ctx.run_id)
+            finished = run.finishing.pop(event.call.id, None) if run is not None else None
+            if finished is not None:
+                span, returned = finished
+                span.end(end_time=returned)
+        elif isinstance(event, SubagentEvent):
+            inner = event.event
+            if isinstance(inner, ExternalAgentEvent) and inner.kind in EVENTS:
+                self._external_event(ctx, event.tool_call_id, inner)
+        elif isinstance(event, InputRequired):
+            # A tool that raised DeferToolCall ran before_tool but gets no after_tool.
             run = self._runs.get(ctx.run_id)
             span = run.tools.pop(event.input.tool_call_id, None) if run is not None else None
             if span is not None:
                 span.set_attribute(ATTR["deferred"], True)
                 span.end()
+
+    def _external_event(
+        self, ctx: RunContext[Any], tool_call_id: str | None, event: ExternalAgentEvent
+    ) -> None:
+        """Add an external agent's ``permission_decided`` or ``turn_finished`` event to the
+        span of the tool call that ran the agent, or to the run span.
+
+        Only what says who decided what and how the turn ended: the arguments, the reason,
+        a stop reason that is not a known word (an error turn's message) and the changed
+        paths are content, recorded only with ``record_content``. The data comes from the
+        adapter, which may be a custom one: a field of the wrong type is left out, so
+        tracing never fails a run that would succeed without it.
+        """
+        run = self._runs.get(ctx.run_id)
+        if run is None:
+            return
+        span = run.tools.get(tool_call_id or "")
+        when: int | None = None  # now
+        if span is None and (finishing := run.finishing.get(tool_call_id or "")) is not None:
+            span, when = finishing  # it happened before the tool returned: inside the span
+        if span is None:
+            span = run.span
+        data = event.data
+        attributes: dict[str, Any] = {ATTR["agent"]: event.agent}
+        if event.kind == "permission_decided":
+            for source, target in (
+                ("tool", "external_tool"),
+                ("tool_call_id", "external_tool_call_id"),
+                ("outcome", "external_outcome"),
+                ("decision", "external_decision"),
+                ("rule", "external_decided_by"),
+            ):
+                value = data.get(source)
+                if isinstance(value, str) and value:
+                    attributes[ATTR[target]] = value
+            attributes[ATTR["external_approved"]] = data.get("approved") is True
+            if self._record_content:
+                raw_arguments = data.get("arguments", {})
+                if isinstance(raw_arguments, Mapping):
+                    try:
+                        arguments = json.dumps(raw_arguments, ensure_ascii=False, default=str)
+                    except (TypeError, ValueError, RecursionError):  # a bad key, a cycle, too deep
+                        pass
+                    else:
+                        attributes[ATTR["external_arguments"]] = arguments
+                reason = data.get("reason")
+                if isinstance(reason, str) and reason:
+                    attributes[ATTR["external_reason"]] = reason
+        else:
+            from .external.contract import STOP_REASONS  # loaded: an external agent ran
+
+            status = data.get("status")
+            if isinstance(status, str) and status:
+                attributes[ATTR["external_status"]] = status
+            stop_reason = data.get("stop_reason")
+            if isinstance(stop_reason, str) and stop_reason:
+                known = stop_reason in STOP_REASONS or stop_reason in _EXTERNAL_STOP_WORDS
+                if self._record_content or known:
+                    attributes[ATTR["external_stop_reason"]] = stop_reason
+            session = event.session_id or data.get("session_id")
+            if isinstance(session, str) and session:
+                attributes[ATTR["external_session"]] = session
+            backend = data.get("backend")
+            if isinstance(backend, str) and backend:
+                attributes[ATTR["external_backend"]] = backend
+            usage = data.get("usage")
+            usage = usage if isinstance(usage, Mapping) else {}
+            attributes[ATTR["input_tokens"]] = _count(usage.get("input_tokens")) or 0
+            attributes[ATTR["output_tokens"]] = _count(usage.get("output_tokens")) or 0
+            if cached := _count(usage.get("cached_input_tokens")):
+                attributes[ATTR["cached_input_tokens"]] = cached
+            if (cost := _number(usage.get("cost_usd"))) is not None:
+                attributes[ATTR["cost"]] = cost
+            calls = data.get("tool_calls")
+            counts = calls.values() if isinstance(calls, Mapping) else ()
+            attributes[ATTR["external_tool_calls"]] = sum(_count(n) or 0 for n in counts)
+            if (count := _count(data.get("changed_files_count"))) is not None:
+                attributes[ATTR["external_changed_files_count"]] = count
+            files = data.get("changed_files")
+            if self._record_content and isinstance(files, list | tuple) and files:
+                paths = [path for path in files if isinstance(path, str)]
+                if paths:
+                    attributes[ATTR["external_changed_files"]] = paths
+        span.add_event(EVENTS[event.kind], attributes, timestamp=when)
 
     async def on_run_end(
         self, ctx: RunContext[Any], result: RunResult | None, error: BaseException | None
@@ -319,6 +505,9 @@ class OTelHooks(Hooks):
         if run.chat is not None:
             self._fail(run.chat)
             run.chat = None
+        for span, returned in run.finishing.values():  # their tools returned: no failure
+            span.end(end_time=returned)
+        run.finishing.clear()
         for span in run.tools.values():
             self._fail(span)
         run.tools.clear()

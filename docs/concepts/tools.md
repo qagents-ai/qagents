@@ -76,6 +76,7 @@ await agent.run("What did I order?", deps=Deps(db=db, user_id="u-42"))
 | Field | What it is |
 |---|---|
 | `deps` | whatever you passed as `deps=`: connections, the current user, configuration |
+| `state` | JSON state shared between tool calls, persisted in the session journal across runs and resumes; tools that change it must use `read_only=False` |
 | `run_id`, `session_id`, `agent_name`, `turn` | where the call is happening |
 | `tool_call_id` | the model's id for this call |
 | `operation_id` | a stable id for this call: [use it as an idempotency key](sessions.md#idempotency) |

@@ -117,12 +117,11 @@ def build_env(
     for name, value in (extra or {}).items():
         if not isinstance(name, str) or not name or "=" in name:
             raise ExternalAgentConfigurationError(
-                f"Environment variable name {name!r} is not valid: use a non-empty string "
-                "without '='."
+                prompts.EXTERNAL_PROCESS_ENV_NAME.format(name=name)
             )
         if not isinstance(value, str):
             raise ExternalAgentConfigurationError(
-                f"Environment variable {name} must be a string, not {type(value).__name__}."
+                prompts.EXTERNAL_PROCESS_ENV_VALUE.format(name=name, type=type(value).__name__)
             )
         if _WINDOWS:  # one entry per name: an explicit value replaces a copied one
             for key in [key for key in env if key.upper() == name.upper()]:
@@ -153,7 +152,7 @@ def resolve_command(command: Sequence[str], env: Mapping[str, str]) -> list[str]
     """
     if not command or not all(isinstance(part, str) for part in command):
         raise ExternalAgentConfigurationError(
-            f"The command must be a non-empty list of strings, not {command!r}."
+            prompts.EXTERNAL_PROCESS_COMMAND_INVALID.format(command=command)
         )
     program = command[0]
     path = next((value for key, value in env.items() if key.upper() == "PATH"), None)
@@ -161,34 +160,38 @@ def resolve_command(command: Sequence[str], env: Mapping[str, str]) -> list[str]
     if os.path.isabs(program) or os.path.dirname(program):  # a path the caller chose
         found = _existing_file(program, pathext)
         if found is None:
-            raise ExternalAgentConfigurationError(f"Cannot start {program!r}: no such file.")
+            raise ExternalAgentConfigurationError(
+                prompts.EXTERNAL_PROCESS_FILE_MISSING.format(program=program)
+            )
     else:
         searched = find_program(program, path, pathext=pathext)
         if searched is None:
-            where = "the PATH given to the process" if path is not None else "PATH"
+            where = (
+                prompts.EXTERNAL_PROCESS_PATH_GIVEN
+                if path is not None
+                else prompts.EXTERNAL_PROCESS_PATH_DEFAULT
+            )
             raise ExternalAgentConfigurationError(
-                f"Cannot start {program!r}: it was not found on {where}. Give its absolute "
-                "path, or add its directory to PATH."
+                prompts.EXTERNAL_PROCESS_PROGRAM_MISSING.format(program=program, where=where)
             )
         found = searched
     suffix = Path(found).suffix
     if _WINDOWS and suffix.lower() in (".cmd", ".bat"):
         raise ExternalAgentConfigurationError(
-            f"Cannot start {found!r}: it is a {suffix} shim, which Windows runs "
-            "through cmd.exe. Run the script it wraps instead, for example "
-            "['node', '<path to the package>/bin.js']."
+            prompts.EXTERNAL_PROCESS_SHIM.format(program=found, suffix=suffix)
         )
     if _WINDOWS and suffix.lower() not in _WINDOWS_PROGRAMS:
-        kind = f"a {suffix} file" if suffix else "a file without an extension"
+        kind = (
+            prompts.EXTERNAL_PROCESS_FILE_KIND.format(suffix=suffix)
+            if suffix
+            else prompts.EXTERNAL_PROCESS_EXTENSIONLESS
+        )
         raise ExternalAgentConfigurationError(
-            f"Cannot start {found!r}: it is {kind}, and Windows starts only .exe and .com "
-            "programs. Run it with its interpreter, for example ['node', "
-            f"{found!r}] for a .js file."
+            prompts.EXTERNAL_PROCESS_WINDOWS_FILE.format(program=found, kind=kind)
         )
     if not _WINDOWS and not os.access(found, os.X_OK):
         raise ExternalAgentConfigurationError(
-            f"Cannot start {found!r}: it is not executable. Make it executable (chmod +x), or "
-            "run it with its interpreter, for example ['node', '<path>/bin.js']."
+            prompts.EXTERNAL_PROCESS_NOT_EXECUTABLE.format(program=found)
         )
     return [found, *command[1:]]
 
@@ -320,7 +323,7 @@ class ManagedProcess:
         label = name or Path(argv[0]).name
         if cwd is not None and not _is_dir(cwd):
             raise ExternalAgentConfigurationError(
-                f"Cannot start {label}: the working directory {str(cwd)!r} does not exist."
+                prompts.EXTERNAL_PROCESS_CWD.format(name=label, cwd=str(cwd))
             )
         options: dict[str, Any] = {}
         if _WINDOWS:
@@ -342,11 +345,12 @@ class ManagedProcess:
             )
         except NotImplementedError as error:
             raise ExternalAgentConfigurationError(
-                f"Cannot start {label}: this event loop cannot run subprocesses. On Windows use "
-                "the default Proactor event loop (do not set WindowsSelectorEventLoopPolicy)."
+                prompts.EXTERNAL_PROCESS_NO_SUBPROCESSES.format(name=label)
             ) from error
         except OSError as error:
-            raise ExternalAgentConfigurationError(f"Cannot start {label}: {error}") from error
+            raise ExternalAgentConfigurationError(
+                prompts.EXTERNAL_PROCESS_START_FAILED.format(name=label, error=error)
+            ) from error
         managed = cls(process, name=label, stderr_bytes=stderr_bytes)
         if _WINDOWS:
             managed._job = _WindowsJob.create_for(process.pid)

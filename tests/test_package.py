@@ -15,6 +15,7 @@ from qagents import (
     Agent,
     Hooks,
     Message,
+    RunContext,
     Session,
     ToolCallPart,
     ToolResultPart,
@@ -453,7 +454,7 @@ def test_external_agent_strings_live_in_prompts():
     }
     prefixes = ("EXTERNAL_", "TOOL_SERVER_", "ACP_", "DEVVI_")
     names = [name for name in vars(prompts) if name.startswith(prefixes)]
-    assert len(names) == 79
+    assert len(names) == 191
     assert all(isinstance(getattr(prompts, name), str) for name in names)
     assert set(names) <= documented
     readers = (
@@ -466,6 +467,11 @@ def test_external_agent_strings_live_in_prompts():
         "qagents.integrations.devvi",
         "qagents.integrations.devvi.sdk",
         "qagents.integrations.devvi.acp",
+        "qagents.integrations.devvi.events",
+        "qagents.integrations.devvi.launcher",
+        "qagents.integrations.devvi.patches",
+        "qagents.integrations._process",
+        "qagents.integrations._jsonrpc",
     )
     for reader in readers:
         module = importlib.import_module(reader)
@@ -483,6 +489,184 @@ async def test_a_new_prompt_value_reaches_the_external_agent_tool(monkeypatch):
     monkeypatch.setattr(prompts, "EXTERNAL_AGENT_DESCRIPTION", "Ask {name}.")
     built = ScriptedExternalAgent([["done"]], name="coder").as_tool()
     assert built.description.startswith("Ask coder.")
+
+
+async def test_new_values_of_the_external_agent_joiners_reach_their_readers(monkeypatch, tmp_path):
+    """One constant (or more) from every module that builds external-agent text: a new value
+    reaches the calling model, the external agent, or the MCP client's model."""
+    from qagents.errors import ToolError
+    from qagents.external import (
+        STATE_SESSIONS,
+        ExternalApproval,
+        PermissionStep,
+        ScriptedExternalAgent,
+        ToolStep,
+    )
+    from qagents.external.permissions import ExternalTool
+    from qagents.integrations._jsonrpc import JsonRpcError
+    from qagents.integrations.acp import mapping
+    from qagents.integrations.devvi import DevviAgent
+    from qagents.integrations.devvi import events as devvi_events
+    from qagents.integrations.devvi import sdk as devvi_sdk
+    from qagents.integrations.mcp_server import _note_edit, _Verdict
+    from qagents.messages import TextPart
+
+    for name, value in {
+        "EXTERNAL_AGENT_FOOTER_TOOL_COUNT": "{tool} x{count}",  # contract.py
+        "EXTERNAL_AGENT_FOOTER_LIST_SEPARATOR": " | ",
+        "EXTERNAL_AGENT_NO_ARGUMENTS": "(none)",  # permissions.py
+        "EXTERNAL_AGENT_DECLINED_REASON": " because {reason}",
+        "EXTERNAL_TOOL_DESCRIPTION": "{agent} runs {tool}.",
+        "EXTERNAL_TOOL_NEVER_RUN": "Not here.",
+        "EXTERNAL_AGENT_TASK_SEPARATOR": " / ",  # turn.py
+        "EXTERNAL_AGENT_FORGOTTEN_SESSION": "forgot {session} ({limit})",  # tool.py
+        "EXTERNAL_AGENT_UNKNOWN_SESSION": "never saw {session}",
+        "ACP_DIFF_PLACEHOLDER": "<diff {path}>",  # acp/mapping.py
+        "ACP_TOOL_CONTENT_SEPARATOR": " + ",
+        "ACP_JSONRPC_ERROR": "code {code}",
+        "EXTERNAL_AGENT_DESCRIPTION_WITH_HINT": "{hint} {description}",  # devvi/__init__.py
+        "EXTERNAL_AGENT_LINE_SHORTENED": "~",  # devvi/sdk.py
+        "DEVVI_UNKNOWN_TURN_END": "no end",  # devvi/events.py
+        "APPROVAL_ARGUMENTS_CHANGED_RESULT": "{content} [{note}]",  # mcp_server.py
+    }.items():
+        monkeypatch.setattr(prompts, name, value)
+
+    # The calling model's tool result: the footer's tool counts and refused requests.
+    external = ScriptedExternalAgent(
+        [[ToolStep("read"), ToolStep("read"), ToolStep("bash"), PermissionStep("edit"), "ok"]],
+        name="coder",
+    )
+    model = ScriptedModel([call("coder", task="Go."), "Done."])
+    result = await Agent(model, tools=[external.as_tool()]).run("go")
+    (content,) = [p.content for m in result.messages for p in m.tool_results]
+    assert "3 tool calls (read x2 | bash x1)" in content
+    assert "1 permission refused (edit: (none))" in content
+
+    # The approval texts, and the stand-in tool of a permission decision.
+    assert ExternalApproval(False, reason="risky").content.startswith("Declined because risky.")
+    stand_in = ExternalTool("coder.bash", agent="coder", external_name="bash")
+    assert stand_in.description == "coder runs bash."
+    with pytest.raises(ToolError, match="^Not here.$"):
+        stand_in.function()
+
+    # The external agent's prompt text of a task in several parts.
+    scripted = ScriptedExternalAgent([["ok"]], name="coder")
+    await scripted.run([TextPart(text="a"), TextPart(text="b")])
+    assert scripted.calls[0].task == "a / b"
+
+    # The model passes a session the tool does not know: with few sessions kept, and with
+    # the tool's full 50 (the call before fills its list).
+    @tool
+    def fill(ctx: RunContext) -> str:
+        """Pretend the coder tool opened 50 sessions."""
+        old = [{"session_id": f"old-{i}", "cwd": None, "backend": None} for i in range(50)]
+        ctx.state[STATE_SESSIONS] = {"coder": old}
+        return "filled"
+
+    model = ScriptedModel(
+        [
+            call("coder", task="Go on.", session="s-9"),
+            call("fill"),
+            call("coder", task="Go on.", session="s-9"),
+            "Done.",
+        ]
+    )
+    result = await Agent(model, tools=[external.as_tool(), fill]).run("go")
+    unknown, _, forgotten = [p.content for m in result.messages for p in m.tool_results]
+    assert unknown == prompts.EXTERNAL_AGENT_FAILED.format(name="coder", error="never saw s-9")
+    assert forgotten == prompts.EXTERNAL_AGENT_FAILED.format(name="coder", error="forgot s-9 (50)")
+
+    # ACP: a tool call's result content, and a stop reason the model reads.
+    pieces = [{"type": "content", "content": {"type": "text", "text": "a"}}, {"type": "diff"}]
+    assert mapping.content_text(pieces) == "a + <diff >"
+    failed = mapping.outcome_for_prompt_error(JsonRpcError(-32000, ""), cancelling=False)
+    assert failed.stop_reason == "code -32000"
+
+    # Devvi: the tool description, a shortened stop reason, an unknown turn end.
+    devvi = DevviAgent(
+        workspace=tmp_path, transport="sdk", command=["node", "devvi.js"], home=tmp_path / "h"
+    )
+    assert devvi.as_tool().description.startswith(prompts.EXTERNAL_AGENT_CONTINUE_HINT + " ")
+    assert devvi_sdk._first_line("x" * 400, 10) == "x" * 9 + "~"
+    assert devvi_events.turn_end_outcome(None).stop_reason == "no end"
+
+    # The MCP tool server: a result that ran with an approver's edited arguments.
+    ran = ToolResultPart(tool_call_id="c", name="send", content="sent")
+    edited = _note_edit(ran, _Verdict(ToolCallPart(id="c", name="send"), edited=True))
+    assert edited.content.startswith("sent [") and edited.content.endswith("]")
+
+
+@pytest.mark.parametrize("with_tools", [False, True])
+async def test_core_unknown_tool_uses_shared_prompt_joiners(monkeypatch, with_tools):
+    monkeypatch.setattr(prompts, "UNKNOWN_TOOL_SEPARATOR", " / ")
+    monkeypatch.setattr(prompts, "UNKNOWN_TOOL_NONE", "nothing")
+
+    @tool
+    def one() -> str:
+        """Return one."""
+        return "one"
+
+    @tool
+    def two() -> str:
+        """Return two."""
+        return "two"
+
+    model = ScriptedModel([call("missing"), "done"])
+    await Agent(model, tools=[one, two] if with_tools else []).run("go")
+    content = model.requests[1].messages[-1].tool_results[0].content
+    assert content == prompts.UNKNOWN_TOOL.format(
+        name="missing", available="one / two" if with_tools else "nothing"
+    )
+
+
+@pytest.mark.parametrize("outside", [False, True])
+async def test_core_edited_tool_result_uses_shared_prompt_layout(monkeypatch, outside):
+    from qagents import Approval, Permissions
+
+    monkeypatch.setattr(prompts, "APPROVAL_ARGUMENTS_CHANGED_RESULT", "{content} <{note}>")
+
+    @tool(requires_approval=True)
+    def send(value: str) -> str:
+        """Send the approved value."""
+        return value
+
+    @tool
+    async def delegate(ctx: RunContext) -> str:
+        """Ask the run to call send."""
+        return (await ctx.call_tool(send, {"value": "original"}, source="test")).content
+
+    permissions = Permissions(
+        on_ask=lambda *_: Approval(approved=True, arguments={"value": "edited"})
+    )
+    calls = [call("delegate")] if outside else [call("send", value="original")]
+    model = ScriptedModel([*calls, "done"])
+    await Agent(model, tools=[delegate] if outside else [send], permissions=permissions).run("go")
+    content = model.requests[1].messages[-1].tool_results[0].content
+    assert content.startswith("edited <The approver changed the arguments") and content.endswith(
+        ">"
+    )
+
+
+async def test_core_tool_and_fan_out_errors_use_shared_exception_text(monkeypatch):
+    from qagents.models.testing import FunctionModel
+    from qagents.multi import fan_out
+
+    monkeypatch.setattr(prompts, "TOOL_FAILED_EXCEPTION", "<{type}> {error}")
+
+    @tool
+    def broken() -> str:
+        """Raise an ordinary tool error."""
+        raise ValueError("bad input")
+
+    def fail(request):
+        raise RuntimeError("worker unavailable")
+
+    worker = Agent(FunctionModel(fail), name="worker")
+    model = ScriptedModel([call("broken"), call("worker_parallel", tasks=["go"]), "done"])
+    result = await Agent(model, tools=[broken, fan_out(worker)]).run("go")
+    contents = [p.content for m in result.messages for p in m.tool_results]
+    assert contents[0] == "'broken' failed: <ValueError> bad input"
+    assert "<RuntimeError> worker unavailable" in contents[1]
 
 
 def test_pyproject_has_the_external_agent_extras_and_bundles_the_docs():

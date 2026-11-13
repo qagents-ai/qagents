@@ -305,10 +305,7 @@ def _server_wire(server: Any) -> dict[str, Any]:
         return server.to_acp()
     if isinstance(server, Mapping):
         return dict(server)
-    raise ConfigurationError(
-        f"mcp_servers holds {type(server).__name__}; use MCPServerStdio, MCPServerHTTP or an "
-        "ACP McpServer mapping."
-    )
+    raise ConfigurationError(prompts.ACP_SERVER_UNKNOWN_TYPE.format(type=type(server).__name__))
 
 
 # --- the agent -----------------------------------------------------------------------------
@@ -604,7 +601,7 @@ class ACPAgent(ExternalAgent):
             await self._handshake(peer, process)
             if peer.closed:
                 raise self._setup_error(
-                    "stopped right after the ACP handshake", process, peer.close_error
+                    prompts.ACP_STOPPED_AFTER_HANDSHAKE, process, peer.close_error
                 )
         except asyncio.CancelledError:
             process.kill()
@@ -662,8 +659,7 @@ class ACPAgent(ExternalAgent):
         cwd = turn.cwd
         if cwd is None:
             raise ExternalAgentConfigurationError(
-                f"{self.name}: an ACP session needs a working directory. Build the agent with "
-                "workspace= (or cwd=), or pass cwd= to stream() or run()."
+                prompts.ACP_NO_WORKING_DIRECTORY.format(name=self.name)
             )
         prompt = self._prompt(turn)
         held: list[str] = []  # sessions this turn keeps from being closed as idle
@@ -715,7 +711,9 @@ class ACPAgent(ExternalAgent):
             except JsonRpcError as error:
                 if error.code == AUTH_REQUIRED:
                     raise ExternalAgentUnavailableError(
-                        f"{self.name} needs authentication: {error_text(error)}"
+                        prompts.ACP_PROMPT_NEEDS_AUTH.format(
+                            name=self.name, error=error_text(error)
+                        )
                     ) from error
                 return outcome_for_prompt_error(error, cancelling=turn.cancel_requested)
             finally:
@@ -959,12 +957,14 @@ class ACPAgent(ExternalAgent):
                 given = ()
             if isinstance(given, str | bytes | Mapping) or not isinstance(given, Iterable):
                 raise ConfigurationError(
-                    f"mcp_servers must give a list of MCP servers, not {type(given).__name__}."
+                    prompts.ACP_SERVERS_NOT_A_LIST.format(type=type(given).__name__)
                 )
             wire = [_server_wire(server) for server in given]
             self._check_servers(wire)
         except ConfigurationError as error:
-            raise ExternalAgentConfigurationError(f"{self.name}: {error}") from error
+            raise ExternalAgentConfigurationError(
+                prompts.ACP_SERVERS_FAILED.format(name=self.name, error=error)
+            ) from error
         return wire, per_turn
 
     def _check_servers(self, wire: Sequence[Mapping[str, Any]]) -> None:
@@ -974,8 +974,9 @@ class ACPAgent(ExternalAgent):
             transport = server.get("type")
             if transport in ("http", "sse") and offered.get(transport) is not True:
                 raise ConfigurationError(
-                    f"MCP server {server.get('name')!r} uses {transport}, which the agent does "
-                    f"not support (its mcpCapabilities.{transport} is not true)."
+                    prompts.ACP_SERVER_NOT_SUPPORTED.format(
+                        server=server.get("name"), transport=transport
+                    )
                 )
 
     async def _open_session(
@@ -1070,15 +1071,21 @@ class ACPAgent(ExternalAgent):
         if error.code in (INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND):
             # an MCP server that did not start, a refused cwd: setup, not a failed turn
             raise ExternalAgentConfigurationError(
-                f"{self.name} refused session/new: {error.message}"
+                prompts.ACP_SESSION_NEW_REFUSED.format(name=self.name, message=error.message)
             )
         return ExternalOutcome(status="error", stop_reason=error_text(error))
 
     def _auth_error(self, error: JsonRpcError) -> ExternalAgentConfigurationError:
-        offered = ", ".join(str(method.get("id")) for method in self.auth_methods) or "none"
+        offered = (
+            prompts.EXTERNAL_SETUP_LIST_SEPARATOR.join(
+                str(method.get("id")) for method in self.auth_methods
+            )
+            or prompts.EXTERNAL_SETUP_LIST_NONE
+        )
         return ExternalAgentConfigurationError(
-            f"{self.name} needs authentication ({error_text(error)}). Log in to the agent "
-            f"yourself, or pass auth_method= with one of the methods it offers: {offered}."
+            prompts.ACP_SESSION_NEEDS_AUTH.format(
+                name=self.name, error=error_text(error), offered=offered
+            )
         )
 
     def _remember_options(self, session_id: str, result: Mapping[str, Any]) -> list[Any] | None:
@@ -1122,21 +1129,28 @@ class ACPAgent(ExternalAgent):
             )
             if option is None or not isinstance(option.get("id"), str):
                 raise ExternalAgentConfigurationError(
-                    f"{self.name}: model={self.model!r} was asked for, but the session offers "
-                    "no model option."
+                    prompts.ACP_NO_MODEL_OPTION.format(name=self.name, model=self.model)
                 )
-            wanted.append((option["id"], self.model, "model"))
-        wanted.extend((key, value, f"option {key!r}") for key, value in self.config_options.items())
+            wanted.append((option["id"], self.model, prompts.ACP_CONFIG_MODEL))
+        wanted.extend(
+            (key, value, prompts.ACP_CONFIG_OPTION.format(option=key))
+            for key, value in self.config_options.items()
+        )
         for config_id, value, what in wanted:
             option = next(
                 (o for o in options if isinstance(o, Mapping) and o.get("id") == config_id),
                 None,
             )
             if option is None:
-                ids = ", ".join(str(o.get("id")) for o in options if isinstance(o, Mapping))
+                ids = prompts.EXTERNAL_SETUP_LIST_SEPARATOR.join(
+                    str(o.get("id")) for o in options if isinstance(o, Mapping)
+                )
                 raise ExternalAgentConfigurationError(
-                    f"{self.name}: the session offers no config option {config_id!r} "
-                    f"(it offers: {ids or 'none'})."
+                    prompts.ACP_NO_CONFIG_OPTION.format(
+                        name=self.name,
+                        option=config_id,
+                        offered=ids or prompts.EXTERNAL_SETUP_LIST_NONE,
+                    )
                 )
             chosen = self._select(option, value, what)
             if option.get("currentValue") == chosen:
@@ -1149,7 +1163,9 @@ class ACPAgent(ExternalAgent):
                 result = await self._request(peer, "session/set_config_option", params)
             except JsonRpcError as error:
                 raise ExternalAgentConfigurationError(
-                    f"{self.name}: setting {what} to {value!r} failed: {error.message}"
+                    prompts.ACP_CONFIG_FAILED.format(
+                        name=self.name, what=what, value=value, message=error.message
+                    )
                 ) from error
             updated = result.get("configOptions")
             if isinstance(updated, list):
@@ -1175,9 +1191,13 @@ class ACPAgent(ExternalAgent):
                 with contextlib.suppress(ValueError, TypeError):
                     if isinstance(value, str) and json.loads(value) == list(wanted):
                         return value
-        offered = ", ".join(str(name or value) for value, name in values)
+        offered = prompts.EXTERNAL_SETUP_LIST_SEPARATOR.join(
+            str(name or value) for value, name in values
+        )
         raise ExternalAgentConfigurationError(
-            f"{self.name}: {what} {wanted!r} is not offered by the session (it offers: {offered})."
+            prompts.ACP_CONFIG_NOT_OFFERED.format(
+                name=self.name, what=what, wanted=wanted, offered=offered
+            )
         )
 
     # -- the agent's messages ------------------------------------------------------------------
@@ -1286,25 +1306,22 @@ class ACPAgent(ExternalAgent):
             result = await peer.request("initialize", params, timeout=self.handshake_timeout_s)
         except JsonRpcError as error:
             raise self._setup_error(
-                f"refused the ACP handshake (initialize): {error.message}", process
+                prompts.ACP_HANDSHAKE_REFUSED.format(message=error.message), process
             ) from error
         except ExternalAgentTimeoutError as error:
             raise self._setup_error(
-                f"did not answer the ACP handshake (initialize) within "
-                f"{self.handshake_timeout_s:g} seconds",
-                process,
+                prompts.ACP_HANDSHAKE_TIMEOUT.format(seconds=self.handshake_timeout_s), process
             ) from error
         except ExternalAgentConnectionError as error:
             raise self._setup_error(
-                f"stopped during the ACP handshake ({error.reason})", process, error
+                prompts.ACP_HANDSHAKE_STOPPED.format(reason=error.reason), process, error
             ) from error
         if not isinstance(result, Mapping):
-            raise self._setup_error(f"answered initialize with {result!r}", process)
+            raise self._setup_error(prompts.ACP_HANDSHAKE_BAD_ANSWER.format(answer=result), process)
         version = result.get("protocolVersion")
         if type(version) is not int or version != PROTOCOL_VERSION:
             raise self._setup_error(
-                f"speaks ACP protocol version {version!r}; qagents speaks version "
-                f"{PROTOCOL_VERSION}. Use a release of the agent that supports ACP v1",
+                prompts.ACP_PROTOCOL_VERSION.format(version=version, supported=PROTOCOL_VERSION),
                 process,
             )
         self._info = dict(result)
@@ -1328,16 +1345,16 @@ class ACPAgent(ExternalAgent):
             return
         chosen = next((method for method in methods if method.get("id") == self.auth_method), None)
         if chosen is None:
-            offered = ", ".join(str(method.get("id")) for method in methods)
+            offered = prompts.EXTERNAL_SETUP_LIST_SEPARATOR.join(
+                str(method.get("id")) for method in methods
+            )
             raise self._setup_error(
-                f"offers no authentication method {self.auth_method!r} (it offers: {offered})",
+                prompts.ACP_AUTH_METHOD_UNKNOWN.format(method=self.auth_method, offered=offered),
                 process,
             )
         if chosen.get("type") == "terminal":
             raise self._setup_error(
-                f"authentication method {self.auth_method!r} runs interactively in a terminal, "
-                "which qagents cannot do; log in to the agent yourself first",
-                process,
+                prompts.ACP_AUTH_METHOD_TERMINAL.format(method=self.auth_method), process
             )
         try:
             await peer.request(
@@ -1345,19 +1362,21 @@ class ACPAgent(ExternalAgent):
             )
         except JsonRpcError as error:
             raise self._setup_error(
-                f"authentication with {self.auth_method!r} failed: {error.message}", process
+                prompts.ACP_AUTH_FAILED.format(method=self.auth_method, message=error.message),
+                process,
             ) from error
         except (ExternalAgentTimeoutError, ExternalAgentConnectionError) as error:
             raise self._setup_error(
-                f"authentication with {self.auth_method!r} did not finish", process, error
+                prompts.ACP_AUTH_UNFINISHED.format(method=self.auth_method), process, error
             ) from error
 
     def _setup_error(
         self, summary: str, process: ManagedProcess, cause: BaseException | None = None
     ) -> ExternalAgentConfigurationError:
-        """A setup failure: a short first line (it may reach a model), details after it."""
+        """A setup failure: a short first line (`prompts.ACP_SETUP_FAILED`, which reaches the
+        calling model through ``as_tool()``), details for the developer after it."""
         tail = process.stderr_tail() or None
-        lines = [f"{self.name}: {summary}."]
+        lines = [prompts.ACP_SETUP_FAILED.format(name=self.name, summary=summary)]
         if cause is not None:
             lines.append(str(cause))
         elif tail:

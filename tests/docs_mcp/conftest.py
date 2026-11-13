@@ -1,8 +1,9 @@
 """Fixtures of the docs server tests: the real corpus of this checkout, and a small fake one.
 
-A test marked ``docs_benchmark`` measures wall-clock time. It is skipped unless the ``-m``
-expression names the marker (``pytest tests/docs_mcp -m docs_benchmark``), so a slow or busy
-machine never fails the default suite.
+A test marked ``docs_benchmark`` measures wall-clock time or search quality over the whole
+question set (`test_search_eval.py`). It is skipped unless the ``-m`` expression names the
+marker (``pytest tests/docs_mcp -m docs_benchmark``), so a slow or busy machine never fails
+the default suite, and a ranking change is measured on purpose.
 """
 
 from __future__ import annotations
@@ -24,7 +25,9 @@ BENCHMARK = "docs_benchmark"
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
-        "markers", f"{BENCHMARK}: a wall-clock bound on the docs server (opt-in: -m {BENCHMARK})"
+        "markers",
+        f"{BENCHMARK}: a wall-clock or search-quality benchmark of the docs server "
+        f"(opt-in: -m {BENCHMARK})",
     )
 
 

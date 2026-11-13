@@ -457,8 +457,11 @@ class ExternalAgent(ABC):
                 only a session this tool opened in this qagents session (they are
                 kept in ``ctx.state["qagents.external.sessions"]``, the latest 50);
                 any other id is refused with an error result, before the agent is
-                reached. Code that calls `stream` or `run` itself may continue any
-                session. Without the parameter every call starts a new session,
+                reached (`EXTERNAL_AGENT_UNKNOWN_SESSION`; once 50 are kept,
+                `EXTERNAL_AGENT_FORGOTTEN_SESSION`, which allows that the session
+                may be an older one that was dropped). Code that calls `stream` or
+                `run` itself may continue any session. Without the parameter every
+                call starts a new session,
                 except the call after a pause (``on_permission="pause"``): it
                 continues the paused session by itself, so the human's answer applies.
             requires_approval: Ask the caller's human once per delegation

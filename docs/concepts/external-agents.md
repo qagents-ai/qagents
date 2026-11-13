@@ -139,8 +139,12 @@ Fixed parse_line; the test passes.
 To continue the same conversation, the model passes `session` from the footer in its next call.
 It can continue only a session that this tool opened in this qagents session (the latest 50
 are kept in `ctx.state["qagents.external.sessions"]`). Any other session id is a tool error
-that says so (`coder failed: session ... does not exist; leave session out to start a new
-one`), and the agent is not reached. Your own code may continue any session:
+that says so (`coder failed: session ... was not opened by coder in this conversation; leave
+session out to start a new one`), and the agent is not reached. Once the list holds 50 sessions,
+the refusal uses `EXTERNAL_AGENT_FORGOTTEN_SESSION`: `session ... is not among the last 50
+sessions that coder opened or continued in this conversation, which are the only ones it can
+continue; leave session out to start a new one`. The session may have been dropped from the
+list even if this tool opened it earlier. Your own code may continue any session:
 `coder.run(task, session=...)` and `coder.stream(task, session=...)`.
 Give `as_tool()` a `timeout` that fits coding work: without one the lead's
 `Limits.tool_timeout_s` applies, which is 120 seconds by default, and the turn is cancelled at
@@ -581,7 +585,10 @@ process stop, and a later `aclose()` waits for it.
 !!! note "Not in this version"
     - An unmetered agent under a token or cost budget is refused at its first call, after the
       handshake, not when the agent is built.
-    - No tracing spans or span events are emitted for the steps inside an external turn.
+    - The steps inside an external turn (its model requests and tool calls) get no tracing
+      spans of their own. `OTelHooks` records the turn's permission decisions and its end as
+      span events on the `execute_tool` span of the call that ran it
+      ([Tracing](hooks.md#tracing)); `MLflowHooks` does not record them.
     - ACP's unstable `usage` field is not read yet, so ACP agents stay unmetered.
     - Only Devvi has recorded ACP transcripts. Other ACP agents are expected to work and need
       a fixture of their own before they are called supported.

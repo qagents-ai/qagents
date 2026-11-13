@@ -79,8 +79,11 @@ class ExternalPermission(BaseModel):
         elif self.arguments:
             text = json.dumps(self.arguments, ensure_ascii=False, default=str, sort_keys=True)
         else:
-            text = "(no arguments)"
-        return text if len(text) <= limit else text[: limit - 3] + "..."
+            text = prompts.EXTERNAL_AGENT_NO_ARGUMENTS
+        if len(text) <= limit:
+            return text
+        marker = prompts.EXTERNAL_AGENT_LINE_SHORTENED
+        return text[: max(limit - len(marker), 0)] + marker
 
 
 class PermissionAnswer(BaseModel):
@@ -179,7 +182,7 @@ class ExternalApproval(ToolResultPart):
         data.setdefault("name", "")
         content = data.pop("content", None)
         if not content:
-            why = f" ({reason})" if reason else ""
+            why = prompts.EXTERNAL_AGENT_DECLINED_REASON.format(reason=reason) if reason else ""
             if approved:
                 content = prompts.EXTERNAL_AGENT_APPROVED_GENERIC
             else:
@@ -223,7 +226,8 @@ class ExternalApproval(ToolResultPart):
                 if session
                 else prompts.EXTERNAL_AGENT_DECLINED_NO_SESSION
             )
-            content = template.format(**values, reason=f" ({reason})" if reason else "")
+            why = prompts.EXTERNAL_AGENT_DECLINED_REASON.format(reason=reason) if reason else ""
+            content = template.format(**values, reason=why)
         return cls(approved, reason=reason, content=content)
 
     @property
@@ -236,7 +240,7 @@ class _AnyArguments(BaseModel):
 
 
 def _never_run(*_: Any, **__: Any) -> Any:
-    raise ToolError("This stands for a tool of an external agent; qagents never runs it.")
+    raise ToolError(prompts.EXTERNAL_TOOL_NEVER_RUN)
 
 
 class ExternalTool(Tool):
@@ -253,7 +257,7 @@ class ExternalTool(Tool):
         # Not Tool.__init__: that would refuse the dot in the name.
         self.function = _never_run
         self.name = name
-        self.description = f"Tool {external_name!r} of the external agent {agent!r}."
+        self.description = prompts.EXTERNAL_TOOL_DESCRIPTION.format(tool=external_name, agent=agent)
         self.arguments_model = _AnyArguments
         self.takes_context = False
         self.requires_approval = True

@@ -93,6 +93,13 @@ There is no vector store. The published benchmarks for specialised memory layers
 and an agent with plain file tools is competitive with them; see the
 [research report](research.md).
 
+## Connect external tools
+
+`MCPToolkit` imports tools over MCP for a qagents agent. Install
+`qagents[mcp]`, open the toolkit as an async context manager, and pass it in the agent's
+`tools`. It supports stdio and Streamable HTTP; see the bundled
+`examples/patterns/mcp_tools.py` example.
+
 ## Your own toolkit
 
 A function that returns a list of tools is a toolkit. Close over what the tools need:

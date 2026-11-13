@@ -13,6 +13,7 @@ import importlib
 import inspect
 import os
 import re
+import sys
 import types
 import typing
 from dataclasses import dataclass, field
@@ -180,6 +181,7 @@ class ApiLookup:
         except ImportError:  # pragma: no cover - the package is running this code
             return None
         owner: type | None = None
+        container: ModuleType | None = None
         for index, part in enumerate(parts[1:], start=1):
             so_far = ".".join(parts[: index + 1])
             if inspect.isclass(obj):
@@ -214,8 +216,9 @@ class ApiLookup:
             if value is _MISSING:
                 return None
             owner = obj if inspect.isclass(obj) else None
+            container = obj if inspect.ismodule(obj) else None
             obj = value
-        return self._target(path, obj, owner, parts[-1])
+        return self._target(path, obj, owner, parts[-1], module=container)
 
     def _class_member(self, cls: type, name: str, path: str, *, last: bool) -> Target | None:
         fields = getattr(cls, "model_fields", None)
@@ -234,7 +237,16 @@ class ApiLookup:
         value = getattr(cls, name, raw)
         return self._target(path, value, cls, name, raw=raw)
 
-    def _target(self, path: str, obj: Any, owner: Any, name: str, *, raw: Any = _MISSING) -> Target:
+    def _target(
+        self,
+        path: str,
+        obj: Any,
+        owner: Any,
+        name: str,
+        *,
+        raw: Any = _MISSING,
+        module: ModuleType | None = None,
+    ) -> Target:
         static = raw if raw is not _MISSING else None
         if inspect.ismodule(obj):
             kind = "module"
@@ -247,6 +259,8 @@ class ApiLookup:
         else:
             kind = "attribute"
         entry = self.entry_for(obj, owner if inspect.isclass(owner) else None, name, kind)
+        if entry is None and kind == "attribute" and module is not None:
+            entry = self.module_attribute_entry(module, name, obj)
         return Target(
             path, kind, obj=obj, owner=owner if inspect.isclass(owner) else None,
             member=name if inspect.isclass(owner) else None, entry=entry,
@@ -271,6 +285,28 @@ class ApiLookup:
         qualname = getattr(obj, "__qualname__", None)
         if isinstance(module, str) and isinstance(qualname, str):
             return self._by_path.get(f"{module}.{qualname}")
+        return None
+
+    def module_attribute_entry(self, module: ModuleType, name: str, value: Any) -> ApiEntry | None:
+        """The static entry of a module attribute (a constant, a type alias), which has no
+        ``__module__`` of its own to find it by.
+
+        ``qagents.external.APPROVAL_KEY`` is defined in ``qagents.external.permissions``
+        and re-exported: the entry is the one, defined in this module or a module below it
+        (then in any module), whose module holds this very object under that name.
+        """
+        entry = self._by_path.get(f"{module.__name__}.{name}")
+        if entry is not None and entry.kind == "attribute":
+            return entry
+        prefix = f"{module.__name__}."
+        candidates = [
+            e for e in self._api if e.kind == "attribute" and e.path.rsplit(".", 1)[-1] == name
+        ]
+        candidates.sort(key=lambda e: not e.path.startswith(prefix))  # this package's first
+        for candidate in candidates:
+            defining = sys.modules.get(candidate.path.rsplit(".", 1)[0])
+            if defining is not None and vars(defining).get(name, _MISSING) is value:
+                return candidate
         return None
 
     def _member_entry(self, cls: type, name: str) -> ApiEntry | None:
@@ -855,6 +891,8 @@ def _doc_of(value: Any, lookup: ApiLookup, module: ModuleType, name: str) -> str
         inspect.isclass(value) or inspect.isroutine(value) or inspect.ismodule(value)
     ):
         entry = lookup.entry(f"{module.__name__}.{name}")
+        if entry is None and value is not None:
+            entry = lookup.module_attribute_entry(module, name, value)
         if entry is not None:
             return entry.doc
         if value is None:

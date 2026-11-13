@@ -105,8 +105,9 @@ what did not happen.
 |---|---|
 | `InMemoryStore` | tests, and sessions that need not survive a restart |
 | `SQLiteStore(path)` | one host; WAL mode, calls run on worker threads |
+| `PostgresStore(dsn)` | sessions shared by workers on several hosts; install `qagents[postgres]` |
 
-A store implements three methods. This is all a Postgres or Redis backend needs:
+A basic store implements three methods. A custom backend can implement this interface:
 
 ```python
 from qagents.session import Entry, SessionStore
@@ -125,7 +126,10 @@ class MyStore(SessionStore):
 
 `append` must be atomic and must preserve order. Entries are plain JSON (`entry.model_dump()`).
 
-!!! note "Not in 0.1"
-    There is no Postgres store, no snapshotting (state is derived by reading the whole journal of
-    a session), and no schema version field yet. Long-lived sessions with thousands of entries
-    will want snapshots.
+The built-in stores also support leases for runtime workers; a custom store needs the lease
+methods to support `AgentRuntime`. `PostgresStore` opens a connection pool on first use
+and keeps its tables in a separate schema.
+
+!!! note "Journal snapshots"
+    State is derived by reading the whole session journal. Long-lived sessions with thousands
+    of entries will want snapshots, which are not implemented yet.
