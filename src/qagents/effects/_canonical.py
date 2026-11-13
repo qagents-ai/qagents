@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from pydantic import BaseModel
 
@@ -134,3 +136,75 @@ def freeze(effect: Effect, request: BaseModel) -> Frozen:
 def rebuild(effect: Effect, frozen: Frozen) -> BaseModel:
     """Build a fresh typed request from the journal snapshot for send or lookup."""
     return effect.request_type.model_validate(json.loads(jcs(frozen.json)))
+
+
+@dataclass(frozen=True)
+class Descriptor:
+    """The first intent's effect, version, destination, and request identity."""
+
+    effect: str
+    version: str
+    destination_digest: str
+    request_digest: str
+
+    def same_without_version(self, other: Descriptor) -> bool:
+        """Compare meaning without code version; the recovery table owns this check."""
+        return (self.effect, self.destination_digest, self.request_digest) == (
+            other.effect,
+            other.destination_digest,
+            other.request_digest,
+        )
+
+    def digest(self) -> str:
+        """The claim descriptor digest, deliberately excluding the code version."""
+        return digest([self.effect, self.destination_digest, self.request_digest])
+
+
+def idempotency_key(
+    salt: bytes, namespace: str, effect: str, key: str, generation: int, max_len: int
+) -> str:
+    """Salted q1_ key for one generation; RFC 4648 base32, unpadded, at least 24 characters."""
+    if type(max_len) is not int or max_len < 24:
+        raise ValueError("idempotency_key_max_len must be an integer >= 24.")
+    if type(generation) is not int or generation < 0:
+        raise ValueError("generation must be a nonnegative integer.")
+    hashed = hashlib.sha256(salt + jcs([namespace, effect, key, generation])).digest()
+    return ("q1_" + base64.b32encode(hashed).decode().rstrip("="))[:max_len]
+
+
+def operation_tag(namespace: str, effect: str, key: str, request_digest: str) -> str:
+    """An op1_ binding tag that stays stable across every attempt and generation."""
+    hashed = hashlib.sha256(jcs([namespace, effect, key, request_digest])).digest()
+    return "op1_" + base64.b32encode(hashed).decode()[:26]
+
+
+def record_id(namespace: str, effect: str, key: str) -> str:
+    """An ef_ display identity; ambiguous shortened IDs must be refused by callers."""
+    hashed = hashlib.sha256(jcs([namespace, effect, key])).digest()
+    return "ef_" + base64.b32encode(hashed).decode().lower()[:8]
+
+
+def identity_digest(receipt: dict[str, JSONValue], receipt_identity: Sequence[str] | None) -> str:
+    """Hash declared identity fields, or the whole receipt when no fields were declared."""
+    return digest(
+        receipt
+        if receipt_identity is None
+        else {field: receipt[field] for field in receipt_identity}
+    )
+
+
+def resolve_namespace(effect: Effect, deps: Any, session_id: str) -> str:
+    """Resolve session identity or call a trusted namespace function once per perform."""
+    namespace = effect.namespace
+    if namespace == "session":
+        return "session:" + session_id.replace("%", "%25").replace(":", "%3A")
+    resolved = namespace(deps) if callable(namespace) else namespace
+    if not isinstance(resolved, str) or not resolved:
+        raise ValueError("An effect namespace must be a nonempty string.")
+    jcs(resolved)  # Refuse invalid Unicode before hashing or persisting the namespace.
+    return resolved
+
+
+def descriptor(effect: Effect, destination_json: JSONValue, request_digest: str) -> Descriptor:
+    """Bind the effect's declared version, trusted destination, and frozen request."""
+    return Descriptor(effect.name, effect.version, digest(destination_json), request_digest)
