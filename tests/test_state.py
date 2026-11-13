@@ -252,44 +252,6 @@ async def test_instructions_functions_that_change_state_are_saved():
     assert (await session.state()).values == {"rendered": 1}
 
 
-async def test_concurrent_batches_are_atomic_and_do_not_inherit_a_parent_batch():
-    from qagents import InMemoryStore
-
-    class RecordingStore(InMemoryStore):
-        def __init__(self):
-            super().__init__()
-            self.batches = []
-
-        async def append(self, session_id, entries):
-            entries = list(entries)
-            self.batches.append([entry.data["label"] for entry in entries])
-            await super().append(session_id, entries)
-
-    store = RecordingStore()
-    session = Session(store)
-    run = Agent(ScriptedModel([])).stream("go", session=session)._run
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def child():
-        async with run._batched():
-            await run._journal("probe", {"label": "child-1"})
-            started.set()
-            await release.wait()
-            async with run._batched():
-                await run._journal("probe", {"label": "child-2"})
-
-    async with run._batched():
-        await run._journal("probe", {"label": "parent-1"})
-        task = asyncio.create_task(child())
-        await started.wait()
-        await run._journal("probe", {"label": "parent-2"})
-    release.set()
-    await task
-    assert store.batches == [["parent-1", "parent-2"], ["child-1", "child-2"]]
-    assert len(await session.entries()) == 4
-
-
 @pytest.mark.parametrize("path", ["normal", "supplied", "defer", "served"])
 async def test_final_tool_state_and_terminal_entry_share_one_append(path):
     from qagents import DeferToolCall, InMemoryStore

@@ -403,3 +403,41 @@ async def test_a_sync_thread_left_running_by_a_run_timeout_counts_as_abandoned(m
             break
         await asyncio.sleep(0.02)
     assert not tools_module._ABANDONED
+
+
+@pytest.mark.parametrize("steal", [False, True])
+async def test_a_direct_run_stops_active_work_when_renewal_refuses(monkeypatch, steal):
+    from qagents import InMemoryStore
+    from qagents.errors import LeaseError
+    from qagents.models.testing import FunctionModel
+
+    monkeypatch.setattr("qagents.agent.RUN_LEASE_TTL_S", 0.09)
+    cancelled = asyncio.Event()
+
+    class RefusingStore(InMemoryStore):
+        async def renew_lease(self, session_id, owner, ttl):
+            if steal:
+                await self.release_lease(session_id, owner)
+                assert await self.acquire_lease(session_id, "other", 10)
+            return False
+
+    async def reply(request):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    store = RefusingStore()
+    session = Session(store)
+    running = asyncio.create_task(Agent(FunctionModel(reply)).run("go", session=session))
+    try:
+        if steal:
+            with pytest.raises(LeaseError):
+                await asyncio.wait_for(running, timeout=1)
+        else:
+            result = await asyncio.wait_for(running, timeout=1)
+            assert result.status == "cancelled" and result.stop_reason == "lease_lost"
+        assert cancelled.is_set()
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)

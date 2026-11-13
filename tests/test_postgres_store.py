@@ -500,8 +500,10 @@ def test_values_jsonb_cannot_hold_are_refused_with_advice_and_nothing_is_written
 
 
 @needs_postgres
-def test_a_signed_pause_with_a_large_float_resumes_from_postgres():
+@pytest.mark.parametrize("amount", [2e15, 2e16])
+def test_signed_large_float_normalization_respects_the_safe_integer_range(amount):
     from qagents import Approval, Permissions
+    from qagents.errors import ApprovalTokenError
 
     async def check(store: Any, schema: str) -> None:
         moved: list[float] = []
@@ -513,16 +515,21 @@ def test_a_signed_pause_with_a_large_float_resumes_from_postgres():
             return "moved"
 
         agent = Agent(
-            ScriptedModel([call("transfer", amount=2e16), "Moved."]),
+            ScriptedModel([call("transfer", amount=amount), "Moved."]),
             tools=[transfer],
             permissions=Permissions(approval_secret="test-secret-for-a-local-postgres!"),
         )
         paused = await agent.run("Move it", session=Session(store, id="t"))
         (pending,) = paused.pending_approvals
-        done = await agent.resume(
-            Session(store, id="t"), approvals={pending.tool_call_id: Approval.for_call(pending)}
-        )
-        assert done.status == "completed" and moved == [2e16]
+        answers = {pending.tool_call_id: Approval.for_call(pending)}
+        if amount > 2**53 - 1:
+            # JSONB reloaded the float as an unsafe integer: verification fails closed.
+            with pytest.raises(ApprovalTokenError):
+                await agent.resume(Session(store, id="t"), approvals=answers)
+            assert moved == []
+        else:
+            done = await agent.resume(Session(store, id="t"), approvals=answers)
+            assert done.status == "completed" and moved == [amount]
 
     postgres_check(check)
 

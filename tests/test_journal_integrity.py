@@ -7,7 +7,17 @@ from typing import Any
 
 import pytest
 
-from qagents import Agent, Hooks, InMemoryStore, Limits, Session, SessionError, SQLiteStore, tool
+from qagents import (
+    Agent,
+    Hooks,
+    InMemoryStore,
+    Limits,
+    RunContext,
+    Session,
+    SessionError,
+    SQLiteStore,
+    tool,
+)
 from qagents.errors import ConfigurationError, ModelServerError
 from qagents.messages import Message, Usage
 from qagents.models.base import ModelResponse
@@ -622,3 +632,135 @@ async def test_usage_added_before_a_crash_is_restored_on_resume():
     result = await Agent(later, limits=Limits(max_total_tokens=1000)).resume(session)
     assert (result.status, result.stop_reason) == ("limit_reached", "max_total_tokens")
     assert later.requests == []  # the summary already used the budget
+
+
+async def test_concurrent_batches_are_atomic_and_do_not_inherit_a_parent_batch():
+    from qagents import InMemoryStore
+
+    class RecordingStore(InMemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        async def append(self, session_id, entries):
+            entries = list(entries)
+            self.batches.append([entry.data["label"] for entry in entries])
+            await super().append(session_id, entries)
+
+    store = RecordingStore()
+    session = Session(store)
+    run = Agent(ScriptedModel([])).stream("go", session=session)._run
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def child():
+        async with run._batched():
+            await run._journal("probe", {"label": "child-1"})
+            started.set()
+            await release.wait()
+            async with run._batched():
+                await run._journal("probe", {"label": "child-2"})
+
+    async with run._batched():
+        await run._journal("probe", {"label": "parent-1"})
+        task = asyncio.create_task(child())
+        await started.wait()
+        await run._journal("probe", {"label": "parent-2"})
+    release.set()
+    await task
+    assert store.batches == [["parent-1", "parent-2"], ["child-1", "child-2"]]
+    assert len(await session.entries()) == 4
+
+
+@pytest.mark.parametrize("outcome", ["committed", "unknown", "cancelled", "refused"])
+async def test_added_usage_is_restored_only_after_a_definite_append_refusal(outcome):
+    import asyncio
+
+    from qagents import InMemoryStore, Session, Usage
+    from qagents.errors import LeaseError
+
+    class FailingStore(InMemoryStore):
+        fail = True
+
+        async def append(self, session_id, entries):
+            if self.fail:
+                self.fail = False
+                if outcome == "committed":
+                    await super().append(session_id, entries)
+                if outcome == "refused":
+                    raise LeaseError("nothing written")
+                if outcome == "cancelled":
+                    raise asyncio.CancelledError
+                raise ConnectionError("the acknowledgement was lost")
+            await super().append(session_id, entries)
+
+    store = FailingStore()
+    session = Session(store)
+    run = Agent(ScriptedModel([])).stream("go", session=session)._run
+    run._add_usage(Usage(input_tokens=7), operation_id="call-op")
+    with pytest.raises((ConnectionError, LeaseError, asyncio.CancelledError)):
+        await run._journal("tool_checkpoint", {"operation_id": "call-op", "key": "one"})
+    assert run._usage_to_journal.input_tokens == (7 if outcome == "refused" else 0)
+    await run._journal("run_failed", {"message": "stopped"})
+    entries = await session.entries()
+    tokens = sum(e.data.get("added_usage", {}).get("input_tokens", 0) for e in entries)
+    assert tokens == (7 if outcome in {"committed", "refused"} else 0)
+
+
+@pytest.mark.parametrize("path", ["normal", "supplied", "defer"])
+async def test_crash_at_the_final_state_boundary_does_not_double_state_on_resume(path):
+    from qagents import DeferToolCall
+
+    class CrashAtBoundary(InMemoryStore):
+        saw_state = False
+        crashed = False
+
+        async def append(self, session_id, entries):
+            kinds = {entry.kind for entry in entries}
+            terminal = bool(kinds & {"tool_result", "tool_deferred"})
+            if not self.crashed and self.saw_state and terminal:
+                self.crashed = True
+                raise ConnectionError("crash before the separate terminal append")
+            await super().append(session_id, entries)
+            if "state_updated" in kinds:
+                self.saw_state = True
+                if terminal and not self.crashed:
+                    self.crashed = True
+                    raise ConnectionError("crash after the atomic append")
+
+    applications = set()
+
+    class ResultState(Hooks):
+        async def after_tool(self, ctx, call, result):
+            if path == "supplied":
+                ctx.state["count"] = ctx.state.get("count", 0) + 1
+
+    @tool(idempotent=True, deferred=path == "supplied")
+    async def issue(ctx: RunContext) -> str:
+        """Apply an externally deduplicated action and update local state."""
+        applications.add(ctx.operation_id)
+        ctx.state["count"] = ctx.state.get("count", 0) + 1
+        if path == "defer":
+            raise DeferToolCall("waiting")
+        return "ok"
+
+    store = CrashAtBoundary()
+    session = Session(store)
+    agent = Agent(ScriptedModel([call("issue"), "done"]), tools=[issue], hooks=[ResultState()])
+    if path == "supplied":
+        paused = await agent.run("go", session=session)
+        with pytest.raises(ConnectionError):
+            await agent.resume(session, results={paused.pending_inputs[0].tool_call_id: "ok"})
+    else:
+        with pytest.raises(ConnectionError):
+            await agent.run("go", session=session)
+    pending = (await session.state()).pending_inputs
+    answers = {item.tool_call_id: "ok" for item in pending}
+    result = await agent.resume(session, results=answers)
+    if result.status == "paused":
+        result = await agent.resume(
+            session, results={item.tool_call_id: "ok" for item in result.pending_inputs}
+        )
+    assert result.completed and store.crashed
+    assert (await session.state()).values == {"count": 1}
+    assert len(applications) == (0 if path == "supplied" else 1)

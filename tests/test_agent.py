@@ -390,38 +390,3 @@ def test_run_sync():
 
 def test_every_framework_string_is_a_plain_attribute():
     assert "{name" in prompts.TOOL_FAILED and isinstance(prompts.OUTPUT_INSTRUCTIONS, str)
-
-
-@pytest.mark.parametrize("outcome", ["committed", "unknown", "cancelled", "refused"])
-async def test_added_usage_is_restored_only_after_a_definite_append_refusal(outcome):
-    import asyncio
-
-    from qagents import InMemoryStore, Session, Usage
-    from qagents.errors import LeaseError
-
-    class FailingStore(InMemoryStore):
-        fail = True
-
-        async def append(self, session_id, entries):
-            if self.fail:
-                self.fail = False
-                if outcome == "committed":
-                    await super().append(session_id, entries)
-                if outcome == "refused":
-                    raise LeaseError("nothing written")
-                if outcome == "cancelled":
-                    raise asyncio.CancelledError
-                raise ConnectionError("the acknowledgement was lost")
-            await super().append(session_id, entries)
-
-    store = FailingStore()
-    session = Session(store)
-    run = Agent(ScriptedModel([])).stream("go", session=session)._run
-    run._add_usage(Usage(input_tokens=7), operation_id="call-op")
-    with pytest.raises((ConnectionError, LeaseError, asyncio.CancelledError)):
-        await run._journal("tool_checkpoint", {"operation_id": "call-op", "key": "one"})
-    assert run._usage_to_journal.input_tokens == (7 if outcome == "refused" else 0)
-    await run._journal("run_failed", {"message": "stopped"})
-    entries = await session.entries()
-    tokens = sum(e.data.get("added_usage", {}).get("input_tokens", 0) for e in entries)
-    assert tokens == (7 if outcome in {"committed", "refused"} else 0)

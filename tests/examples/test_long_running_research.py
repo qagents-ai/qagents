@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import runpy
 import sys
 
@@ -92,7 +93,7 @@ async def test_worker_b_recovers_the_run_and_finishes_the_plan(tmp_path, capsys)
     printed = capsys.readouterr().out
     assert "worker-a -> search" in printed and "worker-b -> search" in printed
     assert "could not release its lease" in printed  # the dead worker's last log line
-    assert "the journal says 'running'; worker-a holds the lease" in printed
+    assert re.search(r"the journal says 'running'; worker-a#[0-9a-f]{32} holds the lease", printed)
     assert "worker-b recovers session 'research:data-centre-sites'" in printed.lower()
     assert "of its 5 tool calls, search never finished. worker-b ran search again" in printed
     assert "4. [completed] Write the recommendation" in printed
