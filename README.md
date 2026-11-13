@@ -32,7 +32,13 @@ made against the live QCloud API yet; see [What is verified](#what-is-verified).
 ## Documentation
 
 The full documentation is in [`docs/`](docs/index.md): concepts, guides, design notes and an API
-reference generated from the docstrings. Build and browse it locally:
+reference generated from the docstrings.
+
+For learning loops, scoped memory and adapters for other agent or voice libraries, see
+[QAgent Gym and integration recipes](docs/integrations/gym.md). The runnable
+[scoped-memory example](examples/scoped_memory.py) uses only qagents and SQLite.
+
+Build and browse the docs locally:
 
 ```bash
 pip install -e ".[docs]"

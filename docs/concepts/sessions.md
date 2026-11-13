@@ -69,9 +69,10 @@ Stated plainly, because the details matter when tools have side effects:
 - **Delivery is at-least-once**, as in every agent framework. Exactly-once needs cooperation from
   the system your tool calls: see below.
 
-`agent.resume` continues a run; nothing calls it for you. Finding dead runs across replicas
-(leases, heartbeats, a recovery worker) is on the [roadmap](../design.md#roadmap). Until then,
-resume from your own job runner or on the user's next request.
+`agent.resume` continues a run. To recover interrupted runs automatically, run
+`AgentRuntime` and call `recover()`; it uses leases and heartbeats to avoid taking an active
+worker's session. Workflow sessions are recovered by resuming their workflow instead.
+Without a runtime, resume from your own job runner or on the user's next request.
 
 ### Idempotency
 

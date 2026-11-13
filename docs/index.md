@@ -42,6 +42,7 @@ print(result.output)
 | A multi-step job that resumes | `Workflow(store, id=...)` | [Workflows](concepts/multi-agent.md#workflows) |
 | Traces | `hooks=[OTelHooks()]` | [Tracing](concepts/hooks.md#tracing) |
 | Tests without a model | `ScriptedModel([...])` | [Testing](testing.md) |
+| Learning loops, memory and adapter recipes | the separate QAgent Gym package | [Gym and integrations](integrations/gym.md) |
 | Docs your coding agent can query | `python -m qagents.docs_mcp` (MCP) or `qagents docs search "..."` | [Docs for coding agents](coding-agents.md) |
 
 ## Why another framework
