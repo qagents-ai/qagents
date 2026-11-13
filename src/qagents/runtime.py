@@ -188,6 +188,7 @@ class RunHandle:
         self._changed = asyncio.Event()
         self._done = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._preparing_task = asyncio.current_task()
         self._heartbeat: asyncio.Task[None] | None = None
         """Renews the lease from the moment it is taken, through preparation and the run."""
         self._stream: RunStream | None = None
@@ -199,6 +200,7 @@ class RunHandle:
         self._wake_up = asyncio.Event()
         """Set by `cancel` and by a stop request: a queued run stops waiting for its slot."""
         self._lease_lost = False
+        self._lease_deadline = asyncio.get_running_loop().time() + runtime.lease_ttl_s
         self._answers = answers
         """The run was resumed with approvals or results it has not finished using."""
         self._unsaved = set(unsaved)
@@ -947,6 +949,7 @@ class AgentRuntime:
         recovered: Mapping[str, Any] | None = None,
     ) -> RunHandle:
         self._handles[handle.session_id] = handle
+        handle._preparing_task = None
         task = asyncio.create_task(
             self._drive(handle, open_stream, deps, limits, journal, recovered),
             name=f"qagents-run:{handle.session_id}",
@@ -1125,12 +1128,18 @@ class AgentRuntime:
 
     async def _heartbeat(self, handle: RunHandle) -> None:
         session_id = handle.session_id
+        loop = asyncio.get_running_loop()
+        deadline = handle._lease_deadline
         while True:
-            await asyncio.sleep(self.heartbeat_s)
+            await asyncio.sleep(min(self.heartbeat_s, max(0, deadline - loop.time())))
+            if loop.time() >= deadline:
+                self._lose_lease(handle)
+                return
+            began = loop.time()
             try:
                 held = await asyncio.wait_for(
                     self.store.renew_lease(session_id, self.worker_id, self.lease_ttl_s),
-                    timeout=self.heartbeat_s,
+                    timeout=min(self.heartbeat_s, deadline - began),
                 )
             except Exception as failure:
                 logger.warning(
@@ -1140,17 +1149,22 @@ class AgentRuntime:
                     type(failure).__name__,
                 )
                 logger.debug("The renewal failed with", exc_info=True)
-                continue
-            if not held:
-                logger.error(
-                    "Worker %s lost its lease on session %r to another worker; stopping its run",
-                    self.worker_id,
-                    session_id,
-                )
-                handle._lease_lost = True
-                if handle._task is not None:
-                    handle._task.cancel()
+                continue  # failures never extend the last confirmed local deadline
+            if not held or loop.time() >= deadline:
+                self._lose_lease(handle)
                 return
+            deadline = began + self.lease_ttl_s
+
+    def _lose_lease(self, handle: RunHandle) -> None:
+        logger.error(
+            "Worker %s lost or could not confirm its lease on session %r; stopping its run",
+            self.worker_id,
+            handle.session_id,
+        )
+        handle._lease_lost = True
+        task = handle._task or handle._preparing_task
+        if task is not None:
+            task.cancel()
 
     async def _release(self, session_id: str) -> None:
         """Release the lease; on failure it simply expires."""

@@ -1310,3 +1310,62 @@ async def test_a_recovery_stopped_by_shutdown_before_it_resumed_is_not_counted()
     assert RECOVERED_KIND not in [e.kind for e in await store.load("order-7")]
     assert (await store.status("order-7")).lease_owner is None
     gate.set()
+
+
+@pytest.mark.parametrize("failure", ["raise", "hang"])
+async def test_renewal_errors_stop_the_run_at_its_last_confirmed_deadline(failure):
+    class UnreachableRenewal(InMemoryStore):
+        renewals = 0
+
+        async def renew_lease(self, session_id, owner, ttl):
+            self.renewals += 1
+            if failure == "hang":
+                await asyncio.Event().wait()
+            raise ConnectionError("renewal unavailable")
+
+    stopped = asyncio.Event()
+
+    async def reply(request):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    store = UnreachableRenewal()
+    agent = Agent(FunctionModel(reply), name="a")
+    runtime = AgentRuntime(store, [agent], lease_ttl_s=0.15, heartbeat_s=0.03)
+    try:
+        handle = await runtime.start("a", "go", session_id="s")
+        with pytest.raises(RunInterrupted):
+            await asyncio.wait_for(handle.wait(), timeout=1)
+        assert handle._lease_lost and stopped.is_set()
+        renewals = store.renewals
+        await asyncio.sleep(0.08)
+        assert store.renewals == renewals
+    finally:
+        await runtime.shutdown(timeout_s=0)
+
+
+async def test_unconfirmed_lease_also_cancels_preparation():
+    class UnreachableRenewal(InMemoryStore):
+        async def renew_lease(self, session_id, owner, ttl):
+            raise ConnectionError("renewal unavailable")
+
+    stopped = asyncio.Event()
+
+    async def deps(session_id):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    runtime = AgentRuntime(UnreachableRenewal(), [echo_agent()], deps_factory=deps, **FAST)
+    starting = asyncio.create_task(runtime.start("worker", "go", session_id="s"))
+    try:
+        done, _ = await asyncio.wait([starting], timeout=1)
+        assert starting in done and starting.cancelled()
+        assert stopped.is_set()
+    finally:
+        starting.cancel()
+        await asyncio.gather(starting, return_exceptions=True)
+        await runtime.shutdown(timeout_s=0)
