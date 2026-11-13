@@ -548,3 +548,37 @@ async def test_route_says_when_it_took_the_default_and_can_journal_the_classifie
     routed = await route(triage, specialists(), "Invoice?", classifier_session=classifier_session)
     assert routed.classification.session is classifier_session
     assert [m.text for m in await classifier_session.messages()] == ["Invoice?", "billing"]
+
+
+async def test_read_only_fan_out_restarts_children_in_fresh_sessions():
+    sessions = []
+    started = asyncio.Event()
+
+    class Capture(Hooks):
+        async def on_run_start(self, ctx):
+            sessions.append(ctx.session_id)
+
+    @tool(read_only=True)
+    async def wait() -> str:
+        """Wait for a result."""
+        started.set()
+        await asyncio.Event().wait()
+        return "done"
+
+    worker_model = ScriptedModel([call("wait"), "fresh answer"])
+    worker = Agent(worker_model, name="worker", tools=[wait], hooks=[Capture()])
+    lead = Agent(
+        ScriptedModel([call("worker_parallel", tasks=["task"]), "done"]),
+        tools=[fan_out(worker, read_only=True)],
+    )
+    session = Session()
+    running = asyncio.create_task(lead.run("go", session=session))
+    await asyncio.wait_for(started.wait(), 2)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    resumed = await lead.resume(session)
+    assert resumed.completed and len(sessions) == 2 and sessions[0] != sessions[1]
+    assert len(worker_model.requests[1].messages) == 1
+    assert worker_model.requests[1].messages[0].text == "task"
+    assert "fresh sessions" in fan_out.__doc__

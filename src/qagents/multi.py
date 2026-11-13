@@ -106,7 +106,7 @@ def fan_out(
             under ``Permissions(mode="read_only")``; and when the calling run
             is interrupted while the call works (a crash, a cancel, a
             deploy), a resume runs the whole call again: every task and every
-            worker model request, nothing reused. With the default
+            worker model request in fresh sessions, nothing reused. With the default
             ``False``, a resume tells the model the call's outcome is unknown.
         timeout: Seconds for the whole call, all tasks included. Defaults to
             `FAN_OUT_TIMEOUT_S` (10 minutes), since agents need far longer
