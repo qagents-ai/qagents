@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import inspect
 import json
 import logging
 import math
-from collections.abc import Callable, Mapping, Sequence
+import threading
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from qagents.errors import ConfigurationError, EffectRejected, ToolError
+from qagents import prompts
+from qagents.errors import ConfigurationError, EffectConflictError, EffectRejected, ToolError
 from qagents.session import EFFECTS_REQUIRED, SessionStore
 
 from . import _canonical as canonical
@@ -26,6 +30,128 @@ from ._types import MISSING, Absent, Found, HoldReason, NotYetVisible, RecT, Req
 
 Verdict = Found | NotYetVisible | Absent | Unknown
 _TOOLERROR_WARNED = False
+
+
+@dataclass
+class _Flight:
+    descriptor: canonical.Descriptor
+    result: concurrent.futures.Future[Any] = field(default_factory=concurrent.futures.Future)
+    task: asyncio.Task[Any] | None = None
+
+
+@dataclass
+class _StoreWork:
+    root: SessionStore
+    flights: dict[tuple[str, str, str, str], _Flight] = field(default_factory=dict)
+    sends: dict[tuple[str, str], set[concurrent.futures.Future[Any]]] = field(default_factory=dict)
+
+
+_WORK: dict[int, _StoreWork] = {}
+_WORK_LOCK = threading.Lock()
+
+
+def _root(store: SessionStore) -> SessionStore:
+    from qagents import agent
+
+    return agent._store_root(store)
+
+
+def _discard_empty(work: _StoreWork) -> None:
+    if not work.flights and not work.sends and _WORK.get(id(work.root)) is work:
+        _WORK.pop(id(work.root), None)
+
+
+async def _shield(awaitable: Awaitable[Any], *, scope: CallScope) -> Any:
+    """Complete the bounded operation and its durable accounting before cancellation (M39)."""
+    task = asyncio.ensure_future(awaitable)
+    scope.journal.track(task)
+    cancelled = None
+    while True:
+        try:
+            value = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                raise
+            cancelled = error
+            if task.done():
+                # Retrieve an exception even when caller cancellation takes precedence.
+                task.exception()
+                raise cancelled from None
+        except BaseException:
+            if cancelled is not None:
+                raise cancelled from None
+            raise
+    if cancelled is not None:
+        raise cancelled
+    return value
+
+
+async def _single_flight(
+    prepared: _Prepared, scope: CallScope, work: Callable[[], Awaitable[Any]]
+) -> Any:
+    """Share one live result across callers and event loops using the same store object."""
+    root = _root(scope.journal.store)
+    key = (scope.session_id, prepared.namespace, prepared.descriptor.effect, prepared.key)
+    with _WORK_LOCK:
+        store_work = _WORK.setdefault(id(root), _StoreWork(root))
+        flight = store_work.flights.get(key)
+        owner = flight is None
+        if owner:
+            flight = _Flight(prepared.descriptor)
+            store_work.flights[key] = flight
+        elif flight.descriptor != prepared.descriptor:
+            raise EffectConflictError(
+                prompts.EFFECT_CONFLICT.format(
+                    effect=prepared.descriptor.effect, key=prepared.key, status="held"
+                ),
+                effect=prepared.descriptor.effect,
+                key=prepared.key,
+                record_id=canonical.record_id(*key[1:]),
+                existing_status="held",
+            )
+
+    async def run() -> None:
+        try:
+            flight.result.set_result(await work())
+        except BaseException as error:
+            flight.result.set_exception(error)
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+        finally:
+            with _WORK_LOCK:
+                if store_work.flights.get(key) is flight:
+                    store_work.flights.pop(key)
+                _discard_empty(store_work)
+
+    if owner:
+        flight.task = asyncio.create_task(run())
+        scope.journal.track(flight.task)
+    return await _shield(asyncio.wrap_future(flight.result), scope=scope)
+
+
+def _track_abandoned(
+    store: SessionStore,
+    session_id: str,
+    record_id: str,
+    future: concurrent.futures.Future[Any],
+) -> None:
+    root = _root(store)
+    key = (session_id, record_id)
+    with _WORK_LOCK:
+        store_work = _WORK.setdefault(id(root), _StoreWork(root))
+        store_work.sends.setdefault(key, set()).add(future)
+
+    def ended(done: concurrent.futures.Future[Any]) -> None:
+        with _WORK_LOCK:
+            active = store_work.sends.get(key)
+            if active is not None:
+                active.discard(done)
+                if not active:
+                    store_work.sends.pop(key)
+            _discard_empty(store_work)
+
+    future.add_done_callback(ended)
 
 
 @dataclass(frozen=True)
@@ -339,13 +465,20 @@ async def check_run_start(
 def send_running(store: SessionStore, session_id: str, record_id: str) -> bool:
     """True while an abandoned sync send of that operation still runs in this process
     (SEND_STILL_RUNNING: O4a does not re-run the call)."""
-    raise NotImplementedError("Effects implementation is pending its owning stage.")
+    root = _root(store)
+    with _WORK_LOCK:
+        work = _WORK.get(id(root))
+        return work is not None and any(
+            not future.done() for future in work.sends.get((session_id, record_id), ())
+        )
 
 
 def _forget_store(store: SessionStore) -> None:
     """Drop the single-flight and send-running entries whose root store is this object
     (harness teardown)."""
-    raise NotImplementedError("Effects implementation is pending its owning stage.")
+    root = _root(store)
+    with _WORK_LOCK:
+        _WORK.pop(id(root), None)
 
 
 def _require_claims(effect, namespace, store) -> None:
