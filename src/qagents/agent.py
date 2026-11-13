@@ -49,6 +49,7 @@ from .errors import (
     ConfigurationError,
     DeferToolCall,
     GuardrailTripped,
+    LeaseError,
     MaxDepthExceeded,
     ModelError,
     ModelResponseError,
@@ -3126,9 +3127,11 @@ class _Run:
                 await self.session.store.append_leased(self.session.id, entries, self._lease_owner)
             else:
                 await self.session.append_entries(entries)
-        except BaseException:
+        except LeaseError:  # the store contract guarantees that nothing was written
             self._unwritten(entries)
             raise
+        # Other exceptions, including cancellation, do not establish whether the
+        # append committed. Do not attach that usage again to a later entry.
         for entry in entries:  # written: the journal holds this usage of these calls now
             for operation_id, usage in _usage_loads(entry.data).items():
                 held = self.journaled_usage.get(operation_id, Usage())
