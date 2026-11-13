@@ -709,3 +709,12 @@ def test_the_agents_md_layout_names_only_paths_that_exist_and_every_cli_command(
     parser = build_parser()
     commands = next(a for a in parser._actions if a.dest == "command").choices
     assert listed.group(1).split(", ") == list(commands)
+
+
+def test_mcp_ambiguous_error_is_a_tool_error_without_importing_mcp():
+    from qagents.errors import MCPAmbiguousError, ToolError
+
+    error = MCPAmbiguousError("outcome unknown", tool="publish")
+    assert isinstance(error, ToolError)
+    assert error.tool == "publish"
+    assert str(error) == "outcome unknown"

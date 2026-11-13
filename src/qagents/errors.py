@@ -79,6 +79,19 @@ class ToolError(QAgentsError):
     """
 
 
+class MCPAmbiguousError(ToolError):
+    """An MCP call timed out, lost its connection, or returned an unreadable answer.
+
+    The server may have performed the call: its outcome is unknown. Reconcile
+    with the server before repeating a call that can change external state.
+    """
+
+    def __init__(self, message: str, *, tool: str) -> None:
+        super().__init__(message)
+        self.tool = tool
+        """The MCP tool whose outcome is unknown."""
+
+
 class ToolArgumentError(ToolError):
     """The model called a tool with arguments that do not match its schema."""
 
