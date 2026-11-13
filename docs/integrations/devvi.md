@@ -143,24 +143,25 @@ async with DevviAgent(workspace="C:/work/repo") as coder:
 A direct run has no calling run: its permission requests are decided by `stream(permissions=...)`
 or the agent's `permissions=`, and with neither, every request is refused.
 
-### As a workflow step
+### As a durable workflow agent
 
 ```python
-from qagents import Workflow
-from qagents.external import ExternalResult
+from qagents import Agent, Workflow
 from qagents.integrations.devvi import DevviAgent
 
 coder = DevviAgent(workspace="C:/work/repo", allow_unmetered=True)
-
+lead = Agent(model, tools=[coder.as_tool(name="code", requires_approval=True)])
 wf = Workflow(store, id=f"fix:{issue}")
 plan = await wf.run_agent("plan", planner, f"Plan a fix for {issue}")
-code = await wf.step("code", lambda: coder.run(plan.text), type=ExternalResult)
-print(code.status, code.session_id, code.changed_files)
+result = await wf.run_agent("code", lead, plan.text)
+print(result.status, result.output)
 ```
 
-`wf.step` records the `ExternalResult`, so a finished step never runs again for this workflow
-id. A `wf.step` that was running when the process died runs again from its start: Devvi gets the
-task again, in a new session. (Crash re-attach happens only for calls through `as_tool()`.)
+Editing a repository changes external state. Delegate through `as_tool()` in a durable
+agent run, which journals the external session used for re-attachment. A paused approval
+is supplied on the next `run_agent` call. Inspect an unknown outcome before starting a new
+coding session; plain workflow steps may restart their function after a crash and must not
+wrap an unprotected edit.
 
 ### Gate the delegation, not each command
 

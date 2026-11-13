@@ -92,12 +92,18 @@ async def weekly_report(topic: str, store) -> str:
     wf = Workflow(store, id=f"report:{topic}:2026-W46")
     notes = await wf.run_agent("research", researcher, f"Research {topic}")
     draft = await wf.run_agent("write", writer, f"Write a report from these notes:\n{notes.text}")
-    await wf.step("publish", lambda: publish(draft.text))
+    await wf.run_agent("publish", publisher, draft.text)
     return draft.text
 ```
 
-- `wf.step(name, function)` runs the function once per workflow id and records its result. When
-  the same workflow id runs again, a finished step returns the recorded result instead of running.
+External changes belong in durable agent tools. Pass `ctx.operation_id` to a service that
+enforces an idempotency key; set `idempotent=True` only with that guarantee. Otherwise keep
+the tool non-idempotent and reconcile an unknown outcome before trying again. An unfinished
+plain `Workflow.step` may execute again after a crash.
+
+
+- `wf.step(name, function)` records a pure or read-only function's result. When the same workflow
+  id runs again, a finished step returns the recorded result; an unfinished function may repeat.
 - `wf.run_agent(name, agent, prompt)` runs an agent in its own durable session. If the step was
   interrupted, the agent run is resumed at the exact tool call rather than restarted.
 - Results must be JSON-serialisable. Pass `type=` to get a recorded value back as a model:

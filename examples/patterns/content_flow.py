@@ -6,7 +6,10 @@ guardrail blocks banned words and plain Python checks the length; a rejected dra
 revision. Then the flow waits for an editor's "publish" signal. The example runs the flow twice,
 as two processes would: the first pass stops with `WorkflowSuspended`, the example sends the
 signal (or asks you, with ``--interactive``), and the second pass, with a new store and new
-agents, replays every finished step from the journal without a model request, and publishes.
+agents, replays every finished step without a model request, and saves a local artifact.
+The artifact is reproducible from the journaled draft and is checked on every pass. This
+example does not publish to an external service: that belongs in an agent tool with an
+idempotency key enforced by the service, or explicit reconciliation of unknown outcomes.
 
 Mirrors: CrewAI Flows. The pieces map like this:
 
@@ -191,13 +194,27 @@ async def revision(crew: Crew, topic: str, draft: Draft) -> Draft:
 
 
 def publish(folder: Path, draft: Draft) -> str:
+    """Materialize the recorded draft locally; replay repairs a missing artifact.
+
+    An existing different file (including a partial write) requires inspection.
+    Repeating this operation never changes an already complete artifact.
+    """
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / f"{draft.route}.md").write_text(draft.text + "\n", encoding="utf-8")
+    path = folder / f"{draft.route}.md"
+    content = draft.text + "\n"
+    try:
+        with path.open("x", encoding="utf-8") as output:
+            output.write(content)
+    except FileExistsError:
+        if path.read_text(encoding="utf-8") != content:
+            raise ValueError(
+                f"Artifact {path} differs from the recorded draft; inspect it first."
+            ) from None
     return f"{folder.name}/{draft.route}.md"
 
 
 async def content_flow(wf: Workflow, crew: Crew, out: Path) -> dict[str, Any]:
-    """The whole flow. Each step runs once per flow id; a later run replays its result."""
+    """Replay recorded computations, wait for approval, and materialize the local artifact."""
     idea = await wf.run_agent("topic", crew.ideas, f"Suggest one topic about {THEME}.")  # @start
     topic = first_line(idea.text) if idea.completed else ""
     if not topic:
@@ -210,7 +227,8 @@ async def content_flow(wf: Workflow, crew: Crew, out: Path) -> dict[str, Any]:
     decision = await wf.wait_for_signal("publish", type=PublishDecision)  # may suspend
     if not decision.approve:
         return {"status": "declined", "topic": topic, "draft": draft}
-    file = await wf.step("publish", lambda: publish(out, draft))
+    # Recreate the same local artifact on replay; no external send is hidden in a step.
+    file = publish(out, draft)
     return {"status": "published", "topic": topic, "draft": draft, "file": file, "by": decision.by}
 
 

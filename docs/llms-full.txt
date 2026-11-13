@@ -1009,12 +1009,18 @@ async def weekly_report(topic: str, store) -> str:
     wf = Workflow(store, id=f"report:{topic}:2026-W46")
     notes = await wf.run_agent("research", researcher, f"Research {topic}")
     draft = await wf.run_agent("write", writer, f"Write a report from these notes:\n{notes.text}")
-    await wf.step("publish", lambda: publish(draft.text))
+    await wf.run_agent("publish", publisher, draft.text)
     return draft.text
 ```
 
-- `wf.step(name, function)` runs the function once per workflow id and records its result. When
-  the same workflow id runs again, a finished step returns the recorded result instead of running.
+External changes belong in durable agent tools. Pass `ctx.operation_id` to a service that
+enforces an idempotency key; set `idempotent=True` only with that guarantee. Otherwise keep
+the tool non-idempotent and reconcile an unknown outcome before trying again. An unfinished
+plain `Workflow.step` may execute again after a crash.
+
+
+- `wf.step(name, function)` records a pure or read-only function's result. When the same workflow
+  id runs again, a finished step returns the recorded result; an unfinished function may repeat.
 - `wf.run_agent(name, agent, prompt)` runs an agent in its own durable session. If the step was
   interrupted, the agent run is resumed at the exact tool call rather than restarted.
 - Results must be JSON-serialisable. Pass `type=` to get a recorded value back as a model:
@@ -2531,24 +2537,25 @@ async with DevviAgent(workspace="C:/work/repo") as coder:
 A direct run has no calling run: its permission requests are decided by `stream(permissions=...)`
 or the agent's `permissions=`, and with neither, every request is refused.
 
-### As a workflow step
+### As a durable workflow agent
 
 ```python
-from qagents import Workflow
-from qagents.external import ExternalResult
+from qagents import Agent, Workflow
 from qagents.integrations.devvi import DevviAgent
 
 coder = DevviAgent(workspace="C:/work/repo", allow_unmetered=True)
-
+lead = Agent(model, tools=[coder.as_tool(name="code", requires_approval=True)])
 wf = Workflow(store, id=f"fix:{issue}")
 plan = await wf.run_agent("plan", planner, f"Plan a fix for {issue}")
-code = await wf.step("code", lambda: coder.run(plan.text), type=ExternalResult)
-print(code.status, code.session_id, code.changed_files)
+result = await wf.run_agent("code", lead, plan.text)
+print(result.status, result.output)
 ```
 
-`wf.step` records the `ExternalResult`, so a finished step never runs again for this workflow
-id. A `wf.step` that was running when the process died runs again from its start: Devvi gets the
-task again, in a new session. (Crash re-attach happens only for calls through `as_tool()`.)
+Editing a repository changes external state. Delegate through `as_tool()` in a durable
+agent run, which journals the external session used for re-attachment. A paused approval
+is supplied on the next `run_agent` call. Inspect an unknown outcome before starting a new
+coding session; plain workflow steps may restart their function after a crash and must not
+wrap an unprotected edit.
 
 ### Gate the delegation, not each command
 
@@ -4533,7 +4540,7 @@ with agent.override(model=FakeModel(script)):  # tests χωρίς δίκτυο
 
 ## qagents.agent.Agent (class)
 
-Source: `src/qagents/agent.py:234` | qagents 0.2.0
+Source: `src/qagents/agent.py:237` | qagents 0.2.0
 Import: `from qagents.agent import Agent`
 
 ```python
@@ -4605,7 +4612,7 @@ Details of one member: get_api("qagents.agent.Agent.<member>").
 
 ## qagents.agent.Limits (class)
 
-Source: `src/qagents/agent.py:165` | qagents 0.2.0
+Source: `src/qagents/agent.py:168` | qagents 0.2.0
 Import: `from qagents.agent import Limits`
 
 ```python
@@ -4648,7 +4655,7 @@ Details of one member: get_api("qagents.agent.Limits.<member>").
 
 ## qagents.agent.RunStream (class)
 
-Source: `src/qagents/agent.py:770` | qagents 0.2.0
+Source: `src/qagents/agent.py:773` | qagents 0.2.0
 Import: `from qagents.agent import RunStream`
 
 ```python
@@ -4905,6 +4912,7 @@ Entry kinds:
 | `tool_started` | a tool call began executing (`tool_call_id`, `name`) |
 | `tool_result` | a tool call finished (`result`; see below) |
 | `tool_deferred` | a tool call waits for a result from outside the run (`input`) |
+| `child_usage` | a child run ended (`child_run_id`, `tool_call_id`, `added_usage`) |
 | `tool_checkpoint` | a running call noted a fact (`tool_call_id`, `operation_id`, `key`, `value`) |
 | `approval_decided` | an approval was applied to a call, before it ran (see below) |
 | `state_updated` | the session state changed; the full new values (`values`) |
@@ -4924,8 +4932,10 @@ Details:
 * A `tool_result` has `counted` when the call counts toward
   ``Limits.max_tool_calls``. A call waiting for approval counts only once an
   approval lets it run (its `tool_started`).
-* Usage added through ``ctx.add_usage`` (a sub-agent, a compactor's summary
-  request) is written as `added_usage` on the run's next `message`,
+* A child run's usage is written in its own `child_usage` entry when it ends,
+  linked to the delegating tool call. Usage added through ``ctx.add_usage``
+  (for example a compactor's summary request) is written as `added_usage` on
+  the run's next `message`,
   `tool_result`, `tool_checkpoint`, `run_paused`, `run_failed` or
   `run_finished` entry.
 * `approval_decided` has `tool_call_id`, `name`, `approved`, `reason`,
@@ -5263,7 +5273,7 @@ assert on the exact messages, tools and settings that were sent.
 
 ## qagents.workflow.Workflow (class)
 
-Source: `src/qagents/workflow.py:155` | qagents 0.2.0
+Source: `src/qagents/workflow.py:161` | qagents 0.2.0
 Import: `from qagents.workflow import Workflow`
 
 ```python
@@ -5274,15 +5284,19 @@ A durable multi-step job, identified by ``id`` within ``store``.
 
 Create a new ``Workflow`` object every time the job runs (in any process):
 what the journal says has finished is replayed, and the rest runs.
+New journals and step sessions have separate prefixes and percent-encoded
+identities, so punctuation in ids cannot make them collide. Existing
+``workflow:`` journals keep their original ids; a step session resolves
+its legacy id before its first read, write, or lease acquisition.
 
 Args:
     store: Where the workflow's journal and its agent steps' sessions live.
     id: Names the job. Running the same id again continues the same job.
 
 ## Methods
-- `session(name: str) -> Session`: A durable session that belongs to this workflow (for an agent step).
+- `session(name: str) -> Session`: A durable agent-step session; existing legacy ids resolve on first I/O.
 - `async completed_steps() -> dict[str, Any]`: Names and recorded results of the steps that have finished (a copy).
-- `async step(name: str, function: Callable[[], Any], *, type: Any = None) -> Any`: Run ``function`` once per workflow id and remember its result.
+- `async step(name: str, function: Callable[[], Any], *, type: Any = None) -> Any`: Record ``function``'s result and replay completed steps.
 - `async map(name, items, function, *, concurrency, type) -> list[Any]`: Run ``function(item)`` as one durable step per item, concurrently.
 - `async run_agent(name, agent, prompt, *, approvals, results, state, on_event, **options) -> RunResult`: Run an agent as a step, in its own durable session.
 - `async send_signal(store: SessionStore, workflow_id: str, name: str, value: Any = None) -> None`: Record a signal for a workflow, from any process.
@@ -6298,6 +6312,7 @@ defined here too, so you can catch them without importing the integration.
 - `SessionError` (class): A session could not be loaded, resumed or written.
 - `OutputValidationError` (class): The model's final answer did not match ``output_type`` after all retries.
 - `ToolError` (class): Raise this inside a tool to report a failure to the model.
+- `MCPAmbiguousError` (class): An MCP call timed out, lost its connection, or returned an unreadable answer.
 - `ToolArgumentError` (class): The model called a tool with arguments that do not match its schema.
 - `ModelRetry` (class): Ask the model to try again, with a message that says what to correct.
 - `DeferToolCall` (class): Raise this inside a tool to pause the run until its result is supplied.

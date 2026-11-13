@@ -152,8 +152,14 @@ async with SQLiteStore("jobs.db") as store:
     wf = Workflow(store, id="report:solar")
     notes = await wf.run_agent("research", researcher, "Research solar growth in 2025")
     draft = await wf.run_agent("write", writer, f"Write a report from:\n{notes.text}")
-    await wf.step("publish", lambda: publish(draft.text))
+    await wf.run_agent("publish", publisher, draft.text)
 ```
+
+External changes belong in durable agent tools. Pass `ctx.operation_id` to a service that
+enforces an idempotency key; set `idempotent=True` only with that guarantee. Otherwise keep
+the tool non-idempotent and reconcile an unknown outcome before trying again. An unfinished
+plain `Workflow.step` may execute again after a crash.
+
 
 Streaming: events are pydantic models with a `type` field.
 

@@ -73,7 +73,7 @@ async def test_a_blocked_social_post_is_revised_then_published_on_the_second_pas
     assert "Suspended: the flow waits for the signal 'publish'" in printed
     assert "waiting for ['publish']" in printed
     status = await flow_status(ctx)
-    assert status.completed_steps == ["topic", "draft", "revise", "publish"]
+    assert status.completed_steps == ["topic", "draft", "revise"]
     assert status.signals == ["publish"] and status.pending_signals == []
 
 
@@ -87,7 +87,7 @@ async def test_a_clean_blog_post_needs_no_revision(tmp_path):
     assert outcome.details["file"] == "published/blog.md"
     assert ctx.meter.usage.requests == 3
     status = await flow_status(ctx)
-    assert status.completed_steps == ["topic", "draft", "publish"]
+    assert status.completed_steps == ["topic", "draft"]
 
 
 async def test_a_classifier_answer_that_names_no_route_falls_back_to_the_blog(tmp_path):
@@ -148,3 +148,26 @@ def test_runs_as_a_module_and_replays_from_its_cassette(tmp_path, monkeypatch, c
     report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert replayed.value.code == 0, report
     assert report["ok"] and report["name"] == "content_flow" and report["requests"] == 4
+
+
+async def test_replay_restores_a_missing_artifact_without_model_requests(tmp_path):
+    ctx = scripted_context(flow_policy("social", SOCIAL_POST), tmp_path)
+    outcome = await run(ctx)
+    artifact = ctx.workdir / outcome.details["file"]
+    artifact.unlink()
+    before = ctx.meter.usage.requests
+    async with SQLiteStore(ctx.workdir / "flows.db") as store:
+        result = await content_flow.content_flow(
+            Workflow(store, FLOW_ID), content_flow.build_crew(ctx), ctx.workdir / "published"
+        )
+    assert result["status"] == "published"
+    assert artifact.read_text(encoding="utf-8").strip() == SOCIAL_POST
+    assert ctx.meter.usage.requests == before
+
+
+def test_materializing_an_artifact_preserves_a_different_existing_file(tmp_path):
+    artifact = tmp_path / "social.md"
+    artifact.write_text("edited by the user", encoding="utf-8")
+    with pytest.raises(ValueError, match="inspect it first"):
+        content_flow.publish(tmp_path, content_flow.Draft(route="social", text=SOCIAL_POST))
+    assert artifact.read_text(encoding="utf-8") == "edited by the user"
