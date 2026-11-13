@@ -1,13 +1,15 @@
 """Public effect declarations and the errors tool authors may handle."""
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
+from pydantic import BaseModel
 
 from qagents.effects import _types
-from qagents.effects._declare import Dedupe, Unique
-from qagents.effects._types import EffectContext, Found, current_attempt
+from qagents.effects._declare import REACH_NAMES, Dedupe, Key, Unique, effect
+from qagents.effects._types import Absent, Attempt, EffectContext, Found, current_attempt
 from qagents.errors import (
     ApprovalConflictError,
     ClaimConflict,
@@ -165,8 +167,6 @@ def test_effect_context_distinguishes_missing_and_explicit_none_dependencies():
 
 
 async def test_current_attempt_is_task_local_and_restored():
-    import asyncio
-
     assert current_attempt() is None
     first, second = object(), object()
 
@@ -180,3 +180,169 @@ async def test_current_attempt_is_task_local_and_restored():
 
     assert await asyncio.gather(one(first), one(second)) == [first, second]
     assert current_attempt() is None
+
+
+class RequestModel(BaseModel):
+    business_id: str
+    values: list[int] = []
+
+
+class ReceiptModel(BaseModel):
+    receipt_id: str
+    status: str = "pending"
+
+
+async def async_send(ctx: EffectContext, attempt: Attempt[RequestModel]) -> ReceiptModel:
+    return ReceiptModel(receipt_id=attempt.request.business_id)
+
+
+def sync_send(ctx: EffectContext, attempt: Attempt[RequestModel]) -> ReceiptModel:
+    return ReceiptModel(receipt_id=attempt.request.business_id)
+
+
+def declare(**kwargs):
+    return effect("example.refund", **{"key": Key("refund", "business_id"), **kwargs})(async_send)
+
+
+def test_declare_infers_request_receipt_and_exposes_raw_send():
+    declared = declare(receipt_identity=("receipt_id",))
+    assert declared.request_type is RequestModel
+    assert declared.receipt_type is ReceiptModel
+    assert declared.send is async_send
+    assert declared.is_async is True
+    assert declared.klass == "opaque"
+    assert declared.lookup_fn is declared.on_commit_fn is None
+    assert declared.key_spec_digest == Key("refund", "business_id").spec_digest()
+    assert declared.request_schema_digest == declare().request_schema_digest
+    with pytest.raises(TypeError, match="await ctx.perform.*example.refund"):
+        declared(None, None)
+
+
+def test_lookup_decorators_and_contract_classes():
+    declared = declare()
+
+    @declared.lookup
+    def lookup(ctx, inquiry):
+        return Absent()
+
+    assert declared.lookup_fn is lookup
+    assert declared.klass == "reconcilable"
+    bounded = declare(applies_within_s=1)
+
+    @bounded.lookup(authoritative=True)
+    async def authoritative(ctx, inquiry):
+        return Absent()
+
+    assert bounded.lookup_fn is authoritative and bounded.authoritative
+    assert bounded.klass == "authoritative"
+    assert declare(dedupe=Dedupe(3600, "example")).klass == "deduplicated"
+    unique = declare(dedupe=Unique("constraint", (ValueError,)))
+    assert unique.klass == "unique" and unique.lookup_fn is None
+
+
+def test_authoritative_lookup_needs_async_send_and_application_bound():
+    with pytest.raises(ConfigurationError, match="applies_within_s.*async send"):
+        declare().lookup(authoritative=True)
+    synchronous = effect("sync", key=Key("refund", "business_id"), applies_within_s=1)(sync_send)
+    assert synchronous.is_async is False
+    with pytest.raises(ConfigurationError, match="async send"):
+        synchronous.lookup(authoritative=True)
+    assert synchronous.lookup_fn is None and not synchronous.authoritative
+
+
+def test_commit_callback_and_coverage_point_names():
+    declared = declare()
+
+    @declared.on_commit
+    def patch(state, request, receipt):
+        state["receipt"] = receipt.receipt_id
+
+    assert declared.on_commit_fn is patch
+    for name in REACH_NAMES:
+        point = getattr(declared.reached, name)
+        assert (point.effect, point.name) == (declared.name, name)
+    with pytest.raises(AttributeError):
+        _ = declared.reached.invented
+
+    async def invalid_patch(state, request, receipt):
+        pass
+
+    with pytest.raises(ConfigurationError, match="synchronous"):
+        declared.on_commit(invalid_patch)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"key": "business_id"},
+        {"key": Key("refund", "missing")},
+        {"key": Key("refund", "values")},
+        {"on_unknown": "tell_model", "key": Key.per_call()},
+        {"destination": "secret"},
+        {"dedupe": True},
+        {"timeout_s": 0},
+        {"applies_within_s": -1},
+        {"on_unknown": "ignore"},
+        {"approval": "effect"},
+        {"version": ""},
+        {"namespace": ""},
+        {"idempotency_key_max_len": 23},
+        {"receipt_identity": ()},
+        {"receipt_identity": ("missing",)},
+        {"receipt_identity": ("receipt_id", "receipt_id")},
+    ],
+)
+def test_invalid_effect_declarations_fail_before_a_run(invalid):
+    with pytest.raises(ConfigurationError):
+        declare(**invalid)
+
+
+@pytest.mark.parametrize("kind", [Exception, BaseException, ToolError, TimeoutError, "error"])
+def test_rejected_on_refuses_ambiguous_or_broad_exceptions(kind):
+    with pytest.raises(ConfigurationError, match="rejected_on"):
+        declare(rejected_on=(kind,))
+
+
+def test_rejected_on_refuses_cancellation_but_accepts_explicit_refusal():
+    import asyncio
+
+    with pytest.raises(ConfigurationError, match="rejected_on"):
+        declare(rejected_on=(asyncio.CancelledError,))
+    assert declare(rejected_on=(ValueError, EffectRejected)).rejected_on == (
+        ValueError,
+        EffectRejected,
+    )
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        {},
+        {"ctx": dict, "attempt": Attempt[RequestModel], "return": ReceiptModel},
+        {"ctx": EffectContext, "attempt": RequestModel, "return": ReceiptModel},
+        {"ctx": EffectContext, "attempt": Attempt[RequestModel], "return": str},
+    ],
+)
+def test_invalid_send_annotations_are_configuration_errors(annotations):
+    def send(ctx, attempt):
+        return None
+
+    send.__annotations__ = annotations
+    with pytest.raises(ConfigurationError):
+        effect("bad", key=Key("refund", "business_id"))(send)
+
+
+def test_local_forward_annotations_resolve_at_declaration():
+    class LocalRequest(BaseModel):
+        key: str
+
+    def send(ctx, attempt):
+        return ReceiptModel(receipt_id="local")
+
+    send.__annotations__ = {
+        "ctx": "EffectContext",
+        "attempt": "Attempt[LocalRequest]",
+        "return": "ReceiptModel",
+    }
+    declared = effect("local", key=Key("local", "key"))(send)
+    assert declared.request_type is LocalRequest
