@@ -187,7 +187,7 @@ HOLD_DETAIL: Mapping[HoldReason, str] = MappingProxyType(
         HoldReason.DIVERGED: "Request or destination changed; restore or settle the original.",
         HoldReason.KEY_CHANGED: "The same call changed its business key; restore the original key.",
         HoldReason.VERSION_CHANGED: "Effect version changed; operator review needed.",
-        HoldReason.APPROVAL_EXPIRED: "Approval expired; obtain a new decision or operator resend.",
+        HoldReason.APPROVAL_EXPIRED: "Approval expired; recheck or use an operator settlement.",
         HoldReason.APPROVAL_UNVERIFIABLE: "Approval unverifiable; obtain a valid decision.",
         HoldReason.LEASE: "The writer lost its lease; a current owner must recover the operation.",
         HoldReason.CONFLICT: "Conflicting journal evidence; inspect before settlement.",
@@ -201,7 +201,7 @@ HOLD_DETAIL: Mapping[HoldReason, str] = MappingProxyType(
 
 @dataclass(frozen=True)
 class HeldEffect:
-    """An unresolved operation surfaced to a person, without a fabricated tool result."""
+    """An unresolved operation surfaced to the host, without a fabricated tool result."""
 
     id: str
     session_id: str

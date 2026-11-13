@@ -26,6 +26,12 @@ def test_hold_details_cover_every_reason():
     assert str(HoldReason.RESPONSE_LOST) == "RESPONSE_LOST"
 
 
+def test_expired_intent_approval_points_to_operator_paths():
+    detail = HOLD_DETAIL[HoldReason.APPROVAL_EXPIRED]
+    assert "new decision" not in detail
+    assert "operator" in detail and "recheck" in detail
+
+
 def test_settlement_constructors_preserve_revision_and_distinct_meanings():
     original = held()
     receipt = {"id": "refund-1"}
