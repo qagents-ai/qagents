@@ -1,16 +1,17 @@
 """Workflows: multi-step and multi-agent work written as ordinary Python.
 
-There is no graph to declare. You write an async function, and wrap each unit
-of work in ``workflow.step(name, ...)``. A finished step is written to the
-store with its result; when the same workflow id runs again (after a crash, a
-deploy, a pause for approval) finished steps return their recorded result
+There is no graph to declare. Write an async function, use ``run_agent``
+for durable agent runs and ``step`` for pure computations or read-only work.
+A finished step is written to the store with its result. When the same workflow
+id runs again (after a crash, a deploy, or a pause for approval), finished steps
+return their recorded result
 instead of running again, and the function continues where it stopped:
 
     async def research_report(topic: str, store: SessionStore) -> str:
         wf = Workflow(store, id=f"report:{topic}")
         notes = await wf.run_agent("research", researcher, f"Research {topic}")
         draft = await wf.run_agent("write", writer, f"Write a report from:\\n{notes.text}")
-        await wf.step("publish", lambda: publish(draft.text))
+        await wf.run_agent("publish", publisher, draft.text)
         return draft.text
 
 Guarantees, stated plainly: a step that *finished* never runs again. A step
@@ -18,8 +19,12 @@ that was in progress when the process died runs again from its start, except
 agent steps started with ``run_agent``, which resume inside the agent run at
 the exact tool call (see `session`); an agent step whose run completed just
 before the process died, before the step was recorded, is recorded from the
-step's journal instead of running again. Make other side-effecting steps
-idempotent.
+step's journal instead of running again. Do not put external changes inside
+``step``: a crash between the change and its recorded result repeats the function.
+The publisher above uses a tool that passes ``ctx.operation_id`` as a downstream
+idempotency key. Declare it ``idempotent=True`` only when the service enforces
+that key; otherwise leave the tool non-idempotent and reconcile unknown outcomes.
+``step`` alone does not deduplicate external changes.
 
 Use ``asyncio.gather`` to run steps in parallel, or ``map`` to run one step
 per item with an optional bound on concurrency; branches do not wait for
@@ -41,7 +46,7 @@ again almost at once:
         verdict = await wf.wait_for_signal("review")  # sent by a reviewer, maybe days later
         if verdict != "approved":
             return "rejected"
-        await wf.step("publish", lambda: publish(draft.text))
+        await wf.run_agent("publish", publisher, draft.text)
         return "published"
 
     # In the web handler of the review form:
@@ -198,7 +203,11 @@ class Workflow:
     # -- steps -------------------------------------------------------------------------
 
     async def step(self, name: str, function: Callable[[], Any], *, type: Any = None) -> Any:
-        """Run ``function`` once per workflow id and remember its result.
+        """Record ``function``'s result and replay completed steps.
+
+        Use pure computations or read-only work. An unfinished function runs
+        again after a crash; external changes belong in tools with downstream
+        idempotency keys and an explicit policy for unknown outcomes.
 
         The result must be JSON-serialisable (pydantic models are). It comes
         back as plain JSON data on a later run unless you pass ``type``, in
@@ -495,9 +504,9 @@ class Workflow:
         from now. Later calls, in this run or a later one, use that recorded
         time, whatever ``seconds`` they pass.
 
-            await wf.step("remind", send_reminder)
+            await wf.run_agent("remind", reminder, "Send the reminder")
             await wf.wait_for_timer("grace-period", 3 * 24 * 3600)
-            await wf.step("close", close_ticket)
+            await wf.run_agent("close", closer, "Close the reviewed ticket")
 
         Args:
             name: The timer's name, unique within the workflow.

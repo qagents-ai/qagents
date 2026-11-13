@@ -584,3 +584,16 @@ async def test_workflow_replay_and_live_cache_both_keep_the_first_result():
     assert await workflow.step("race", race) == "winner"
     assert (await workflow.completed_steps())["race"] == "winner"
     assert (await Workflow(store, "first-wins").completed_steps())["race"] == "winner"
+
+
+def test_workflow_docstrings_keep_external_changes_out_of_plain_steps():
+    import inspect
+
+    import qagents.workflow as workflow_module
+
+    text = inspect.getdoc(workflow_module)
+    assert 'wf.step("publish"' not in text
+    assert "idempotency key" in text
+    assert "external changes" in inspect.getdoc(Workflow.step)
+    timer = inspect.getdoc(Workflow.wait_for_timer)
+    assert 'wf.step("remind"' not in timer and 'wf.step("close"' not in timer
