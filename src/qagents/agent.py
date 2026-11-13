@@ -43,7 +43,10 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, create
 from pydantic_core import PydanticSerializationError, to_jsonable_python
 
 from . import prompts
+from . import session as _session
 from .context import Compactor
+from .effects._declare import Effect
+from .effects._types import EffectRecord, HeldEffect, Settle
 from .errors import (
     ApprovalTokenError,
     ConfigurationError,
@@ -96,7 +99,7 @@ from .session import (
     PendingInput,
     Session,
     SessionState,
-    _owner_token,
+    SessionStore,
     _usage_loads,
 )
 from .tools import (
@@ -112,6 +115,24 @@ from .tools import (
 from .tools import tool as make_tool
 
 logger = logging.getLogger("qagents")
+
+
+def _effects_child_refusal(agent: Agent, *, durable_session: bool) -> str | None:
+    """Frozen composition-check entry point; the guard is added by the loop owner."""
+    return None
+
+
+def _store_root(store: SessionStore) -> SessionStore:
+    """Follow only library-owned writer wrappers, preserving the root store identity."""
+    from .runtime import _LeasedStore
+    from .session import LeasedWriter
+
+    seen = set()
+    while isinstance(store, (_LeasedStore, LeasedWriter)) and id(store) not in seen:
+        seen.add(id(store))
+        store = store.wrapped
+    return store
+
 
 T = TypeVar("T")
 Instructions = str | Callable[[RunContext[Any]], Any] | None
@@ -269,6 +290,8 @@ class Agent:
         hooks: Iterable[Hooks] = (),
         handoffs: Iterable[Agent] = (),
         compactor: Compactor | None = None,
+        lease_ttl_s: float = 30.0,
+        build_id: str | None = None,
     ) -> None:
         """Build the agent. Settings the provider would reject fail here.
 
@@ -334,6 +357,8 @@ class Agent:
             )
         self.model = resolve_model(model)
         self.name = name
+        self.lease_ttl_s = lease_ttl_s
+        self.build_id = build_id
         self.description = description
         self.instructions = instructions
         self.tools: list[Tool | Toolkit] = _normalize_tools(tools)
@@ -384,6 +409,15 @@ class Agent:
 
     # -- running ---------------------------------------------------------------
 
+    async def settle(self, session: Session, answer: Settle, *, deps: Any = None) -> EffectRecord:
+        raise NotImplementedError("Effect settlement is pending operator integration.")
+
+    async def recheck(self, session: Session, *, deps: Any = None) -> list[HeldEffect]:
+        raise NotImplementedError("Effect recheck is pending operator integration.")
+
+    def effects_by_name(self) -> dict[str, Effect]:
+        raise NotImplementedError("Effect enumeration is pending runtime integration.")
+
     def stream(
         self,
         prompt: Prompt = None,
@@ -395,6 +429,7 @@ class Agent:
         settings: ModelSettings | None = None,
         state: Mapping[str, Any] | None = None,
         parent: RunContext[Any] | None = None,
+        if_held_effects: Literal["raise", "continue"] = "raise",
     ) -> RunStream:
         """Start a run and return its event stream.
 
@@ -456,6 +491,7 @@ class Agent:
         settings: ModelSettings | None = None,
         state: Mapping[str, Any] | None = None,
         parent: RunContext[Any] | None = None,
+        if_held_effects: Literal["raise", "continue"] = "raise",
     ) -> RunResult:
         """Run until the agent answers, pauses, hits a limit or is blocked.
 
@@ -469,9 +505,15 @@ class Agent:
         )  # fmt: skip
         return await stream.wait()
 
-    def run_sync(self, prompt: Prompt = None, **options: Any) -> RunResult:
+    def run_sync(
+        self,
+        prompt: Prompt = None,
+        *,
+        if_held_effects: Literal["raise", "continue"] = "raise",
+        **options: Any,
+    ) -> RunResult:
         """``run`` for code that is not async. Do not call it from a running event loop."""
-        return asyncio.run(self.run(prompt, **options))
+        return asyncio.run(self.run(prompt, if_held_effects=if_held_effects, **options))
 
     def resume_stream(
         self,
@@ -1259,7 +1301,7 @@ class _Run:
         self._claimed = key
         if _fenced_by_runtime(store) or _append_overridden_alone(store):
             return
-        owner = _owner_token("qagents-run")
+        owner = _session._owner_token("qagents-run")
         try:
             held = await store.acquire_lease(session_id, owner, RUN_LEASE_TTL_S)
         except NotImplementedError:

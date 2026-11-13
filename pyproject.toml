@@ -75,10 +75,14 @@ docs = [
 [project.scripts]
 qagents = "qagents.cli:main"
 
+[project.entry-points.pytest11]
+_qagents_pytest = "_qagents_pytest"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/qagents"]
 
 [tool.hatch.build.targets.wheel.force-include]
+"src/_qagents_pytest.py" = "_qagents_pytest.py"
 # The docs MCP server (python -m qagents.docs_mcp) reads these from the installed package,
 # so a wheel install answers from the docs of its own version.
 "docs" = "qagents/docs_mcp/_bundled/docs"
@@ -89,6 +93,16 @@ packages = ["src/qagents"]
 "mkdocs.yml" = "qagents/docs_mcp/_bundled/mkdocs.yml"
 
 [tool.pytest.ini_options]
+addopts = "-p _qagents_pytest"
+markers = [
+    "integration_r1: effect engine and runtime integration",
+    "integration_r2: operators and recovery integration",
+    "integration_r3: crash harness integration",
+    "crash: exhaustive crash testing",
+    "mutants: seeded recovery defects",
+    "process: actual process termination recovery",
+    "network: opt-in live service probes",
+]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]

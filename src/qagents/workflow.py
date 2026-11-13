@@ -202,6 +202,12 @@ class Workflow:
 
     # -- steps -------------------------------------------------------------------------
 
+    async def effect(self, name: str, effect: Any, request: Any) -> Any:
+        raise ConfigurationError(
+            "Workflow.effect requires the workflow Effects integration (S-3); "
+            "Workflow.step retains at-least-once execution."
+        )
+
     async def step(self, name: str, function: Callable[[], Any], *, type: Any = None) -> Any:
         """Record ``function``'s result and replay completed steps.
 

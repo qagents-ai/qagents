@@ -101,6 +101,8 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
+from . import session as _session
+from .effects._types import EffectRecord, HeldEffect, Settle
 from .errors import ConfigurationError, RunInterrupted, SessionError
 from .events import (
     AgentSwitched,
@@ -112,7 +114,7 @@ from .events import (
     ToolCallFinished,
     TurnStarted,
 )
-from .session import Entry, LeaseError, Session, SessionStatus, SessionStore, _owner_token
+from .session import Entry, LeaseError, Session, SessionStatus, SessionStore
 
 if TYPE_CHECKING:
     from .agent import Agent, Limits, RunStream
@@ -468,6 +470,7 @@ class AgentRuntime:
         deps: Any = None,
         state: Mapping[str, Any] | None = None,
         limits: Limits | None = None,
+        if_held_effects: Literal["raise", "continue"] = "raise",
     ) -> RunHandle:
         """Start a run in the background, as ``agent.stream`` would.
 
@@ -504,6 +507,33 @@ class AgentRuntime:
             return agent.stream(prompt, deps=deps, session=session, state=state, limits=limits)
 
         return await self._begin(session_id, agent, open_stream, deps, resumed=False, limits=limits)
+
+    async def submit(
+        self,
+        agent_name: str,
+        prompt: Any = None,
+        *,
+        session_id: str | None = None,
+        deps: Any = None,
+        state: Mapping[str, Any] | None = None,
+        limits: Limits | None = None,
+        if_held_effects: Literal["raise", "continue"] = "raise",
+    ) -> RunHandle:
+        return await self.start(
+            agent_name,
+            prompt,
+            session_id=session_id,
+            deps=deps,
+            state=state,
+            limits=limits,
+            if_held_effects=if_held_effects,
+        )
+
+    async def settle(self, session_id: str, answer: Settle) -> EffectRecord:
+        raise NotImplementedError("Runtime settlement is pending operator integration.")
+
+    async def recheck(self, session_id: str) -> list[HeldEffect]:
+        raise NotImplementedError("Runtime recheck is pending operator integration.")
 
     async def resume(
         self,
@@ -757,7 +787,7 @@ class AgentRuntime:
 
     async def _recover_one(self, session_id: str) -> RunHandle | None:
         with self._claim(session_id):
-            owner = _owner_token(self.worker_id)
+            owner = _session._owner_token(self.worker_id)
             deadline = asyncio.get_running_loop().time() + self.lease_ttl_s
             try:
                 if not await self.store.acquire_lease(session_id, owner, self.lease_ttl_s):
@@ -854,7 +884,7 @@ class AgentRuntime:
                 f"runtime.get({session_id!r}) to finish before starting or resuming another."
             )
         with self._claim(session_id):
-            owner = _owner_token(self.worker_id)
+            owner = _session._owner_token(self.worker_id)
             deadline = asyncio.get_running_loop().time() + self.lease_ttl_s
             if not await self.store.acquire_lease(session_id, owner, self.lease_ttl_s):
                 holder = await self.store.status(session_id)
@@ -1311,6 +1341,8 @@ class _LeasedStore(SessionStore):
 
     def __init__(self, store: SessionStore, owner: str) -> None:
         self._store = store
+        self.wrapped = store
+        self.writer = None
         self._owner = owner
         self.writing = 0
 

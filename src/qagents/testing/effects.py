@@ -8,6 +8,7 @@ from typing import Any
 
 from qagents.effects import _canonical as canonical
 from qagents.effects._declare import Effect
+from qagents.effects._ports import Timing
 from qagents.effects._types import Attempt, AttemptDebug, AttemptInfo, Inquiry, ReqT
 
 
@@ -21,7 +22,7 @@ def attempt_for(
     salt: bytes = b"test-salt",
     timeout_s: float | None = None,
 ) -> Attempt[ReqT]:
-    """Freeze and rebuild the request, using the same identities as a test-session perform."""
+    """Build a frozen attempt using the default 30-second lease's three-second slack."""
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise ValueError("Attempt number must be a positive integer.")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
@@ -49,9 +50,7 @@ def attempt_for(
         ),
         canonical.operation_tag(namespace, effect.name, rendered, frozen.digest),
         time.monotonic() + timeout,
-        None
-        if effect.applies_within_s is None
-        else time.time() + timeout + effect.applies_within_s,
+        time.time() + timeout + Timing.for_lease(30.0, 1.0, effects=True).m_s,
         AttemptDebug(number, generation, 1, 1),
     )
 

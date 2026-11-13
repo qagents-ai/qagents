@@ -82,7 +82,8 @@ def test_invented_names_are_caught_with_the_real_names(service):
         "`qagents` has no `Tools`. Did you mean: `Tool`",
         "`ScriptedModel` is in `qagents.models.testing`: "
         "`from qagents.models.testing import ScriptedModel`",
-        "`qagents.testing` does not exist",
+        "`FunctionModel` is in `qagents.models.testing`: "
+        "`from qagents.models.testing import FunctionModel`",
         "`Agent()` has no parameter `system_prompt`. qagents calls it `instructions`",
         "`Agent()` has no parameter `max_iterations`.",
         "Turn limits are `limits=Limits(max_turns=...)`",

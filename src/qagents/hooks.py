@@ -54,6 +54,8 @@ if TYPE_CHECKING:
 class Hooks:
     """Override the methods you need; the defaults do nothing."""
 
+    may_change_approved_arguments: ClassVar[bool] = False
+
     propagate: ClassVar[bool] = False
     """Also apply this hook to child runs started from the run it is attached to,
     at any depth. Set it on tracers, loggers and cost meters."""
@@ -109,6 +111,11 @@ class Hooks:
 
 class HookChain(Hooks):
     """Runs several hooks in order; each sees what the previous one returned."""
+
+    async def before_tool_traced(
+        self, ctx: RunContext, call: ToolCallPart
+    ) -> tuple[ToolCallPart | ToolResultPart, str | None]:
+        raise NotImplementedError("Hook argument provenance is pending its owning stage.")
 
     def __init__(self, hooks: Iterable[Hooks]) -> None:
         self.hooks = list(hooks)

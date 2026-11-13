@@ -220,6 +220,41 @@ class RunFinished(BaseModel):
     result: RunResult
 
 
+class EffectStarted(BaseModel):
+    type: Literal["effect_started"] = "effect_started"
+    record_id: str
+    effect: str
+    namespace: str
+    key: str
+    attempt: int
+    generation: int
+    rule: Literal["D1", "D2", "D3", "D4", "D5"]
+    tool_call_id: str | None
+
+
+class EffectFinished(BaseModel):
+    type: Literal["effect_finished"] = "effect_finished"
+    record_id: str
+    effect: str
+    namespace: str
+    key: str
+    outcome: Literal["committed", "rejected", "held"]
+    via: str | None
+    reason: str | None
+    replayed: bool
+    tool_call_id: str | None
+
+
+class EffectSettled(BaseModel):
+    type: Literal["effect_settled"] = "effect_settled"
+    record_id: str
+    effect: str
+    namespace: str
+    key: str
+    outcome: Literal["committed", "not_applied", "resend", "close_unknown"]
+    by: str
+
+
 Event = (
     RunStarted
     | TurnStarted
@@ -238,9 +273,15 @@ Event = (
     | SubagentEvent
     | ExternalAgentEvent
     | RunFinished
+    | EffectStarted
+    | EffectFinished
+    | EffectSettled
 )
 
 __all__ = [
+    "EffectStarted",
+    "EffectFinished",
+    "EffectSettled",
     "AgentSwitched",
     "ApprovalRequired",
     "Event",

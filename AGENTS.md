@@ -229,6 +229,8 @@ src/qagents/prompts.py the strings qagents itself sends to a model (see "Nothing
 src/qagents/models/   QCloudModel, OpenAIChatModel, AnthropicModel, FallbackModel, testing models
 src/qagents/toolkits/ files, shell, web, notes, planning, human, mcp (MCPToolkit)
 src/qagents/stores/   PostgresStore (the postgres extra)
+src/qagents/effects/  Effect declarations, receipt types, journal folding and runtime contracts
+src/qagents/testing/  Effect/store test helpers and the crash-harness interfaces
 src/qagents/integrations/  agui, mlflow; names resolved lazily through _LAZY
   acp/                ACPAgent: drives any Agent Client Protocol agent over stdio
   devvi/              DevviAgent: drives Devvi over ACP or the Devvi SDK

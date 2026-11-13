@@ -682,6 +682,10 @@ def test_pyproject_has_the_external_agent_extras_and_bundles_the_docs():
     bundled = project["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
     package = Path(sources.__file__).resolve().parents[2]  # the folder that holds qagents/
     for source, target in bundled.items():
+        if source == "src/_qagents_pytest.py":
+            assert target == "_qagents_pytest.py"
+            assert (root / source).is_file()
+            continue
         assert (root / source).exists(), source
         assert (package / target).is_relative_to(sources.BUNDLE_DIR), target
     for needed in ("docs", "examples", "README.md", "AGENTS.md", sources.SKILL_PATH, "mkdocs.yml"):

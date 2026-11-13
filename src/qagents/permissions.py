@@ -68,7 +68,7 @@ import inspect
 import json
 import logging
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from decimal import Decimal
 from fnmatch import fnmatchcase
 from typing import Any, Literal
@@ -77,6 +77,9 @@ from pydantic import BaseModel, ConfigDict
 from pydantic_core import to_jsonable_python
 
 from . import prompts
+from .effects._canonical import JSONValue
+from .effects._kinds import ApprovalRecord as ApprovalRecord
+from .effects._types import EffectRecord, Settle
 from .errors import ConfigurationError
 from .messages import ToolCallPart
 from .session import PendingApproval, PendingInput
@@ -97,6 +100,7 @@ class Approval(BaseModel):
     """A human's answer to an approval request."""
 
     approved: bool
+    by: str | None = None
     reason: str | None = None
     """Why the call was declined; the model reads it as the call's result."""
     arguments: dict[str, Any] | None = None
@@ -114,6 +118,7 @@ class Approval(BaseModel):
         pending: PendingApproval,
         approved: bool = True,
         *,
+        by: str | None = None,
         reason: str | None = None,
         arguments: dict[str, Any] | None = None,
     ) -> Approval:
@@ -125,7 +130,9 @@ class Approval(BaseModel):
             reason: Why it was declined, for the model.
             arguments: Arguments to run the tool with instead of the model's.
         """
-        return cls(approved=approved, reason=reason, arguments=arguments, token=pending.token)
+        return cls(
+            approved=approved, by=by, reason=reason, arguments=arguments, token=pending.token
+        )
 
 
 class InputResult(BaseModel):
@@ -183,6 +190,10 @@ class Permissions:
         can_use_tool: CanUseTool | None = None,
         on_ask: OnAsk | None = None,
         approval_secret: str | bytes | None = None,
+        approval_ttl_s: float = 6 * 3600,
+        authorize_settlement: Callable[[Settle, EffectRecord], bool | Awaitable[bool]]
+        | None = None,
+        resend_min_age_s: float = 900.0,
     ) -> None:
         """Set up the rules.
 
@@ -205,6 +216,9 @@ class Permissions:
             ConfigurationError: ``approval_secret`` is not text or bytes, or is
                 shorter than 16 bytes.
         """
+        self.approval_ttl_s = approval_ttl_s
+        self.authorize_settlement = authorize_settlement
+        self.resend_min_age_s = resend_min_age_s
         self.mode: Mode = mode
         self.allow = tuple(allow)
         self.ask = tuple(ask)
@@ -244,6 +258,30 @@ class Permissions:
         if expected is None:
             return True
         return isinstance(token, str) and token.isascii() and hmac.compare_digest(token, expected)
+
+    def decision_record(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        operation_id: str,
+        ask: int,
+        tool: Tool,
+        call: ToolCallPart,
+        approved: bool,
+        reason: str | None,
+        by: str | None,
+        decided_at: float,
+        arguments_changed: bool = False,
+        arguments_changed_by: str | None = None,
+    ) -> ApprovalRecord:
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def verify_decision(self, record: ApprovalRecord) -> bool:
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def sign_settlement(self, fields: Mapping[str, JSONValue]) -> str | None:
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
 
     async def decide(self, ctx: RunContext[Any], tool: Tool, call: ToolCallPart) -> Decision:
         name = tool.name
@@ -305,6 +343,9 @@ def approval_token(
     kind: Literal["approval", "input"] = "approval",
     reason: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    operation_id: str | None = None,
+    ask: int = 1,
+    v: Literal[2, 3] = 3,
 ) -> str:
     """HMAC-SHA256, as hex, of the canonical JSON of one paused call.
 
@@ -439,3 +480,11 @@ def _as_decision(answer: Any) -> Decision | None:
         return Decision(behavior=answer)
     logger.error("can_use_tool returned %r, which is not a decision; refusing the call", answer)
     return Decision(behavior="deny", reason=prompts.PERMISSION_REASON_CHECK_FAILED)
+
+
+def arguments_digest(arguments: Mapping[str, Any]) -> str:
+    raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+
+def tool_spec_digest(tool: Tool) -> str:
+    raise NotImplementedError("Effects implementation is pending its owning stage.")

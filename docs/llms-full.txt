@@ -4643,7 +4643,7 @@ with agent.override(model=FakeModel(script)):  # tests χωρίς δίκτυο
 
 ## qagents.agent.Agent (class)
 
-Source: `src/qagents/agent.py:237` | qagents 0.2.0
+Source: `src/qagents/agent.py:258` | qagents 0.2.0
 Import: `from qagents.agent import Agent`
 
 ```python
@@ -4667,6 +4667,8 @@ class Agent(
     hooks: Iterable[Hooks] = (),
     handoffs: Iterable[Agent] = (),
     compactor: Compactor | None = None,
+    lease_ttl_s: float = 30.0,
+    build_id: str | None = None,
 )
 ```
 
@@ -4683,9 +4685,12 @@ instructions, tools, output settings and output validators take over; the
 output guardrails of both agents apply.
 
 ## Methods
-- `stream(prompt, *, deps, session, history, limits, settings, state, parent) -> RunStream`: Start a run and return its event stream.
-- `async run(prompt, *, deps, session, history, limits, settings, state, parent) -> RunResult`: Run until the agent answers, pauses, hits a limit or is blocked.
-- `run_sync(prompt: Prompt = None, **options: Any) -> RunResult`: ``run`` for code that is not async.
+- `async settle(session: Session, answer: Settle, *, deps: Any = None) -> EffectRecord`
+- `async recheck(session: Session, *, deps: Any = None) -> list[HeldEffect]`
+- `effects_by_name() -> dict[str, Effect]`
+- `stream(prompt, *, deps, session, history, limits, settings, state, parent, if_held_effects) -> RunStream`: Start a run and return its event stream.
+- `async run(prompt, *, deps, session, history, limits, settings, state, parent, if_held_effects) -> RunResult`: Run until the agent answers, pauses, hits a limit or is blocked.
+- `run_sync(prompt, *, if_held_effects, **options) -> RunResult`: ``run`` for code that is not async.
 - `resume_stream(session, *, approvals, results, deps, limits, settings, state) -> RunStream`: Continue the session's unfinished run and return its event stream.
 - `async resume(session, *, approvals, results, deps, limits, settings, state) -> RunResult`: Continue the session's unfinished run: after a pause, a crash or an error.
 - `as_tool(*, name, description, read_only, timeout) -> Tool`: Expose this agent as a tool another agent can call.
@@ -4694,6 +4699,8 @@ output guardrails of both agents apply.
 ## Attributes
 - `model`
 - `name`
+- `lease_ttl_s`
+- `build_id`
 - `description`
 - `instructions`
 - `tools: list[Tool | Toolkit]`
@@ -4715,7 +4722,7 @@ Details of one member: get_api("qagents.agent.Agent.<member>").
 
 ## qagents.agent.Limits (class)
 
-Source: `src/qagents/agent.py:168` | qagents 0.2.0
+Source: `src/qagents/agent.py:189` | qagents 0.2.0
 Import: `from qagents.agent import Limits`
 
 ```python
@@ -4758,7 +4765,7 @@ Details of one member: get_api("qagents.agent.Limits.<member>").
 
 ## qagents.agent.RunStream (class)
 
-Source: `src/qagents/agent.py:773` | qagents 0.2.0
+Source: `src/qagents/agent.py:815` | qagents 0.2.0
 Import: `from qagents.agent import RunStream`
 
 ```python
@@ -4823,11 +4830,15 @@ validated against the signature before your code runs:
 
 ## Members
 - `prompts` (module): Every piece of text qagents itself puts in front of a model.
+- `ThreadSlot` (class)
 - `RunContext` (class): What a tool, hook or instructions function can know about the current run.
 - `Tool` (class): A callable the model can invoke.
 - `ToolTimeout` (class): A tool call took longer than its timeout (raised by `Tool.run`).
 - `Toolkit` (class): A source of tools that is resolved when a run starts.
-- `tool(function, *, name, description, requires_approval, read_only, idempotent, timeout, strict, deferred) -> Any` (function): Turn a function into a `Tool`.
+- `set_thread_observer(observer: ThreadObserver | None) -> ThreadObserver | None` (function)
+- `reserve_thread() -> ThreadSlot | None` (function)
+- `start_thread(name, function, *args, slot, **kwargs) -> tuple[asyncio.Future[Any], concurrent.futures.Future[Any]]` (function)
+- `tool(function, *, name, description, requires_approval, read_only, idempotent, timeout, strict, deferred, effe...)` (function): Turn a function into a `Tool`.
 - `render_tool_output(value: Any) -> str` (function): The text a model reads for a tool's return value.
 - `TOOL_THREADS` (attribute): Worker threads that run sync tool functions.
 
@@ -4909,8 +4920,10 @@ not act on it (for example by polling a job id from it) before that.
 - `Approval` (class): A human's answer to an approval request.
 - `InputResult` (class): The result of a call that waits for input, with the token of its signed pause.
 - `Permissions` (class): Rules for tool calls.
-- `approval_token(secret, *, session_id, run_id, position, tool_call_id, name, arguments, kind, reason, metadata) -> str` (function): HMAC-SHA256, as hex, of the canonical JSON of one paused call.
+- `approval_token(secret, *, session_id, run_id, position, tool_call_id, name, arguments, kind, reason, metadata, operation...)` (function): HMAC-SHA256, as hex, of the canonical JSON of one paused call.
 - `canonical_json(value: Any) -> str` (function): The RFC 8785 (JCS) canonical JSON of a JSON value.
+- `arguments_digest(arguments: Mapping[str, Any]) -> str` (function)
+- `tool_spec_digest(tool: Tool) -> str` (function)
 - `CanUseTool` (attribute): ``(ctx, tool, call)`` -> ``Decision``, ``"allow"``/``"ask"``/``"deny"``, a bool, or ``None`` for "no opinion".
 - `OnAsk` (attribute): ``(ctx, tool, call, reason)`` -> ``Approval`` or a bool.
 
@@ -5075,12 +5088,16 @@ and `qagents.stores.postgres.PostgresStore` implement both.
 - `PendingInput` (class): A tool call whose result must come from outside the run.
 - `SessionState` (class): What the journal says about a session right now.
 - `SessionStatus` (class): What a store tracks about a session next to its journal.
+- `LeaseGrant` (class)
 - `SessionStore` (class): Where journals live.
 - `InMemoryStore` (class): Keeps journals in a dict.
 - `SQLiteStore` (class): Journals in one SQLite file (WAL mode).
 - `Session` (class): One conversation in a store.
-- `derive_state(entries: list[Entry]) -> SessionState` (function): Replay a journal into the current `SessionState`.
+- `Lease` (class): One lease's token, epoch, deadline, renewals and running sends; implementation pending.
+- `LeasedWriter` (class): Frozen leased-writer contract; implementation is pending the store owner stage.
+- `derive_state(entries: list[Entry], *, session_id: str | None = None) -> SessionState` (function): Replay a journal into the current `SessionState`.
 - `advance_status(status: SessionStatus, entry: Entry) -> None` (function): Update ``status`` in place for one appended entry.
+- `append_fenced(store, session_id, entries, owner, *, fence, attempts) -> list[int] | None` (function): SPEC 7.7.2-3 in one place: first append (append_leased with owner, or append when owner is None); a definite refusal (LeaseError, validation SessionError,...
 - `SessionRunStatus` (attribute): Where a session's latest run stands, as the store tracks it (`SessionStatus.status`).
 
 ---
@@ -5147,6 +5164,9 @@ journal records ``run_failed``), except on ``run_finished``, when the run has
 already ended.
 
 ## Members
+- `EffectStarted` (class)
+- `EffectFinished` (class)
+- `EffectSettled` (class)
 - `AgentSwitched` (class): A handoff made another agent the active one.
 - `ApprovalRequired` (class): A tool call waits for a human.
 - `ExternalAgentEvent` (class): An event of an external agent with no qagents counterpart.
@@ -5399,6 +5419,7 @@ Args:
 ## Methods
 - `session(name: str) -> Session`: A durable agent-step session; existing legacy ids resolve on first I/O.
 - `async completed_steps() -> dict[str, Any]`: Names and recorded results of the steps that have finished (a copy).
+- `async effect(name: str, effect: Any, request: Any) -> Any`
 - `async step(name: str, function: Callable[[], Any], *, type: Any = None) -> Any`: Record ``function``'s result and replay completed steps.
 - `async map(name, items, function, *, concurrency, type) -> list[Any]`: Run ``function(item)`` as one durable step per item, concurrently.
 - `async run_agent(name, agent, prompt, *, approvals, results, state, on_event, **options) -> RunResult`: Run an agent as a step, in its own durable session.
@@ -7827,4 +7848,40 @@ servers over HTTP."""
 DEVVI_EXPOSE_FAILED = "{name}: expose_tools: {error}"
 """The in-process tool server of a turn (ACP transport, ``expose_tools``) did not start:
 ``error`` is a ``TOOL_SERVER_*`` setup text such as `TOOL_SERVER_DUPLICATE_NAME`."""
+
+EFFECT_OUTCOME_UNKNOWN = (
+    "EFFECT_OUTCOME_UNKNOWN: the outcome of {effect} for {key} is unknown: it may or may not "
+    "have been done. It is held for checking; do not try it again. "
+    "Already done in this call: {committed}."
+)
+EFFECT_CLOSED_UNKNOWN = (
+    "EFFECT_CLOSED_UNKNOWN: {effect} for {key} was closed by an operator with its outcome "
+    "unknown ({reason}). Do not try it again."
+)
+EFFECT_HELD_BY_NEW_RUN = (
+    "EFFECT_HELD_BY_NEW_RUN: this call did not finish in an earlier run. Its effect {effect} "
+    "for {key} is held for checking; do not try it again."
+)
+EFFECT_REJECTED = "{effect} for {key} was refused by the destination; nothing was done: {error}"
+EFFECT_NOT_APPLIED = "{effect} for {key} was not done (recorded by an operator: {evidence})."
+EFFECT_CONFLICT = (
+    "{effect} for {key} already holds a different request ({status}); this request was not sent."
+)
+EFFECT_RECEIPT_UNSTORABLE = (
+    "{effect} for {key} was done, but its receipt could not be stored ({error}). "
+    "Do not try it again."
+)
+EFFECT_TOOL_TIMEOUT = (
+    "The tool timed out after {seconds:g} s. These were done before it stopped: {committed}. "
+    "Do not repeat them."
+)
+EFFECT_TOOL_TIMEOUT_NONE = (
+    "The tool timed out after {seconds:g} s, before any of its effects was done."
+)
+EFFECT_ARGUMENTS_NOT_CANONICAL = (
+    "{name!r} was not run: its arguments have no canonical JSON (NaN, an infinity, an "
+    "integer beyond 2^53 - 1 or a lone surrogate). Send large integers as strings."
+)
+APPROVAL_SCOPE_CHANGED = "A hook changed the arguments of this approved call, so it was not run."
+EFFECT_NONE_DONE = "nothing"
 ```

@@ -70,6 +70,22 @@ def test_helper_key_override_changes_derived_key_but_not_request():
     assert overridden.operation_tag != normal.operation_tag
 
 
+@pytest.mark.parametrize("applies_within_s", [None, 2.0, 100.0])
+def test_attempt_not_after_uses_default_lease_slack(monkeypatch, applies_within_s):
+    import qagents.testing.effects as helpers
+
+    @effect(name="deadline", key=Key("deadline", "request_id"), applies_within_s=applies_within_s)
+    async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+        return Receipt(id=attempt.request.request_id)
+
+    monkeypatch.setattr(helpers.time, "time", lambda: 100.0)
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: 40.0)
+    attempt = attempt_for(send, Request(request_id="R1", values=[]), timeout_s=5)
+    assert attempt.deadline == 45.0
+    # The default 30-second lease has m=3, independent of the remote apply bound.
+    assert attempt.not_after == 108.0
+
+
 @pytest.mark.parametrize(
     "arguments", [{"number": 0}, {"generation": -1}, {"timeout_s": float("inf")}, {"key": ""}]
 )

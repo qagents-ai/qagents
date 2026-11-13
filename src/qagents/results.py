@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field, PrivateAttr
 
+from .effects._types import HeldEffect
 from .messages import Message, Usage
 from .session import PendingApproval, PendingInput
 
@@ -69,6 +70,7 @@ class RunResult(BaseModel):
     agent: str
     """The agent that was active when the run stopped (differs from the one
     you called after a handoff)."""
+    held_effects: list[HeldEffect] = Field(default_factory=list)
     status: RunStatus
     stop_reason: str | None = None
     output: Any = None

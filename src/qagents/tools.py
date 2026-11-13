@@ -37,6 +37,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from pydantic_core import to_jsonable_python
 
 from . import prompts
+from .effects._declare import Effect
+from .effects._ports import CallScope
+from .effects._types import RecT, ReqT
 from .errors import ConfigurationError, ToolArgumentError, ToolError
 from .messages import Message, ToolResultPart, Usage
 from .models.base import ToolSpec
@@ -61,6 +64,31 @@ thread: a sync tool that hangs for good keeps the process from exiting. Give syn
 clients their own socket timeouts, or write the tool as an ``async`` function."""
 
 _NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+ThreadObserver = Callable[[concurrent.futures.Future[Any]], None]
+
+
+def set_thread_observer(observer: ThreadObserver | None) -> ThreadObserver | None:
+    raise NotImplementedError("Thread accounting is pending its owning stage.")
+
+
+class ThreadSlot:
+    def release(self) -> None:
+        raise NotImplementedError("Thread reservation is pending its owning stage.")
+
+
+def reserve_thread() -> ThreadSlot | None:
+    raise NotImplementedError("Thread reservation is pending its owning stage.")
+
+
+def start_thread(
+    name: str,
+    function: Callable[..., Any],
+    *args: Any,
+    slot: ThreadSlot | None = None,
+    **kwargs: Any,
+) -> tuple[asyncio.Future[Any], concurrent.futures.Future[Any]]:
+    raise NotImplementedError("Thread dispatch is pending its owning stage.")
 
 
 @dataclass
@@ -119,6 +147,24 @@ class RunContext(Generic[DepsT]):
     _add_usage: Callable[[Usage], None] | None = field(default=None, repr=False)
     _run: Any = field(default=None, repr=False, compare=False)
     """The run this context belongs to; a child run reads its remaining limits."""
+
+    _call: CallScope | None = field(default=None, repr=False, compare=False)
+
+    async def perform(
+        self, effect: Effect[ReqT, RecT], request: ReqT, *, occurrence: int | None = None
+    ) -> RecT:
+        raise NotImplementedError("Effect dispatch is pending runtime integration.")
+
+    async def memo(self, name: str, function: Callable[[], Any], *, type: Any = None) -> Any:
+        raise NotImplementedError("Durable memo is pending runtime integration.")
+
+    @property
+    def tool_attempt(self) -> int:
+        return 1
+
+    @property
+    def is_rerun(self) -> bool:
+        return False
 
     def emit(self, event: Any) -> None:
         """Put a custom event on the run's event stream (from inside a tool).
@@ -377,12 +423,15 @@ class Tool:
         timeout: float | None = None,
         strict: bool = False,
         deferred: bool = False,
+        effects: Sequence[Effect] = (),
     ) -> None:
         if not _NAME_PATTERN.match(name):
             raise ConfigurationError(
                 f"Tool name {name!r} is not valid: use 1-64 letters, digits, '_' or '-'."
             )
         self.function = function
+        self.effects = tuple(effects)
+        self.origin: str | None = None
         self.name = name
         self.description = description
         self.arguments_model = arguments_model
@@ -602,6 +651,8 @@ def tool(
     timeout: float | None = None,
     strict: bool = False,
     deferred: bool = False,
+    effects: Sequence[Effect] = (),
+    timeout_s: float | None = None,
 ) -> Any:
     """Turn a function into a `Tool`. Use bare or with options.
 
@@ -644,9 +695,10 @@ def tool(
             requires_approval=requires_approval,
             read_only=read_only,
             idempotent=idempotent,
-            timeout=timeout,
+            timeout=timeout if timeout_s is None else timeout_s,
             strict=strict,
             deferred=deferred,
+            effects=effects,
         )
 
     return build(function) if function is not None else build
