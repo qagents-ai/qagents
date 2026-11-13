@@ -8,21 +8,166 @@ import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from qagents.errors import ConfigurationError
+from qagents.errors import ConfigurationError, EffectRejected, ToolError
 from qagents.session import EFFECTS_REQUIRED, SessionStore
 
+from . import _canonical as canonical
 from ._canonical import LIMIT_BYTES, JSONValue, check_model_numbers, jcs, resolve_namespace
-from ._declare import Effect, Unique
+from ._declare import Dedupe, Effect, Unique
 from ._fold import Operation
 from ._kinds import StatePatchData
 from ._ports import FINDINGS_LOGGER, CallScope, EffectJournal, Timing
-from ._types import MISSING, Absent, Found, NotYetVisible, RecT, ReqT, Unknown
+from ._types import MISSING, Absent, Found, HoldReason, NotYetVisible, RecT, ReqT, Unknown
 
 Verdict = Found | NotYetVisible | Absent | Unknown
+_TOOLERROR_WARNED = False
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    frozen: canonical.Frozen
+    descriptor: canonical.Descriptor
+    namespace: str
+    key: str
+    occurrence: int | None
+    destination: JSONValue
+    original: BaseModel
+
+
+def _prepare(effect: Effect, request: Any, scope: CallScope, occurrence: int | None) -> _Prepared:
+    """P0 and the immutable request/destination identity, before the first store write."""
+    if not isinstance(effect, Effect) or effect.name not in scope.effects:
+        raise ConfigurationError("perform requires an effect listed in this tool's effects=[...].")
+    if scope.composition_refusal is not None:
+        raise ConfigurationError(scope.composition_refusal)
+    journal = scope.journal
+    if (
+        not scope.session_id
+        or journal.session_id != scope.session_id
+        or not getattr(journal, "leased", True)
+        or not getattr(journal.lease, "owner", None)
+        or EFFECTS_REQUIRED - journal.store.features
+    ):
+        raise ConfigurationError(
+            "perform requires a fenced session implementing the Effects contract."
+        )
+    if scope.key_override is not None and scope.tool_name is not None:
+        raise ConfigurationError("An effect key override is only available to Workflow.effect.")
+    occurrence = _occurrence_for(scope, effect, occurrence)
+    frozen = canonical.freeze(effect, request)
+    restored = canonical.rebuild(effect, frozen)
+    try:
+        namespace = canonical.resolve_namespace(effect, scope.deps, scope.session_id)
+        destination = effect.destination(scope.deps) if effect.destination is not None else None
+        destination = json.loads(canonical.jcs(destination))
+    except Exception as error:
+        raise ConfigurationError(
+            f"{effect.name}: invalid namespace or destination: {error}"
+        ) from error
+    _require_claims(effect, namespace, journal.store)
+    key = effect.key.render(
+        restored, effect=effect.name, operation_id=scope.operation_id, occurrence=occurrence
+    )
+    if scope.key_override is not None:
+        if not isinstance(scope.key_override, str) or not scope.key_override:
+            raise ConfigurationError("Workflow effect key must be a nonempty string.")
+        canonical.jcs(scope.key_override)
+        key = scope.key_override
+    return _Prepared(
+        frozen,
+        canonical.descriptor(effect, destination, frozen.digest),
+        namespace,
+        key,
+        occurrence,
+        destination,
+        request,
+    )
+
+
+def _occurrence_for(scope: CallScope, effect: Effect, occurrence: int | None) -> int | None:
+    """Require an explicit occurrence after the first call-scoped invocation (M12)."""
+    if occurrence is not None and (type(occurrence) is not int or occurrence < 0):
+        raise ConfigurationError("occurrence must be a nonnegative integer or None.")
+    if effect.key.is_per_call and scope.occurrences[effect.name] and occurrence is None:
+        raise ConfigurationError("A second per-call perform needs an explicit occurrence=.")
+    scope.occurrences[effect.name] += 1
+    return occurrence
+
+
+def _request_for_send(effect: Effect, frozen: canonical.Frozen, original: Any) -> Any:
+    """The sender receives a fresh validated snapshot, never the caller's object (M13)."""
+    return canonical.rebuild(effect, frozen)
+
+
+def _may_overrun(effect: Effect) -> bool:
+    """A synchronous send cannot be stopped by cancelling its asyncio wrapper (M35)."""
+    return not effect.is_async
+
+
+def _classify_send_error(
+    effect: Effect, error: BaseException
+) -> Literal["rejected", "duplicate", "unknown"]:
+    """Only explicit destination contracts classify a raised response as definite (M4)."""
+    global _TOOLERROR_WARNED
+    if isinstance(error, EffectRejected) or isinstance(error, effect.rejected_on):
+        return "rejected"
+    if isinstance(effect.dedupe, Unique) and isinstance(error, effect.dedupe.on_duplicate):
+        return "duplicate"
+    if isinstance(error, ToolError) and not _TOOLERROR_WARNED:
+        _TOOLERROR_WARNED = True
+        logging.getLogger("qagents.effects").warning(
+            "ToolError from an effect send has an unknown outcome; declare rejected_on only "
+            "when the destination guarantees no application."
+        )
+    return "unknown"
+
+
+async def _self_fence(journal: EffectJournal, effect: Effect) -> bool:
+    """Renew once for a short margin; a lost lease never authorizes a new send (M7)."""
+    lease = journal.lease
+    if lease.lost():
+        return False
+    required = effect.timeout_s + journal.timing.m_s
+    if lease.remaining() >= required:
+        return True
+    try:
+        if not await lease.renew():
+            return False
+    except Exception:
+        return False
+    return not lease.lost() and lease.remaining() >= required
+
+
+def _authorization_valid(rule: str, scope: CallScope, store_now: float) -> HoldReason | None:
+    """Fresh sends use the current decision; automatic retries need its original proof (M17)."""
+    if rule == "D5":
+        return (
+            None
+            if scope.authorization.decision == "resend"
+            and scope.authorization.settlement_seq is not None
+            else HoldReason.APPROVAL_UNVERIFIABLE
+        )
+    if rule not in {"D1", "D2", "D3", "D4"}:
+        raise ConfigurationError("Authorization can only be checked for a sending row.")
+    auth = scope.original_authorization if rule in {"D3", "D4"} else scope.authorization
+    if auth is None or auth.decision == "resend":
+        return HoldReason.APPROVAL_UNVERIFIABLE
+    if rule in {"D3", "D4"} and not auth.verifiable:
+        return HoldReason.APPROVAL_UNVERIFIABLE
+    if auth.expires_at is not None and store_now > auth.expires_at:
+        return HoldReason.APPROVAL_EXPIRED
+    return None
+
+
+def _d2_plan(effect: Effect, op: Operation) -> tuple[bool, int]:
+    """Look up a rejection before retrying; only replayed rejections advance generation (M33)."""
+    changes_key = isinstance(effect.dedupe, Dedupe) and effect.dedupe.replays_rejections
+    return effect.lookup_fn is not None, op.generation + int(changes_key)
 
 
 async def perform(
@@ -33,7 +178,8 @@ async def perform(
     ("fail_run"), ToolError(EFFECT_OUTCOME_UNKNOWN) ("tell_model"), ConfigurationError
     (P0), LeaseError (F1: nothing journaled or sent), JournalOutcomeUnknown (poisoned),
     CancelledError (after the shield). Keeps the perform contract of 3.6."""
-    raise NotImplementedError("Effects implementation is pending its owning stage.")
+    _prepare(effect, request, scope, occurrence)
+    raise NotImplementedError("Effect state transitions and dispatch are pending implementation.")
 
 
 async def lookup_and_record(
@@ -190,15 +336,6 @@ async def check_run_start(
             )
 
 
-def _require_claims(effect, namespace, store) -> None:
-    """M45: every declared shared namespace needs claims, regardless of its spelling."""
-    if effect.namespace != "session" and "claims" not in store.features:
-        raise ConfigurationError(
-            f"{effect.name}: shared namespace {namespace!r} needs the store claims feature. "
-            "Use a claims-capable store or namespace='session'."
-        )
-
-
 def send_running(store: SessionStore, session_id: str, record_id: str) -> bool:
     """True while an abandoned sync send of that operation still runs in this process
     (SEND_STILL_RUNNING: O4a does not re-run the call)."""
@@ -209,3 +346,12 @@ def _forget_store(store: SessionStore) -> None:
     """Drop the single-flight and send-running entries whose root store is this object
     (harness teardown)."""
     raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+
+def _require_claims(effect, namespace, store) -> None:
+    """M45: every declared shared namespace needs claims, regardless of its spelling."""
+    if effect.namespace != "session" and "claims" not in store.features:
+        raise ConfigurationError(
+            f"{effect.name}: shared namespace {namespace!r} needs the store claims feature. "
+            "Use a claims-capable store or namespace='session'."
+        )
