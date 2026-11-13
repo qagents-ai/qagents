@@ -90,6 +90,11 @@ from .errors import LeaseError, SessionError
 from .messages import Message, ToolResultPart, Usage
 
 
+def _owner_token(worker: str) -> str:
+    """Return a fresh lease owner for one acquisition by this worker (the M8 seam)."""
+    return f"{worker}#{uuid.uuid4().hex}"
+
+
 class Entry(BaseModel):
     kind: str
     data: dict[str, Any] = Field(default_factory=dict)

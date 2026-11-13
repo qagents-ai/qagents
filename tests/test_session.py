@@ -343,3 +343,15 @@ async def test_a_store_that_overrides_only_append_still_runs_one_run_at_a_time()
         await Agent(ScriptedModel(["two"])).run("two", session=session)
     gate.set()
     assert (await first).status == "completed"
+
+
+def test_owner_token_is_unique_for_each_acquisition_by_the_same_worker():
+    from qagents.session import _owner_token
+
+    first, second = _owner_token("worker-a"), _owner_token("worker-a")
+    assert first != second
+    for token in (first, second):
+        prefix, suffix = token.split("#")
+        assert prefix == "worker-a"
+        assert len(suffix) == 32
+        assert int(suffix, 16) >= 0
