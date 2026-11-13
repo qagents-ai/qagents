@@ -593,7 +593,9 @@ class Workflow:
 
     @staticmethod
     def _check_journal(entries: list[Entry], session_id: str) -> None:
-        if any(not entry.kind.startswith("workflow_") for entry in entries):
+        # A real agent journal starts a run. Unknown extension kinds remain
+        # ignorable, as they are in _scan and in ordinary session readers.
+        if any(entry.kind == "run_started" for entry in entries):
             raise SessionError(
                 f"Workflow journal id {session_id!r} is already an agent-step session; "
                 "choose another workflow id. Nothing was written."
@@ -739,12 +741,23 @@ class _StepSession(Session):
 
     def __init__(self, workflow: Workflow, name: str) -> None:
         self._workflow, self._name = workflow, name
+        self._resolved = False
         super().__init__(workflow.store, id=_step_id(workflow.id, name))
 
     async def _resolve(self) -> None:
+        if self._resolved:
+            return
         await self._workflow._resolve_layout()
+        legacy_id = f"workflow:{self._workflow.id}:{self._name}"
         if self._workflow._legacy_layout:
-            self.id = f"workflow:{self._workflow.id}:{self._name}"
+            self.id = legacy_id
+        elif not await self.store.load(self.id):
+            # session(name) may have been used directly, before any workflow
+            # journal existed. Only reuse a recognizable legacy agent journal.
+            legacy = await self.store.load(legacy_id)
+            if any(entry.kind == "run_started" for entry in legacy):
+                self.id = legacy_id
+        self._resolved = True
 
 
 def _journal_id(workflow_id: str) -> str:

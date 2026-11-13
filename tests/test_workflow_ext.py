@@ -597,3 +597,33 @@ def test_workflow_docstrings_keep_external_changes_out_of_plain_steps():
     assert "external changes" in inspect.getdoc(Workflow.step)
     timer = inspect.getdoc(Workflow.wait_for_timer)
     assert 'wf.step("remind"' not in timer and 'wf.step("close"' not in timer
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_workflow_identity_checks_ignore_unknown_journal_kinds(legacy):
+    store = InMemoryStore()
+    journal_id = "workflow:extensions" if legacy else "workflow-journal:extensions"
+    journal = Session(store, id=journal_id)
+    await journal.append("future_extension", {"value": "preserved"})
+    await journal.append("workflow_step", {"name": "recorded", "result": 7})
+    before = await journal.entries()
+    assert await Workflow(store, "extensions").completed_steps() == {"recorded": 7}
+    assert await journal.entries() == before
+
+
+async def test_legacy_standalone_step_session_resolves_without_a_workflow_journal():
+    store = InMemoryStore()
+    legacy = Session(store, id="workflow:standalone:write")
+    await Agent(ScriptedModel(["old answer"])).run("old prompt", session=legacy)
+    step = Workflow(store, "standalone").session("write")
+    assert [message.text for message in await step.messages()] == ["old prompt", "old answer"]
+    assert step.id == legacy.id
+    await Agent(ScriptedModel(["new answer"])).run(
+        "new prompt", session=Workflow(store, "standalone").session("write")
+    )
+    assert [message.text for message in await legacy.messages()] == [
+        "old prompt",
+        "old answer",
+        "new prompt",
+        "new answer",
+    ]
