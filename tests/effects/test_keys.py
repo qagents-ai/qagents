@@ -5,6 +5,7 @@ import hashlib
 from types import SimpleNamespace
 
 import pytest
+from pydantic import BaseModel
 
 from qagents.effects._canonical import (
     Descriptor,
@@ -17,6 +18,8 @@ from qagents.effects._canonical import (
     record_id,
     resolve_namespace,
 )
+from qagents.effects._declare import Key
+from qagents.errors import ConfigurationError
 
 
 def test_idempotency_key_binds_store_namespace_effect_key_and_generation():
@@ -91,3 +94,65 @@ def test_namespace_resolution_and_percent_encoding():
     assert calls == ["trusted"]
     with pytest.raises(ValueError, match="nonempty"):
         resolve_namespace(SimpleNamespace(namespace=lambda deps: 42), None, "s")
+
+
+class KeyRequest(BaseModel):
+    business_id: str
+    version: int = 1
+    active: bool = True
+
+
+def render(key, request, *, operation_id="run:turn:call", effect="refund", occurrence=None):
+    return key.render(request, operation_id=operation_id, effect=effect, occurrence=occurrence)
+
+
+def test_business_key_rendering_is_readable_and_escapes_delimiters():
+    key = Key("refund", "business_id", "version", "active")
+    assert render(key, KeyRequest(business_id="a:b%3A")) == "refund:a%3Ab%253A:1:true"
+    assert render(key, KeyRequest(business_id="a:b")) != render(
+        key, KeyRequest(business_id="a%3Ab")
+    )
+    assert render(key, KeyRequest(business_id="é", active=False)) == "refund:é:1:false"
+    assert not key.is_per_call
+
+
+def test_multi_field_key_encoding_is_injective_for_delimiters():
+    class Pair(BaseModel):
+        first: str
+        second: str
+
+    key = Key("pair", "first", "second")
+    values = ("", ":", "%", "%3A", "a:b", "a", "b", "::")
+    rendered = {
+        render(key, Pair(first=first, second=second)) for first in values for second in values
+    }
+    assert len(rendered) == len(values) ** 2
+
+
+def test_per_call_and_occurrence_are_distinct_from_business_identity():
+    key = Key.per_call()
+    request = KeyRequest(business_id="same")
+    assert render(key, request) == "call/run:turn:call/refund"
+    assert render(key, request, occurrence=0) == "call/run:turn:call/refund/0"
+    assert render(key, request, occurrence=1) != render(key, request, occurrence=0)
+    assert render(key, request, operation_id="a/b", effect="c") != render(
+        key, request, operation_id="a", effect="b/c"
+    )
+    assert render(key, request, operation_id="later") != render(key, request)
+    assert key.is_per_call and key.fields == ()
+    for bad in (-1, True, "1"):
+        with pytest.raises(ConfigurationError, match="occurrence"):
+            render(key, request, occurrence=bad)
+
+
+def test_key_spec_digest_is_stable_and_sensitive_to_field_order():
+    assert Key("p", "a", "b").spec_digest() == Key("p", "a", "b").spec_digest()
+    assert Key("p", "a", "b").spec_digest() != Key("p", "b", "a").spec_digest()
+    assert Key("p", "a").spec_digest() != Key("other", "a").spec_digest()
+    assert Key.per_call().spec_digest() != Key("call", "a").spec_digest()
+
+
+@pytest.mark.parametrize("args", [("", "a"), ("p",), ("p", "a", "a"), ("p", 1)])
+def test_invalid_key_declarations_are_refused(args):
+    with pytest.raises(ConfigurationError):
+        Key(*args)
