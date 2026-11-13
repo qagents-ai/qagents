@@ -64,6 +64,9 @@ class Operation:
     tool_call_ids: list[str]
     revision: int
     resolved_by_rejected_resend: bool
+    _resolved_conflicts: set[tuple[str, tuple[int, ...]]] = field(default_factory=set, repr=False)
+    _resolution_seq: int = field(default=0, repr=False)
+    _operator_settlement: SettlementSummary | None = field(default=None, repr=False)
 
 
 def _new_operation(ref: kinds.EffectRefData) -> Operation:
@@ -111,7 +114,9 @@ def _settled_state(outcome: str) -> State:
 
 def _status_of(op: Operation) -> State:
     """Consider every attempt in the generation, while keeping a recorded commit (M32)."""
-    if op.findings or op.conflicts:
+    if any(
+        _conflict_key(item) not in op._resolved_conflicts for item in [*op.findings, *op.conflicts]
+    ):
         return "X"
     if op.commit_seq is not None:
         return "C"
@@ -134,6 +139,26 @@ def _status_of(op: Operation) -> State:
 
 def _conflict_key(finding: kinds.EffectConflictData) -> tuple[str, tuple[int, ...]]:
     return finding.what, tuple(finding.seqs)
+
+
+def _resolve_prefix(
+    op: Operation, seq: int, expected_revision: int | None, by: str | None, evidence: str | None
+) -> bool:
+    # The operator boundary verifies the decision/MAC before appending. The pure fold
+    # additionally requires a complete answer to this exact prefix; it has no secret.
+    if (
+        op.state not in ("D", "X")
+        or expected_revision != op.revision
+        or not by
+        or not by.strip()
+        or not evidence
+        or not evidence.strip()
+    ):
+        return False
+    op._resolved_conflicts.update(_conflict_key(item) for item in [*op.findings, *op.conflicts])
+    op._resolution_seq = seq
+    op.pending_resend = None
+    return True
 
 
 def _finding(op: Operation, what: str, seqs: Iterable[int], detail: str | None = None) -> None:
@@ -275,6 +300,16 @@ class EffectView:
         elif entry.kind == kinds.KIND_EFFECT_SETTLED:
             data = kinds.EffectSettledData.model_validate(entry.data)
             data = data.model_copy(update={"seq": entry.seq, "voided": False})
+            if data.outcome != "resend" and _resolve_prefix(
+                op,
+                entry.seq,
+                data.expected_revision,
+                data.by,
+                data.reason if data.outcome == "close_unknown" else data.evidence,
+            ):
+                # The answer resolves an X prefix that can contain contradictory commits.
+                # Their evidence remains in the journal and conflict history.
+                op.receipt = op.identity_digest = op.via = op.commit_seq = None
             op.settlements.append(data)
             op.pending_resend = data if data.outcome == "resend" else None
         elif entry.kind == kinds.KIND_EFFECT_CONFLICT:
@@ -321,13 +356,19 @@ class EffectView:
         self._operation_runs[data.operation_id] = entry.run_id
         if data.tool_call_id is not None:
             self._call_operations[(entry.run_id, data.tool_call_id)] = data.operation_id
-        if op.pending_resend is not None and data.rule == "D5":
-            pending_seq = (op.pending_resend.model_extra or {}).get("seq")
-            if data.authorization.settlement_seq == pending_seq:
-                op.pending_resend = None
+        # O3r covers the attempts present at acceptance, not any later attempt.
+        for settlement in op.settlements:
+            if settlement.outcome == "resend":
+                settlement.__pydantic_extra__["voided"] = True
+        op.pending_resend = None
 
     def _commit(self, op: Operation, entry: Entry) -> None:
         data = kinds.EffectCommittedData.model_validate(entry.data)
+        resolved = (
+            data.via == "operator"
+            and data.receipt is not None
+            and _resolve_prefix(op, entry.seq, data.expected_revision, data.by, data.evidence)
+        )
         target = None
         if data.attempt is not None or data.intent_seq is not None:
             target = _terminal_attempt(op, data.attempt, data.intent_seq, entry.seq)
@@ -337,13 +378,22 @@ class EffectView:
             target.terminal, target.terminal_seq = "committed", entry.seq
             if data.send_ended:
                 _end(target, data.ended_at)
+        if resolved:
+            op.receipt, op.identity_digest = data.receipt, data.identity_digest
+            op.commit_seq, op.via = entry.seq, data.via
+            op._operator_settlement = SettlementSummary(
+                "committed", data.by, data.evidence, None, entry.seq, False
+            )
+            return
         for settlement in op.settlements:
             if settlement.outcome == "resend":
                 if data.attempt in settlement.covers_attempts:
                     settlement.__pydantic_extra__["voided"] = True
                     if settlement is op.pending_resend:
                         op.pending_resend = None
-            elif data.via in ("lookup", "operator") or op.commit_seq is None:
+            elif (settlement.model_extra or {})["seq"] >= op._resolution_seq and (
+                data.via in ("lookup", "operator") or op.commit_seq is None
+            ):
                 _finding(
                     op,
                     "late_found_after_settlement",
@@ -441,6 +491,7 @@ class EffectView:
                         HoldReason.CLOSED_BY_INCOMPATIBLE_WORKER
                         if any(
                             item.what == "closed_by_incompatible_worker"
+                            and _conflict_key(item) not in op._resolved_conflicts
                             for item in [*op.conflicts, *op.findings]
                         )
                         else HoldReason.CONFLICT
@@ -492,6 +543,10 @@ class EffectView:
                     extra["seq"],
                     extra.get("voided", False),
                 )
+            if op._operator_settlement is not None and (
+                settlement is None or op._operator_settlement.seq > settlement.seq
+            ):
+                settlement = op._operator_settlement
             records.append(
                 EffectRecord(
                     op.record_id,

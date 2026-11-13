@@ -349,7 +349,7 @@ def test_operator_outcomes_are_distinct(outcome, state):
     assert (op.pending_resend is not None) == (outcome == "resend")
 
 
-def test_resend_is_consumed_only_by_matching_authorized_attempt_and_late_commit_voids_it():
+def test_resend_is_voided_by_any_later_attempt_and_late_commit_still_counts():
     view = fold_effects(
         [entry(1, "effect_intent", intent()), entry(2, "effect_settled", settlement("resend"))]
     )
@@ -363,7 +363,8 @@ def test_resend_is_consumed_only_by_matching_authorized_attempt_and_late_commit_
             ),
         )
     )
-    assert op.pending_resend is not None
+    assert op.pending_resend is None
+    assert view.records("session")[0].settlement.voided
     view.apply(
         entry(
             4,
