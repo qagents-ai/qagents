@@ -346,26 +346,19 @@ def canonical_json(value: Any) -> str:
     """The RFC 8785 (JCS) canonical JSON of a JSON value.
 
     Raises:
-        ValueError: NaN or an infinity, an integer that a double cannot hold
-            exactly (JSON numbers are doubles in JCS, so such an integer would
-            sign the same as its neighbours: pass large ids as strings), a
+        ValueError: NaN or an infinity, an integer outside the safe range
+            ``-(2**53 - 1)`` through ``2**53 - 1`` (pass large ids as strings), a
             string with a lone surrogate, or a value that is not JSON (dicts,
             lists, strings, numbers, bools, None).
     """
     if value is None or isinstance(value, bool):
         return json.dumps(value)
     if isinstance(value, int):
-        if abs(value) <= 2**53:
-            return str(value)
-        try:
-            number = float(value)
-        except OverflowError:
-            number = math.inf
-        if number != value:  # rounded: neighbouring integers would sign the same
+        if abs(value) > 2**53 - 1:
             raise ValueError(
-                "This integer has no exact JSON number form, so a call with it cannot be signed."
+                "This integer is outside the safe JSON range, so a call with it cannot be signed."
             )
-        return _es_number(number)
+        return str(value)
     if isinstance(value, float):
         return _es_number(value)
     if isinstance(value, str):

@@ -394,8 +394,8 @@ def test_the_token_payload_is_rfc_8785_canonical_json():
     )
     assert canonical_json({"\u20ac": 1, "\U0001f600": 2, "z": 3}) == '{"z":3,"€":1,"😀":2}'
     common = dict(session_id="s", run_id="r", position=2, tool_call_id="c", name="refund")
-    as_float = approval_token(SECRET, arguments={"amount": 15.0, "big": 1e16}, **common)
-    as_int = approval_token(SECRET, arguments={"amount": 15, "big": 10**16}, **common)
+    as_float = approval_token(SECRET, arguments={"amount": 15.0, "big": 1e15}, **common)
+    as_int = approval_token(SECRET, arguments={"amount": 15, "big": 10**15}, **common)
     assert as_float == as_int  # what a jsonb store or a JavaScript service gives back
     for bad in (float("nan"), float("inf"), "half \ud83d"):
         with pytest.raises(ValueError):
@@ -415,8 +415,8 @@ async def test_a_call_whose_arguments_cannot_be_signed_is_refused_not_crashed():
 async def test_a_call_with_an_integer_beyond_a_double_is_refused_not_crashed():
     with pytest.raises(ValueError):
         canonical_json({"n": 10**400})  # float(10**400) raises OverflowError
-    assert canonical_json(2**53) == str(2**53) and canonical_json(10**16) == "10000000000000000"
-    for beyond in (2**53 + 1, -(2**53) - 1, 1234567890123456789):
+    assert canonical_json(2**53 - 1) == str(2**53 - 1)
+    for beyond in (2**53, 2**53 + 1, -(2**53), -(2**53) - 1, 10**16, 1234567890123456789):
         with pytest.raises(ValueError):  # a double would sign 1234567890123456829 the same
             canonical_json({"message_id": beyond})
     log: list[str] = []
@@ -452,15 +452,15 @@ def test_a_signed_pause_with_floats_jsonb_rewrites_resumes_on_postgres():
 
         store = PostgresStore(dsn, schema=schema, pool_size=2)
         log: list[str] = []
-        model = ScriptedModel([call("refund", order="A-1", amount=1e16), "Refund issued."])
+        model = ScriptedModel([call("refund", order="A-1", amount=1e15), "Refund issued."])
         agent = Agent(
             model, tools=[refund_tool(log)], permissions=Permissions(approval_secret=SECRET)
         )
         try:
             session = Session(store, id="user-1")
             pending = (await agent.run("Refund A-1", session=session)).pending_approvals[0]
-            # jsonb gives 1e16 back as the integer 10000000000000000
-            assert (await session.state()).pending_approvals[0].arguments["amount"] == 10**16
+            # jsonb gives 1e15 back as the safe integer 1000000000000000
+            assert (await session.state()).pending_approvals[0].arguments["amount"] == 10**15
             approval = Approval.for_call(pending)
             done = await agent.resume(session, approvals={pending.tool_call_id: approval})
             assert done.output == "Refund issued." and len(log) == 1

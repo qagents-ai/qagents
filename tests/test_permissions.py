@@ -347,3 +347,40 @@ async def test_an_approval_for_a_call_that_is_not_open_never_approves_a_later_ca
     result = await agent.resume(session, approvals={"call_0": True, "call_1": True})
     assert log == ["refund A 1.0"]  # call_1 of the next turn was never reviewed
     assert sorted(p.tool_call_id for p in result.pending_approvals) == ["call_0", "call_1"]
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+def test_signing_refuses_every_integer_outside_the_safe_json_range(sign):
+    from qagents.permissions import approval_token, canonical_json
+
+    common = dict(session_id="s", run_id="r", position=1, tool_call_id="c", name="send")
+    safe = sign * (2**53 - 1)
+    assert canonical_json(safe) == str(safe)
+    assert approval_token("test-key-at-least-sixteen", arguments={"n": safe}, **common)
+    for value in (sign * 2**53, sign * (2**53 + 1), sign * 10**16):
+        with pytest.raises(ValueError):
+            approval_token("test-key-at-least-sixteen", arguments={"n": value}, **common)
+
+
+@pytest.mark.parametrize("n", [2**53, 2**53 + 1])
+async def test_unsafe_integer_call_fails_closed_as_unsignable(n):
+    from qagents import prompts
+
+    executed = []
+
+    @tool(requires_approval=True)
+    def send(n: int) -> str:
+        """Send the numbered item."""
+        executed.append(n)
+        return "sent"
+
+    agent = Agent(
+        ScriptedModel([call("send", n=n), "refused"]),
+        tools=[send],
+        permissions=Permissions(approval_secret="test-key-at-least-sixteen"),
+    )
+    result = await agent.run("send")
+    refused = result.messages[2].tool_results[0]
+    assert refused.is_error
+    assert prompts.UNSIGNABLE_CALL in refused.content
+    assert executed == [] and result.pending_approvals == []
