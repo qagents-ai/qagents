@@ -6,7 +6,7 @@ import base64
 import hashlib
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -105,6 +105,42 @@ def digest(value: JSONValue) -> str:
     return hashlib.sha256(jcs(value)).hexdigest()
 
 
+def check_model_numbers(value: Any) -> None:
+    """Reject numeric loss before Pydantic's JSON conversion can replace it with null.
+
+    Other Python values, such as dates and UUIDs, retain their normal model JSON
+    conversion. This check complements strict JCS validation after serialization.
+    """
+    ancestors: set[int] = set()
+
+    def check(item: Any) -> None:
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("A non-finite number is not strict JSON; send it as a string.")
+        if isinstance(item, int) and not isinstance(item, bool) and abs(item) > 2**53 - 1:
+            raise ValueError("Integer outside the safe JSON range; send it as a string.")
+        if not isinstance(item, Mapping | list | tuple | set | frozenset):
+            return
+        identity = id(item)
+        if identity in ancestors:
+            raise ValueError("Cyclic objects are not JSON values.")
+        ancestors.add(identity)
+        try:
+            if isinstance(item, Mapping):
+                for key, child in item.items():
+                    check(key)
+                    check(child)
+            else:
+                for child in item:
+                    check(child)
+        finally:
+            ancestors.remove(identity)
+
+    try:
+        check(value)
+    except RecursionError as error:
+        raise ValueError("JSON nesting exceeds the interpreter's safe recursion depth.") from error
+
+
 @dataclass(frozen=True)
 class Frozen:
     """An independent JSON snapshot of the validated request, ready for the journal."""
@@ -122,6 +158,7 @@ def freeze(effect: Effect, request: BaseModel) -> Frozen:
     validated = effect.request_type.model_validate(
         request.model_dump(mode="python", warnings=False)
     )
+    check_model_numbers(validated.model_dump(mode="python", warnings="error"))
     data = validated.model_dump(mode="json", warnings="error")
     if not isinstance(data, dict):
         raise ValueError("An effect request must serialize as a JSON object.")

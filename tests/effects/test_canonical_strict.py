@@ -5,6 +5,8 @@ import json
 import struct
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
+from uuid import UUID
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -79,6 +81,28 @@ def test_shared_containers_allowed_but_cycles_refused():
 class Request(BaseModel):
     text: str
     values: list[int] = []
+
+
+@pytest.mark.parametrize("number", [float("nan"), float("inf"), -float("inf"), 2**53, -(2**53)])
+@pytest.mark.parametrize("container", [dict, list, tuple, set, frozenset])
+def test_freeze_rejects_unsafe_numbers_before_model_json_conversion(number, container):
+    class Nested(BaseModel):
+        value: Any
+
+    value = {"nested": number} if container is dict else container([number])
+    request = Nested(value={"outer": [value]})
+    with pytest.raises(ValueError, match="send it as a string"):
+        freeze(SimpleNamespace(name="nested", request_type=Nested), request)
+
+
+def test_numeric_guard_preserves_normal_pydantic_date_and_uuid_conversion():
+    class Converted(BaseModel):
+        at: datetime
+        id: UUID
+
+    request = Converted(at=datetime(2026, 1, 2, tzinfo=UTC), id=UUID(int=1))
+    frozen = freeze(SimpleNamespace(name="converted", request_type=Converted), request)
+    assert frozen.json == {"at": "2026-01-02T00:00:00Z", "id": str(request.id)}
 
 
 def test_freeze_rebuild_is_independent_and_digest_is_stable():
