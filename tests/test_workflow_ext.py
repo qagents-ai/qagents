@@ -488,3 +488,32 @@ async def test_run_agent_hands_every_event_to_on_event():
     assert result.output == "Done."
     assert seen[0] == "run_started" and seen[-1] == "run_finished"
     assert "tool_call_started" in seen and "tool_call_finished" in seen
+
+
+@pytest.mark.parametrize("later_open", [False, True])
+async def test_unrecorded_agent_step_recovers_its_bound_run_not_a_later_run(later_open):
+    store = DiesBeforeTheStepIsRecorded()
+    wf = Workflow(store, id="bound")
+    original = Agent(ScriptedModel(["original"], usage=Usage(input_tokens=13)), name="writer")
+    with pytest.raises(ConnectionError):
+        await wf.run_agent("write", original, "first prompt")
+    session = wf.session("write")
+    journal = await wf._journal.entries()
+    binding = next(e for e in journal if e.kind == "workflow_agent_started")
+    expected_run = next(e.run_id for e in await session.entries() if e.kind == "run_started")
+    if later_open:
+        await session.append("run_started", {"agent": "outsider"}, run_id="unrelated")
+        await session.append(
+            "message", {"message": Message.user("other prompt").model_dump()}, run_id="unrelated"
+        )
+    else:
+        await Agent(ScriptedModel(["other"], usage=Usage(input_tokens=99)), name="outsider").run(
+            "other prompt", session=session
+        )
+    again = Workflow(store, id="bound")
+    result = await again.run_agent("write", original, "ignored")
+    assert result.output == "original" and result.run_id == expected_run
+    assert result.usage.input_tokens == 13 and result.agent == "writer"
+    assert [m.text for m in result.messages] == ["first prompt", "original"]
+    assert binding.data["run_id"] == expected_run
+    assert len(original.model.requests) == 1

@@ -57,7 +57,7 @@ they do not know):
 | Kind | Meaning (data) |
 |---|---|
 | `workflow_step` | a step finished (`name`, `result`) |
-| `workflow_agent_started` | an agent step started its first run (`name`, `session_id`) |
+| `workflow_agent_started` | an agent step bound a run (`name`, `session_id`, `run_id`) |
 | `workflow_signal` | a signal was sent (`name`, `value`); the first value of a name wins |
 | `workflow_waiting` | the workflow stopped to wait for a signal (`signal`) |
 | `workflow_timer` | a durable timer was started (`name`, `due`, seconds since the epoch) |
@@ -170,6 +170,7 @@ class Workflow:
         self._completed: dict[str, Any] | None = None
         self._running: set[str] = set()
         self._agent_steps: set[str] | None = None
+        self._agent_runs: dict[str, str] = {}
         self._signals: dict[str, Any] = {}
         self._timers: dict[str, float] = {}
 
@@ -383,19 +384,24 @@ class Workflow:
             session = self.session(name)
             entries = await session.entries()
             current = derive_state(entries)
+            unrecorded = self._finished_unrecorded(name, session.id, entries)
+            if unrecorded is not None:  # the bound run completed before the step was recorded
+                await self._journal.append("workflow_step", {"name": name, "result": unrecorded})
+                completed[name] = unrecorded
+                return self._revive_result(name, unrecorded, agent)
             if current.open_run_id is not None and current.messages:
+                bound = self._agent_runs.get(name)
+                if bound is not None and current.open_run_id != bound:
+                    raise SessionError(
+                        f"Workflow step {name!r} belongs to run {bound!r}, but its session "
+                        f"has another open run {current.open_run_id!r}; nothing was resumed."
+                    )
+                await self._note_agent_step(name, session, current.open_run_id)
                 stream = agent.resume_stream(
                     session, approvals=approvals, results=results, state=state, **options
                 )
                 result = await _drive(stream, on_event)
             else:
-                unrecorded = self._finished_unrecorded(name, session.id, entries)
-                if unrecorded is not None:  # completed, then the process died: record it now
-                    await self._journal.append(
-                        "workflow_step", {"name": name, "result": unrecorded}
-                    )
-                    completed[name] = unrecorded
-                    return self._revive_result(name, unrecorded, agent)
                 if results:
                     raise SessionError(
                         f"Workflow {self.id!r}: step {name!r} has no open run, so the results= "
@@ -403,8 +409,8 @@ class Workflow:
                         "started, or its last run ended. Call run_agent without results= to "
                         "start it."
                     )
-                await self._note_agent_step(name, session)
                 stream = agent.stream(prompt, session=session, state=state, **options)
+                await self._note_agent_step(name, session, stream.run_id)
                 result = await _drive(stream, on_event)
             if result.status == "completed":
                 recorded = to_jsonable_python(result)
@@ -565,6 +571,8 @@ class Workflow:
             elif kind == "workflow_timer":
                 journal.timers.setdefault(data["name"], float(data["due"]))
             elif kind == "workflow_agent_started":
+                if isinstance(data.get("run_id"), str):
+                    self._agent_runs[data["name"]] = data["run_id"]
                 if data["name"] not in journal.agent_steps:
                     journal.agent_steps.append(data["name"])
         if self._completed is None:
@@ -593,26 +601,30 @@ class Workflow:
         finally:
             self._running.discard(name)
 
-    async def _note_agent_step(self, name: str, session: Session) -> None:
-        """Record an agent step's first run in the journal, so `status` can find it."""
+    async def _note_agent_step(self, name: str, session: Session, run_id: str) -> None:
+        """Bind the step to this run before it starts; retries record a new binding."""
         if self._agent_steps is None:
             await self._scan()
         assert self._agent_steps is not None
-        if name not in self._agent_steps:
-            self._agent_steps.add(name)
+        if self._agent_runs.get(name) != run_id:
             await self._journal.append(
-                "workflow_agent_started", {"name": name, "session_id": session.id}
+                "workflow_agent_started",
+                {"name": name, "session_id": session.id, "run_id": run_id},
             )
+            self._agent_steps.add(name)
+            self._agent_runs[name] = run_id
 
     def _finished_unrecorded(
         self, name: str, session_id: str, entries: list[Entry]
     ) -> dict[str, Any] | None:
-        """The recorded form of the step's latest run, when it completed but was not recorded."""
+        """Rebuild the bound run, falling back to the latest only for legacy journals."""
+        bound = self._agent_runs.get(name)
         start = next(
             (
                 index
                 for index in range(len(entries) - 1, -1, -1)
                 if entries[index].kind == "run_started"
+                and (bound is None or entries[index].run_id == bound)
             ),
             None,
         )
@@ -635,7 +647,9 @@ class Workflow:
         for entry in own:
             if entry.kind == "agent_switched":
                 agent_name = entry.data.get("agent", agent_name)
-        state = derive_state(entries)
+        finish_index = entries.index(finish)
+        own = [entry for entry in entries[start : finish_index + 1] if entry.run_id == run_id]
+        state = derive_state(entries[: finish_index + 1])
         usage = state.run_usage
         if added := data.get("added_usage"):
             usage = usage.add(Usage.model_validate(added))
