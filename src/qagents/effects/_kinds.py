@@ -107,6 +107,7 @@ class IntentTiming(
     window_s: float | None
     margin_s: float | None
     unique: bool
+    concurrent: Literal["rejects", "waits", "unknown"] = "unknown"
 
 
 class EffectIntentData(EffectRefData):

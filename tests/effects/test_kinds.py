@@ -47,6 +47,7 @@ def test_legacy_additions_default_without_shared_mutable_values():
     patch = kinds.StatePatchData()
     patch.set["one"] = 1
     assert kinds.StatePatchData().set == {}
+    assert kinds.EffectIntentData.model_validate(intent()).timing.concurrent == "unknown"
 
 
 def test_kind_sets_and_capability_markers():
