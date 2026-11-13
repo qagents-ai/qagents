@@ -43,10 +43,12 @@ from . import prompts
 from .agent import Agent, Limits, RunStream
 from .context import Compactor, CompactorChain, SummarizingCompactor, ToolResultClearing
 from .errors import (
+    ApprovalConflictError,
     ApprovalTokenError,
     ConfigurationError,
     DeferToolCall,
     GuardrailTripped,
+    HeldEffectsError,
     LeaseError,
     MaxDepthExceeded,
     ModelError,
@@ -55,6 +57,7 @@ from .errors import (
     QAgentsError,
     RunInterrupted,
     SessionError,
+    SettlementConflict,
     ToolError,
     WorkflowSuspended,
 )
@@ -151,6 +154,7 @@ __all__ = [
     "Agent",
     "AgentRuntime",
     "Approval",
+    "ApprovalConflictError",
     "ApprovalTokenError",
     "Compactor",
     "CompactorChain",
@@ -159,6 +163,7 @@ __all__ = [
     "DeferToolCall",
     "FallbackModel",
     "GuardrailTripped",
+    "HeldEffectsError",
     "Hooks",
     "ImagePart",
     "InMemoryStore",
@@ -191,6 +196,7 @@ __all__ = [
     "SessionError",
     "SessionStatus",
     "SessionStore",
+    "SettlementConflict",
     "SummarizingCompactor",
     "TextPart",
     "Tool",

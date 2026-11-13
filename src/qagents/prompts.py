@@ -1359,3 +1359,39 @@ servers over HTTP."""
 DEVVI_EXPOSE_FAILED = "{name}: expose_tools: {error}"
 """The in-process tool server of a turn (ACP transport, ``expose_tools``) did not start:
 ``error`` is a ``TOOL_SERVER_*`` setup text such as `TOOL_SERVER_DUPLICATE_NAME`."""
+
+EFFECT_OUTCOME_UNKNOWN = (
+    "EFFECT_OUTCOME_UNKNOWN: the outcome of {effect} for {key} is unknown: it may or may not "
+    "have been done. It is held for checking; do not try it again. "
+    "Already done in this call: {committed}."
+)
+EFFECT_CLOSED_UNKNOWN = (
+    "EFFECT_CLOSED_UNKNOWN: {effect} for {key} was closed by an operator with its outcome "
+    "unknown ({reason}). Do not try it again."
+)
+EFFECT_HELD_BY_NEW_RUN = (
+    "EFFECT_HELD_BY_NEW_RUN: this call did not finish in an earlier run. Its effect {effect} "
+    "for {key} is held for checking; do not try it again."
+)
+EFFECT_REJECTED = "{effect} for {key} was refused by the destination; nothing was done: {error}"
+EFFECT_NOT_APPLIED = "{effect} for {key} was not done (recorded by an operator: {evidence})."
+EFFECT_CONFLICT = (
+    "{effect} for {key} already holds a different request ({status}); this request was not sent."
+)
+EFFECT_RECEIPT_UNSTORABLE = (
+    "{effect} for {key} was done, but its receipt could not be stored ({error}). "
+    "Do not try it again."
+)
+EFFECT_TOOL_TIMEOUT = (
+    "The tool timed out after {seconds:g} s. These were done before it stopped: {committed}. "
+    "Do not repeat them."
+)
+EFFECT_TOOL_TIMEOUT_NONE = (
+    "The tool timed out after {seconds:g} s, before any of its effects was done."
+)
+EFFECT_ARGUMENTS_NOT_CANONICAL = (
+    "{name!r} was not run: its arguments have no canonical JSON (NaN, an infinity, an "
+    "integer beyond 2^53 - 1 or a lone surrogate). Send large integers as strings."
+)
+APPROVAL_SCOPE_CHANGED = "A hook changed the arguments of this approved call, so it was not run."
+EFFECT_NONE_DONE = "nothing"
