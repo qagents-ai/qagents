@@ -355,3 +355,40 @@ def test_owner_token_is_unique_for_each_acquisition_by_the_same_worker():
         assert prefix == "worker-a"
         assert len(suffix) == 32
         assert int(suffix, 16) >= 0
+
+
+@pytest.mark.parametrize("steal", [False, True])
+async def test_a_direct_run_stops_active_work_when_renewal_refuses(monkeypatch, steal):
+    from qagents.errors import LeaseError
+    from qagents.models.testing import FunctionModel
+
+    monkeypatch.setattr("qagents.agent.RUN_LEASE_TTL_S", 0.09)
+    cancelled = asyncio.Event()
+
+    class RefusingStore(InMemoryStore):
+        async def renew_lease(self, session_id, owner, ttl):
+            if steal:
+                await self.release_lease(session_id, owner)
+                assert await self.acquire_lease(session_id, "other", 10)
+            return False
+
+    async def reply(request):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    store = RefusingStore()
+    session = Session(store)
+    running = asyncio.create_task(Agent(FunctionModel(reply)).run("go", session=session))
+    try:
+        if steal:
+            with pytest.raises(LeaseError):
+                await asyncio.wait_for(running, timeout=1)
+        else:
+            result = await asyncio.wait_for(running, timeout=1)
+            assert result.status == "cancelled" and result.stop_reason == "lease_lost"
+        assert cancelled.is_set()
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)

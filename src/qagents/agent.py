@@ -1283,8 +1283,9 @@ class _Run:
             except Exception:
                 logger.warning("Could not renew the lease of run %s; retrying", self.run_id)
                 continue
-            if not held:  # the next write fails with LeaseError, which stops the run
+            if not held:
                 logger.error("Run %s lost the lease on session %r", self.run_id, self.session.id)
+                self.cancel("lease_lost")  # interrupt active work, not just its next write
                 return
 
     async def _unclaim(self) -> None:
