@@ -30,7 +30,8 @@ Signed pauses: with ``Permissions(approval_secret=...)`` every paused call
 (`PendingApproval` and `PendingInput`) carries a ``token``, an HMAC-SHA256 of
 the kind of pause, the session id, the run id, the position of the call's
 message in the run, the call id, the tool name and the arguments (for a
-`PendingInput` also its ``reason`` and ``metadata``); see `approval_token`.
+`PendingInput` also its ``reason`` and ``metadata``). Version 3 additionally
+binds the durable operation identity and ask number; see `approval_token`.
 ``agent.resume`` accepts an approval or a result for such a call only with
 that token, and only while the call recorded in the journal still matches it;
 otherwise it raises `ApprovalTokenError` before anything runs. Someone who can
@@ -69,7 +70,6 @@ import json
 import logging
 import math
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from decimal import Decimal
 from fnmatch import fnmatchcase
 from typing import Any, Literal
 
@@ -77,8 +77,8 @@ from pydantic import BaseModel, ConfigDict
 from pydantic_core import to_jsonable_python
 
 from . import prompts
-from .effects._canonical import JSONValue
-from .effects._kinds import ApprovalRecord as ApprovalRecord
+from .effects._canonical import JSONValue, digest, jcs
+from .effects._kinds import APPROVAL_MAC_FIELDS, ApprovalRecord
 from .effects._types import EffectRecord, Settle
 from .errors import ConfigurationError
 from .messages import ToolCallPart
@@ -89,6 +89,7 @@ logger = logging.getLogger("qagents.permissions")
 
 Behavior = Literal["allow", "ask", "deny"]
 Mode = Literal["default", "allow_all", "ask_all", "read_only"]
+APPROVAL_TOKEN_VERSION = 3
 
 
 class Decision(BaseModel):
@@ -97,10 +98,11 @@ class Decision(BaseModel):
 
 
 class Approval(BaseModel):
-    """A human's answer to an approval request."""
+    """An application-supplied answer to an approval request."""
 
     approved: bool
     by: str | None = None
+    """Reviewer identity asserted and authenticated by the host application."""
     reason: str | None = None
     """Why the call was declined; the model reads it as the call's result."""
     arguments: dict[str, Any] | None = None
@@ -127,6 +129,7 @@ class Approval(BaseModel):
         Args:
             pending: The call from ``result.pending_approvals``.
             approved: Whether the call may run.
+            by: Reviewer identity asserted by the application.
             reason: Why it was declined, for the model.
             arguments: Arguments to run the tool with instead of the model's.
         """
@@ -211,14 +214,26 @@ class Permissions:
                 only answers that carry the pause's token, for calls the journal
                 still records unchanged. Use at least 16 random bytes, for
                 example ``secrets.token_hex(32)``, and keep it out of the code.
+            approval_ttl_s: Decision validity from the recorded store time, in seconds.
+            authorize_settlement: Host policy for operator answers; may be asynchronous.
+            resend_min_age_s: Minimum operator resend age, in store-clock seconds.
 
         Raises:
             ConfigurationError: ``approval_secret`` is not text or bytes, or is
                 shorter than 16 bytes.
         """
-        self.approval_ttl_s = approval_ttl_s
+        for setting, value, positive in (
+            ("approval_ttl_s", approval_ttl_s, True),
+            ("resend_min_age_s", resend_min_age_s, False),
+        ):
+            if not _finite_number(value) or value < 0 or (positive and value == 0):
+                bound = "positive" if positive else "nonnegative"
+                raise ConfigurationError(f"{setting} must be a finite {bound} number.")
+        if authorize_settlement is not None and not callable(authorize_settlement):
+            raise ConfigurationError("authorize_settlement must be callable or None.")
+        self.approval_ttl_s = float(approval_ttl_s)
         self.authorize_settlement = authorize_settlement
-        self.resend_min_age_s = resend_min_age_s
+        self.resend_min_age_s = float(resend_min_age_s)
         self.mode: Mode = mode
         self.allow = tuple(allow)
         self.ask = tuple(ask)
@@ -275,13 +290,55 @@ class Permissions:
         arguments_changed: bool = False,
         arguments_changed_by: str | None = None,
     ) -> ApprovalRecord:
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
+        """Record a decision and, when configured, a tamper-evident HMAC.
+
+        The application asserts who approved. Runtime policy separately checks
+        the current deny rules, tool specification and store-clock expiry.
+        """
+        identity = _decision_id(session_id, run_id, operation_id, call.id, ask)
+        if type(approved) is not bool or type(arguments_changed) is not bool:
+            raise ValueError("Decision and argument-change flags must be bool.")
+        if not _finite_number(decided_at):
+            raise ValueError("decided_at must be a finite store-clock number.")
+        expires_at = decided_at + self.approval_ttl_s
+        if not math.isfinite(expires_at):
+            raise ValueError("Decision expiry exceeds the finite store-clock range.")
+        if call.name != tool.name:
+            raise ValueError("A decision must name the tool whose call was reviewed.")
+        snapshot = json.loads(jcs(dict(call.arguments)))
+        result = ApprovalRecord(
+            approval_id=identity,
+            session_id=session_id,
+            run_id=run_id,
+            operation_id=operation_id,
+            ask=ask,
+            tool_call_id=call.id,
+            name=tool.name,
+            approved=approved,
+            reason=reason,
+            by=by,
+            arguments_digest=arguments_digest(snapshot),
+            tool_spec_digest=tool_spec_digest(tool),
+            decided_at=decided_at,
+            expires_at=expires_at,
+            mac=None,
+            arguments_changed=arguments_changed,
+            arguments=snapshot if arguments_changed else None,
+            arguments_changed_by=arguments_changed_by,
+        )
+        if self._approval_key is not None:
+            result.mac = _decision_mac(self._approval_key, result)
+        return result
 
     def verify_decision(self, record: ApprovalRecord) -> bool:
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
+        """Verify v3 identity, optional argument snapshot and MAC; read no wall clock."""
+        return self._approval_key is not None and _mac_valid(self._approval_key, record)
 
     def sign_settlement(self, fields: Mapping[str, JSONValue]) -> str | None:
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
+        """Sign the supplied canonical settlement fields, or return None without a secret."""
+        if self._approval_key is None:
+            return None
+        return hmac.new(self._approval_key, jcs(dict(fields)), hashlib.sha256).hexdigest()
 
     async def decide(self, ctx: RunContext[Any], tool: Tool, call: ToolCallPart) -> Decision:
         name = tool.name
@@ -350,24 +407,35 @@ def approval_token(
     """HMAC-SHA256, as hex, of the canonical JSON of one paused call.
 
     The payload is the RFC 8785 (JCS) canonical JSON, encoded as UTF-8, of an
-    object with the keys ``v`` (``2``), ``kind`` (``"approval"`` or
+    object with the keys ``v`` (``3``), ``kind`` (``"approval"`` or
     ``"input"``), ``session_id``, ``run_id``, ``position`` (how many messages
     the run had journaled when the call's assistant message joined it, that
     message included), ``tool_call_id``, ``name`` and ``arguments``; a pause
     of kind ``"input"`` also has ``reason`` and ``metadata``. JCS sorts the
     keys, leaves out spaces and writes numbers as JavaScript does (``15.0``
     is written ``15``), so another service that holds the secret can compute
-    the same token with any JCS implementation. Values that are not JSON are
-    first turned into their ``str()``, which only Python reproduces.
+    the same token with any JCS implementation. Version 3 also binds the
+    durable ``operation_id`` and ``ask`` number, so an earlier answer cannot
+    authorize a re-ask. Non-JSON values are refused.
+
+    Explicit ``v=2`` retains the legacy payload and string fallback for old
+    pauses. The caller must select it only for journals without approvals/3;
+    there is no automatic downgrade when a v3 token fails verification.
 
     Raises:
         ValueError: A value has no canonical JSON: NaN, an infinity, an
             integer that a double cannot hold exactly, or a string with a lone
             surrogate.
     """
+    if type(v) is not int or v not in (2, 3):
+        raise ValueError("Approval token version must be 2 or 3.")
+    if type(ask) is not int or ask < 1:
+        raise ValueError("Approval ask must be a positive integer.")
+    if operation_id is not None and (not isinstance(operation_id, str) or not operation_id):
+        raise ValueError("operation_id must be a nonempty string or None.")
     key = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
     payload: dict[str, Any] = {
-        "v": 2,
+        "v": v,
         "kind": kind,
         "session_id": session_id,
         "run_id": run_id,
@@ -379,7 +447,11 @@ def approval_token(
     if kind == "input":
         payload["reason"] = reason
         payload["metadata"] = dict(metadata or {})
-    text = canonical_json(to_jsonable_python(payload, fallback=str))
+    if v == 3:
+        payload.update(operation_id=operation_id, ask=ask)
+    else:
+        payload = to_jsonable_python(payload, fallback=str)
+    text = canonical_json(payload)
     return hmac.new(key, text.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -392,59 +464,88 @@ def canonical_json(value: Any) -> str:
             string with a lone surrogate, or a value that is not JSON (dicts,
             lists, strings, numbers, bools, None).
     """
-    if value is None or isinstance(value, bool):
-        return json.dumps(value)
-    if isinstance(value, int):
-        if abs(value) > 2**53 - 1:
-            raise ValueError(
-                "This integer is outside the safe JSON range, so a call with it cannot be signed."
-            )
-        return str(value)
-    if isinstance(value, float):
-        return _es_number(value)
-    if isinstance(value, str):
-        value.encode("utf-8")  # a lone surrogate raises UnicodeEncodeError, a ValueError
-        return json.dumps(value, ensure_ascii=False)
-    if isinstance(value, list | tuple):
-        return "[" + ",".join(canonical_json(item) for item in value) + "]"
-    if isinstance(value, dict):
-        members = [
-            f"{canonical_json(key)}:{canonical_json(value[key])}"
-            for key in sorted(value, key=_utf16_key)
-        ]
-        return "{" + ",".join(members) + "}"
-    raise ValueError(f"{type(value).__name__} is not a JSON value.")
+    return jcs(value).decode("utf-8")
 
 
-def _utf16_key(key: Any) -> bytes:
-    """JCS sorts object keys by their UTF-16 code units."""
-    if not isinstance(key, str):
-        raise ValueError(f"JSON object keys are strings, not {type(key).__name__}.")
-    return key.encode("utf-16-be")
+def arguments_digest(arguments: Mapping[str, Any]) -> str:
+    """Bind a decision to the exact canonical arguments that the tool will receive."""
+    return digest(dict(arguments))
 
 
-def _es_number(number: float) -> str:
-    """A number as JavaScript's ``Number.prototype.toString`` writes it, as JCS requires."""
-    if math.isnan(number) or math.isinf(number):
-        raise ValueError(f"{number!r} has no JSON form, so a call with it cannot be signed.")
-    if number == 0:
-        return "0"  # -0.0 included
-    _, digit_tuple, exponent = Decimal(repr(abs(number))).as_tuple()
-    assert isinstance(exponent, int)
-    written = "".join(map(str, digit_tuple))
-    digits = written.rstrip("0")
-    k = len(digits)
-    n = exponent + len(written)  # the value is 0.<digits> times 10**n
-    if k <= n <= 21:
-        text = digits + "0" * (n - k)
-    elif 0 < n <= 21:
-        text = f"{digits[:n]}.{digits[n:]}"
-    elif -6 < n <= 0:
-        text = "0." + "0" * -n + digits
-    else:
-        mantissa = digits[0] + (f".{digits[1:]}" if k > 1 else "")
-        text = f"{mantissa}e{'+' if n > 0 else '-'}{abs(n - 1)}"
-    return ("-" if number < 0 else "") + text
+def tool_spec_digest(tool: Tool) -> str:
+    """Bind name, description, argument schema, flags and declared effect versions."""
+    return digest(
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+            "requires_approval": tool.requires_approval,
+            "read_only": tool.read_only,
+            "idempotent": tool.idempotent,
+            "strict": tool.strict,
+            "deferred": tool.deferred,
+            "timeout": tool.timeout,
+            "takes_context": tool.takes_context,
+            "effects": [
+                {"name": effect.name, "version": effect.version}
+                for effect in getattr(tool, "effects", ())
+            ],
+        }
+    )
+
+
+def _decision_id(
+    session_id: str, run_id: str, operation_id: str, tool_call_id: str, ask: int
+) -> str:
+    """Bind operation_id and ask through the already-signed approval_id field."""
+    if any(
+        not isinstance(value, str) or not value
+        for value in (session_id, run_id, operation_id, tool_call_id)
+    ):
+        raise ValueError("Decision identities must be nonempty strings.")
+    if type(ask) is not int or ask < 1:
+        raise ValueError("Approval ask must be a positive integer.")
+    return "ap1:" + digest([session_id, run_id, operation_id, tool_call_id, ask])
+
+
+def _finite_number(value: Any) -> bool:
+    try:
+        return (
+            not isinstance(value, bool) and isinstance(value, int | float) and math.isfinite(value)
+        )
+    except OverflowError:
+        return False
+
+
+def _decision_mac(key: bytes, record: ApprovalRecord) -> str:
+    fields = {name: getattr(record, name) for name in APPROVAL_MAC_FIELDS}
+    return hmac.new(key, jcs(fields), hashlib.sha256).hexdigest()
+
+
+def _mac_valid(key: bytes, record: ApprovalRecord) -> bool:
+    """M14 seam: verify the decision MAC and bindings before runtime reuse."""
+    if not isinstance(record, ApprovalRecord):
+        return False
+    try:
+        if record.v != APPROVAL_TOKEN_VERSION or record.approval_id != _decision_id(
+            record.session_id, record.run_id, record.operation_id, record.tool_call_id, record.ask
+        ):
+            return False
+        if record.arguments_changed and record.arguments is None:
+            return False
+        if (
+            record.arguments is not None
+            and arguments_digest(record.arguments) != record.arguments_digest
+        ):
+            return False
+        expected = _decision_mac(key, record)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return (
+        isinstance(record.mac, str)
+        and record.mac.isascii()
+        and hmac.compare_digest(record.mac, expected)
+    )
 
 
 def _approval_key(secret: str | bytes | None) -> bytes | None:
@@ -480,11 +581,3 @@ def _as_decision(answer: Any) -> Decision | None:
         return Decision(behavior=answer)
     logger.error("can_use_tool returned %r, which is not a decision; refusing the call", answer)
     return Decision(behavior="deny", reason=prompts.PERMISSION_REASON_CHECK_FAILED)
-
-
-def arguments_digest(arguments: Mapping[str, Any]) -> str:
-    raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-
-def tool_spec_digest(tool: Tool) -> str:
-    raise NotImplementedError("Effects implementation is pending its owning stage.")

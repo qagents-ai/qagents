@@ -33,10 +33,11 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, create_model
 from pydantic_core import to_jsonable_python
 
 from . import prompts
+from .effects import _canonical
 from .effects._declare import Effect
 from .effects._ports import CallScope
 from .effects._types import RecT, ReqT
@@ -69,16 +70,51 @@ ThreadObserver = Callable[[concurrent.futures.Future[Any]], None]
 
 
 def set_thread_observer(observer: ThreadObserver | None) -> ThreadObserver | None:
-    raise NotImplementedError("Thread accounting is pending its owning stage.")
+    """Replace the process-wide thread-start observer; return the previous observer.
+
+    Registration runs on the calling loop, after its result wrapper exists and
+    before the worker may enter user code. Observers must not block for the result.
+    """
+    global _THREAD_OBSERVER
+    if observer is not None and not callable(observer):
+        raise TypeError("Thread observer must be callable or None.")
+    with _LOCK:
+        previous, _THREAD_OBSERVER = _THREAD_OBSERVER, observer
+        return previous
 
 
 class ThreadSlot:
+    """One reservation consumed by start_thread, or explicitly released without a send."""
+
+    def __init__(self) -> None:
+        self._reserved = False  # only reserve_thread admits a slot
+
     def release(self) -> None:
-        raise NotImplementedError("Thread reservation is pending its owning stage.")
+        """Release an unused reservation; repeated release after use is harmless."""
+        global _RESERVED
+        with _LOCK:
+            if self._reserved:
+                self._reserved = False
+                _RESERVED -= 1
 
 
 def reserve_thread() -> ThreadSlot | None:
-    raise NotImplementedError("Thread reservation is pending its owning stage.")
+    """Reserve admission before an intent; refuse a pool occupied by abandoned work.
+
+    Healthy active calls may still queue. A reservation guarantees admission,
+    not an immediately idle operating-system thread.
+    """
+    global _RESERVED
+    with _LOCK:
+        _executor_locked()
+        # A result may reach the loop just before _release runs on its worker.
+        _ABANDONED.difference_update(thread for thread in tuple(_ABANDONED) if thread.done())
+        if len(_ABANDONED) + _RESERVED >= _EXECUTOR_SIZE:
+            return None
+        slot = ThreadSlot()
+        slot._reserved = True
+        _RESERVED += 1
+        return slot
 
 
 def start_thread(
@@ -88,7 +124,58 @@ def start_thread(
     slot: ThreadSlot | None = None,
     **kwargs: Any,
 ) -> tuple[asyncio.Future[Any], concurrent.futures.Future[Any]]:
-    raise NotImplementedError("Thread dispatch is pending its owning stage.")
+    """Copy context and start work after wrapper and observer registration.
+
+    The concurrent future exposes its actual worker id as _qagents_thread_id
+    before user code starts. Only the harness uses this private ownership seam.
+    """
+    global _RESERVED
+    loop = asyncio.get_running_loop()
+    if slot is None:
+        slot = reserve_thread()
+        if slot is None:
+            with _LOCK:
+                count = len(_ABANDONED) + _RESERVED
+            raise ToolError(prompts.TOOL_THREADS_EXHAUSTED.format(name=name, count=count))
+    if not isinstance(slot, ThreadSlot):
+        raise ConfigurationError("start_thread requires a reserved ThreadSlot.")
+    context = contextvars.copy_context()
+    ready = threading.Event()
+    admitted = False
+    thread: concurrent.futures.Future[Any] | None = None
+    wrapped: asyncio.Future[Any] | None = None
+
+    def run() -> Any:
+        ready.wait()
+        if not admitted:
+            return None  # registration failed: never enter application code
+        assert thread is not None
+        thread._qagents_thread_id = threading.get_ident()  # type: ignore[attr-defined]
+        return context.run(function, *args, **kwargs)
+
+    try:
+        with _LOCK:
+            if not slot._reserved:
+                raise ConfigurationError("ThreadSlot was released or already consumed.")
+            slot._reserved = False
+            _RESERVED -= 1
+            thread = _executor_locked().submit(run)
+            observer = _THREAD_OBSERVER
+        # _chain_future registers delivery before the observer adds its callback.
+        wrapped = asyncio.wrap_future(thread, loop=loop)
+        if observer is not None:
+            observer(thread)
+        admitted = True
+        return wrapped, thread
+    except BaseException:
+        slot.release()
+        if thread is not None:
+            thread.cancel()
+        if wrapped is not None:
+            wrapped.cancel()
+        raise
+    finally:
+        ready.set()
 
 
 @dataclass
@@ -149,22 +236,64 @@ class RunContext(Generic[DepsT]):
     """The run this context belongs to; a child run reads its remaining limits."""
 
     _call: CallScope | None = field(default=None, repr=False, compare=False)
+    _memo_running: set[str] = field(default_factory=set, repr=False, compare=False)
 
     async def perform(
         self, effect: Effect[ReqT, RecT], request: ReqT, *, occurrence: int | None = None
     ) -> RecT:
-        raise NotImplementedError("Effect dispatch is pending runtime integration.")
+        """Perform a declared effect from an authorized tool body."""
+        if self._call is None:
+            raise ConfigurationError(
+                "perform may only be called from the body of a tool that lists the effect "
+                "in effects=[...]; hooks may not call it."
+            )
+        from .effects import _engine
+
+        return await _engine.perform(effect, request, scope=self._call, occurrence=occurrence)
 
     async def memo(self, name: str, function: Callable[[], Any], *, type: Any = None) -> Any:
-        raise NotImplementedError("Durable memo is pending runtime integration.")
+        """Record a JSON value once per call and revive it on rerun with ``type``.
+
+        Use pure computations or reads: a function interrupted before journaling
+        runs again. As in Workflow.step, a sync function runs on the event loop;
+        return an awaitable for blocking work. Concurrent reuse of a name is refused.
+        """
+        scope = self._call
+        if scope is None:
+            raise ConfigurationError("memo may only be called from a tool body.")
+        if not isinstance(name, str) or not name:
+            raise ConfigurationError("memo requires a nonempty name.")
+        if name in scope.memos:
+            value = copy.deepcopy(scope.memos[name])
+            return value if type is None else TypeAdapter(type).validate_python(value)
+        if name in self._memo_running:
+            raise ConfigurationError(f"Memo {name!r} is already running in this tool call.")
+        self._memo_running.add(name)
+        try:
+            result = function()
+            if inspect.isawaitable(result):
+                result = await result
+            # The Python dump traverses models nested in containers without
+            # JSON mode's silent NaN/Infinity -> null conversion.
+            _canonical.check_model_numbers(
+                TypeAdapter(Any).dump_python(result, mode="python", warnings="error")
+            )
+            recorded = to_jsonable_python(result)
+            _canonical.jcs(recorded)  # refuse non-finite or lossy values before journaling
+            revived = result if type is None else TypeAdapter(type).validate_python(recorded)
+            await scope.record_memo(name, copy.deepcopy(recorded))
+            scope.memos[name] = copy.deepcopy(recorded)
+            return revived
+        finally:
+            self._memo_running.discard(name)
 
     @property
     def tool_attempt(self) -> int:
-        return 1
+        return self._call.tool_attempt if self._call is not None else 1
 
     @property
     def is_rerun(self) -> bool:
-        return False
+        return self.tool_attempt > 1
 
     def emit(self, event: Any) -> None:
         """Put a custom event on the run's event stream (from inside a tool).
@@ -357,6 +486,10 @@ class RunContext(Generic[DepsT]):
                 the entries already have (or ``usage``, which a resume would
                 count as model usage), or ``tags`` or ``metadata`` is not JSON.
         """
+        if tool.effects:
+            raise ConfigurationError(
+                "RunContext.call_tool cannot dispatch effects tools outside the owned call scope."
+            )
         run = self._run
         outside = getattr(run, "_outside_call", None)
         if outside is None or self.tool_call_id is None:
@@ -409,6 +542,9 @@ class RunContext(Generic[DepsT]):
 class Tool:
     """A callable the model can invoke. Build one with `tool`."""
 
+    effects: tuple[Effect, ...]
+    origin: str | None
+
     def __init__(
         self,
         function: Callable[..., Any],
@@ -431,6 +567,12 @@ class Tool:
             )
         self.function = function
         self.effects = tuple(effects)
+        if any(not isinstance(effect, Effect) for effect in self.effects):
+            raise ConfigurationError("Tool effects must contain declared Effect objects.")
+        if self.effects and (read_only or deferred or not _is_async_callable(function)):
+            raise ConfigurationError(
+                "An effects tool must have an async body and cannot be read_only or deferred."
+            )
         self.origin: str | None = None
         self.name = name
         self.description = description
@@ -499,8 +641,10 @@ class Tool:
                     result = await self.function(*args, **kwargs)
                 else:
                     # A thread cannot be stopped: on timeout the call is abandoned, not killed.
-                    thread = _run_in_thread(self.name, self.function, args, kwargs)
-                    result = await asyncio.wrap_future(thread)
+                    wrapped, thread = start_thread(
+                        self.name, functools.partial(self.function, *args, **kwargs)
+                    )
+                    result = await wrapped
                 if inspect.isawaitable(result):  # a sync wrapper around a coroutine function
                     result = await result
         except TimeoutError:
@@ -555,29 +699,23 @@ class ToolTimeout(TimeoutError):
 
 _EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
 _EXECUTOR_SIZE = 0
+_RESERVED = 0
+_THREAD_OBSERVER: ThreadObserver | None = None
 _ABANDONED: set[concurrent.futures.Future[Any]] = set()
 """Calls of sync tools that were given up (timed out, or their run was cancelled or
 timed out) and still hold a worker thread."""
 _LOCK = threading.Lock()
 
 
-def _run_in_thread(
-    name: str, function: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
-) -> concurrent.futures.Future[Any]:
-    """Start ``function`` on a worker thread, with the caller's context variables."""
+def _executor_locked() -> concurrent.futures.ThreadPoolExecutor:
+    """Get the pool while _LOCK is held."""
     global _EXECUTOR, _EXECUTOR_SIZE
-    with _LOCK:
-        if _EXECUTOR is None:
-            _EXECUTOR_SIZE = max(1, TOOL_THREADS)
-            _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-                max_workers=_EXECUTOR_SIZE, thread_name_prefix="qagents-tool"
-            )
-        stuck = len(_ABANDONED)
-        if stuck >= _EXECUTOR_SIZE:
-            # A new call would only queue behind threads that may never return: refuse it.
-            raise ToolError(prompts.TOOL_THREADS_EXHAUSTED.format(name=name, count=stuck))
-        context = contextvars.copy_context()
-        return _EXECUTOR.submit(context.run, functools.partial(function, *args, **kwargs))
+    if _EXECUTOR is None:
+        _EXECUTOR_SIZE = max(1, TOOL_THREADS)
+        _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_EXECUTOR_SIZE, thread_name_prefix="qagents-tool"
+        )
+    return _EXECUTOR
 
 
 _ON_ABANDONED: contextvars.ContextVar[Callable[[concurrent.futures.Future[Any]], None] | None] = (
@@ -685,7 +823,12 @@ def tool(
             the run as a `PendingInput`; its result comes from
             ``agent.resume(session, results={tool_call_id: value})``. Use it for
             work done outside the process: a human's answer, an external job.
+        effects: Declared effects the async body may perform. An effects tool
+            never runs beside another tool and cannot be read_only or deferred.
+        timeout_s: Alias for timeout; specifying both is an error.
     """
+    if timeout is not None and timeout_s is not None:
+        raise ConfigurationError("Specify only one of timeout and timeout_s.")
 
     def build(target: Callable[..., Any]) -> Tool:
         return _tool_from_function(

@@ -4830,14 +4830,14 @@ validated against the signature before your code runs:
 
 ## Members
 - `prompts` (module): Every piece of text qagents itself puts in front of a model.
-- `ThreadSlot` (class)
+- `ThreadSlot` (class): One reservation consumed by start_thread, or explicitly released without a send.
 - `RunContext` (class): What a tool, hook or instructions function can know about the current run.
 - `Tool` (class): A callable the model can invoke.
 - `ToolTimeout` (class): A tool call took longer than its timeout (raised by `Tool.run`).
 - `Toolkit` (class): A source of tools that is resolved when a run starts.
-- `set_thread_observer(observer: ThreadObserver | None) -> ThreadObserver | None` (function)
-- `reserve_thread() -> ThreadSlot | None` (function)
-- `start_thread(name, function, *args, slot, **kwargs) -> tuple[asyncio.Future[Any], concurrent.futures.Future[Any]]` (function)
+- `set_thread_observer(observer: ThreadObserver | None) -> ThreadObserver | None` (function): Replace the process-wide thread-start observer; return the previous observer.
+- `reserve_thread() -> ThreadSlot | None` (function): Reserve admission before an intent; refuse a pool occupied by abandoned work.
+- `start_thread(name, function, *args, slot, **kwargs) -> tuple[asyncio.Future[Any], concurrent.futures.Future[Any]]` (function): Copy context and start work after wrapper and observer registration.
 - `tool(function, *, name, description, requires_approval, read_only, idempotent, timeout, strict, deferred, effe...)` (function): Turn a function into a `Tool`.
 - `render_tool_output(value: Any) -> str` (function): The text a model reads for a tool's return value.
 - `TOOL_THREADS` (attribute): Worker threads that run sync tool functions.
@@ -4885,7 +4885,8 @@ Signed pauses: with ``Permissions(approval_secret=...)`` every paused call
 (`PendingApproval` and `PendingInput`) carries a ``token``, an HMAC-SHA256 of
 the kind of pause, the session id, the run id, the position of the call's
 message in the run, the call id, the tool name and the arguments (for a
-`PendingInput` also its ``reason`` and ``metadata``); see `approval_token`.
+`PendingInput` also its ``reason`` and ``metadata``). Version 3 additionally
+binds the durable operation identity and ask number; see `approval_token`.
 ``agent.resume`` accepts an approval or a result for such a call only with
 that token, and only while the call recorded in the journal still matches it;
 otherwise it raises `ApprovalTokenError` before anything runs. Someone who can
@@ -4917,13 +4918,13 @@ not act on it (for example by polling a job id from it) before that.
 ## Members
 - `prompts` (module): Every piece of text qagents itself puts in front of a model.
 - `Decision` (class)
-- `Approval` (class): A human's answer to an approval request.
+- `Approval` (class): An application-supplied answer to an approval request.
 - `InputResult` (class): The result of a call that waits for input, with the token of its signed pause.
 - `Permissions` (class): Rules for tool calls.
 - `approval_token(secret, *, session_id, run_id, position, tool_call_id, name, arguments, kind, reason, metadata, operation...)` (function): HMAC-SHA256, as hex, of the canonical JSON of one paused call.
 - `canonical_json(value: Any) -> str` (function): The RFC 8785 (JCS) canonical JSON of a JSON value.
-- `arguments_digest(arguments: Mapping[str, Any]) -> str` (function)
-- `tool_spec_digest(tool: Tool) -> str` (function)
+- `arguments_digest(arguments: Mapping[str, Any]) -> str` (function): Bind a decision to the exact canonical arguments that the tool will receive.
+- `tool_spec_digest(tool: Tool) -> str` (function): Bind name, description, argument schema, flags and declared effect versions.
 - `CanUseTool` (attribute): ``(ctx, tool, call)`` -> ``Decision``, ``"allow"``/``"ask"``/``"deny"``, a bool, or ``None`` for "no opinion".
 - `OnAsk` (attribute): ``(ctx, tool, call, reason)`` -> ``Approval`` or a bool.
 
@@ -4935,7 +4936,7 @@ not act on it (for example by polling a job id from it) before that.
 
 ## qagents.hooks.Hooks (class)
 
-Source: `src/qagents/hooks.py:54` | qagents 0.2.0
+Source: `src/qagents/hooks.py:55` | qagents 0.2.0
 Import: `from qagents.hooks import Hooks`
 
 ```python
@@ -4995,6 +4996,7 @@ tool hooks.
 - `async on_run_end(ctx: RunContext[Any], result: RunResult | None, error: BaseException | None) -> None`: The run finished (``result``), failed or was stopped (``error``).
 
 ## Attributes
+- `may_change_approved_arguments`: Opt in to changing approved arguments; the loop records who changed them.
 - `propagate`: Also apply this hook to child runs started from the run it is attached to, at any depth.
 
 Details of one member: get_api("qagents.hooks.Hooks.<member>").
@@ -5571,6 +5573,7 @@ Raises:
 
 ## Attributes
 - `propagate`: Child runs are traced too, nested under the tool call that started them.
+- `may_change_approved_arguments` (from `Hooks`): Opt in to changing approved arguments; the loop records who changed them.
 
 Details of one member: get_api("qagents.tracing.OTelHooks.<member>").
 

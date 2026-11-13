@@ -43,6 +43,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from .effects._canonical import jcs
 from .messages import ToolCallPart, ToolResultPart
 from .models.base import ModelRequest, ModelResponse
 from .tools import RunContext
@@ -55,6 +56,7 @@ class Hooks:
     """Override the methods you need; the defaults do nothing."""
 
     may_change_approved_arguments: ClassVar[bool] = False
+    """Opt in to changing approved arguments; the loop records who changed them."""
 
     propagate: ClassVar[bool] = False
     """Also apply this hook to child runs started from the run it is attached to,
@@ -115,7 +117,20 @@ class HookChain(Hooks):
     async def before_tool_traced(
         self, ctx: RunContext, call: ToolCallPart
     ) -> tuple[ToolCallPart | ToolResultPart, str | None]:
-        raise NotImplementedError("Hook argument provenance is pending its owning stage.")
+        """Run before-tool hooks, identifying the last class that changed arguments."""
+        changed_by = None
+        for hook in self.hooks:
+            before = jcs(call.arguments)
+            changed = await hook.before_tool(ctx, call)
+            candidate = changed if isinstance(changed, ToolCallPart) else call
+            if jcs(candidate.arguments) != before:
+                kind = type(hook)
+                changed_by = f"{kind.__module__}.{kind.__qualname__}"
+            if isinstance(changed, ToolResultPart):
+                return changed, changed_by
+            if changed is not None:
+                call = changed
+        return call, changed_by
 
     def __init__(self, hooks: Iterable[Hooks]) -> None:
         self.hooks = list(hooks)

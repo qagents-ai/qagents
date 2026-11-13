@@ -12,7 +12,9 @@ import threading
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from functools import partial
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -21,7 +23,11 @@ from qagents import events, prompts
 from qagents.errors import (
     ConfigurationError,
     EffectConflictError,
+    EffectHeld,
+    EffectReceiptError,
     EffectRejected,
+    HeldEffectsError,
+    JournalOutcomeUnknown,
     LeaseError,
     ToolError,
 )
@@ -30,14 +36,26 @@ from qagents.session import EFFECTS_REQUIRED, Entry, SessionStore
 from . import _canonical as canonical
 from . import _kinds as kinds
 from . import _ports as ports
+from . import _quiescence as quiescence
 from . import _table as table
 from . import _types as types
 from ._canonical import LIMIT_BYTES, JSONValue, check_model_numbers, jcs, resolve_namespace
 from ._declare import Dedupe, Effect, Unique
-from ._fold import Operation
+from ._fold import Operation, _new_operation
 from ._kinds import StatePatchData
 from ._ports import FINDINGS_LOGGER, CallScope, EffectJournal, Timing
-from ._types import MISSING, Absent, Found, HoldReason, NotYetVisible, RecT, ReqT, Unknown
+from ._types import (
+    HOLD_DETAIL,
+    MISSING,
+    Absent,
+    Found,
+    HeldEffect,
+    HoldReason,
+    NotYetVisible,
+    RecT,
+    ReqT,
+    Unknown,
+)
 
 Verdict = Found | NotYetVisible | Absent | Unknown
 _TOOLERROR_WARNED = False
@@ -236,6 +254,7 @@ async def _finish_send(
     if isinstance(error, (KeyboardInterrupt, SystemExit)):
         raise error
     ended_at = await scope.journal.store_now() if ended else None
+    op = scope.journal.view().get(op.namespace, op.name, op.key) or op
     ref = _reference(op)
     if isinstance(error, _DispatchNotSent):
         await _append_outcome(
@@ -388,8 +407,12 @@ async def _dispatch(
             )
     try:
         number = max((item.number for item in op.attempts), default=0) + 1
-        store_now = await journal.store_now()
         salt = await journal.salt()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + effect.timeout_s
+        store_now = await journal.store_now()
+        if rule == "D3" and not _dedupe_allowed(effect, op, scope, store_now):
+            return Outcome("held", reason=HoldReason.WINDOW_EXPIRED)
         idem = canonical.idempotency_key(
             salt, op.namespace, op.name, op.key, generation, effect.idempotency_key_max_len
         )
@@ -456,8 +479,17 @@ async def _dispatch(
                 tool_call_id=scope.tool_call_id,
             )
         )
-        invalid = _authorization_valid(rule, scope, await journal.store_now())
-        if not await _self_fence(journal, effect) or invalid is not None:
+        fenced = await _self_fence(journal, effect)
+        current_time = await journal.store_now()
+        invalid = _authorization_valid(rule, scope, current_time)
+        if rule == "D3" and not quiescence._dedupe_window_covers(
+            current_time,
+            quiescence._window_start(op),
+            effect,
+            journal.timing,
+        ):
+            invalid = HoldReason.WINDOW_EXPIRED
+        if not fenced or journal.lease.lost() or invalid is not None or loop.time() >= deadline:
             ended_at = await journal.store_now()
             await _append_outcome(
                 scope,
@@ -474,13 +506,12 @@ async def _dispatch(
             )
             _reach(scope, op, "E7")
             return Outcome("not_sent", reason=invalid or HoldReason.LEASE)
-        loop = asyncio.get_running_loop()
         attempt = types.Attempt(
             _request_for_send(effect, frozen, prepared.original),
             op.key,
             idem,
             tag,
-            loop.time() + effect.timeout_s,
+            deadline,
             not_after,
             types.AttemptDebug(number, generation, journal.lease.epoch, journal.lease.epoch or 0),
         )
@@ -533,7 +564,7 @@ async def _dispatch(
                 "D5": "operator_resend",
             }[rule],
         )
-        done, _ = await asyncio.wait({send}, timeout=effect.timeout_s)
+        done, _ = await asyncio.wait({send}, timeout=max(0, deadline - loop.time()))
         timed_out = not done
         if timed_out:
             ports._set_attempt_live(attempt, False)
@@ -756,8 +787,457 @@ async def perform(
     ("fail_run"), ToolError(EFFECT_OUTCOME_UNKNOWN) ("tell_model"), ConfigurationError
     (P0), LeaseError (F1: nothing journaled or sent), JournalOutcomeUnknown (poisoned),
     CancelledError (after the shield). Keeps the perform contract of 3.6."""
-    _prepare(effect, request, scope, occurrence)
-    raise NotImplementedError("Effect state transitions and dispatch are pending implementation.")
+    prepared = _prepare(effect, request, scope, occurrence)
+    if scope.journal.poisoned():
+        raise JournalOutcomeUnknown("Cannot perform with a poisoned Effects journal.")
+    return await _single_flight(prepared, scope, lambda: _perform(effect, prepared, scope))
+
+
+def _finish_event(
+    scope: CallScope,
+    op: Operation,
+    outcome: Literal["committed", "rejected", "held"],
+    *,
+    replayed: bool = False,
+    reason: HoldReason | None = None,
+) -> None:
+    scope.emit(
+        events.EffectFinished(
+            record_id=op.record_id,
+            effect=op.name,
+            namespace=op.namespace,
+            key=op.key,
+            outcome=outcome,
+            via=op.via,
+            replayed=replayed,
+            reason=reason,
+            tool_call_id=scope.tool_call_id,
+        )
+    )
+
+
+def _receipt(effect: Effect, op: Operation, scope: CallScope, *, replayed: bool) -> Any:
+    pair = (op.name, op.key)
+    if pair not in scope.committed:
+        scope.committed.append(pair)
+    _finish_event(scope, op, "committed", replayed=replayed)
+    if op.receipt is not None:
+        try:
+            return effect.receipt_type.model_validate_json(jcs(op.receipt))
+        except (ValueError, TypeError) as error:
+            cause = error
+    else:
+        cause = ValueError("The committed receipt is unavailable.")
+    raise EffectReceiptError(
+        prompts.EFFECT_RECEIPT_UNSTORABLE.format(effect=op.name, key=op.key, error=cause),
+        effect=op.name,
+        key=op.key,
+        receipt_error=cause,
+    ) from cause
+
+
+def _reject(scope: CallScope, op: Operation, error: BaseException | None = None) -> None:
+    pair = (op.name, op.key)
+    if pair not in scope.rejected:
+        scope.rejected.append(pair)
+    _finish_event(scope, op, "rejected", replayed=error is None)
+    if error is None:
+        error = EffectRejected("The journal records a definite rejection.")
+    raise EffectRejected(
+        prompts.EFFECT_REJECTED.format(effect=op.name, key=op.key, error=error),
+        effect=op.name,
+        key=op.key,
+        error=error,
+    ) from error
+
+
+async def _hold(
+    effect: Effect,
+    op: Operation,
+    scope: CallScope,
+    reason: HoldReason,
+    *,
+    rule: str = "H1",
+    detail: str | None = None,
+) -> None:
+    journal = scope.journal
+    now = await journal.store_now()
+    retry = quiescence.retry_after(op, journal.view(), journal.timing, now)
+    observed = op.hold
+    if observed is not None and observed.retry_after is not None and observed.retry_after > now:
+        retry = max(retry or now, observed.retry_after)
+    if reason in {
+        HoldReason.CONFLICT,
+        HoldReason.DIVERGED,
+        HoldReason.KEY_CHANGED,
+        HoldReason.VERSION_CHANGED,
+        HoldReason.WINDOW_EXPIRED,
+        HoldReason.APPROVAL_EXPIRED,
+        HoldReason.APPROVAL_UNVERIFIABLE,
+        HoldReason.CLAIMED_ELSEWHERE,
+    }:
+        retry = None
+    detail = detail or HOLD_DETAIL[reason]
+    if not journal.lease.lost() and reason != HoldReason.CLAIMED_ELSEWHERE:
+        try:
+            await _append_outcome(
+                scope,
+                kinds.KIND_EFFECT_OBSERVED,
+                kinds.EffectObservedData(
+                    **_reference(op),
+                    attempts=[item.number for item in op.attempts],
+                    verdict=None,
+                    reason=reason,
+                    detail=detail,
+                    retry_after=retry,
+                ),
+            )
+        except LeaseError:
+            # A different writer can take over between our clock read and the append.
+            # Surface the hold without claiming the observation was persisted.
+            reason, detail, retry = HoldReason.LEASE, HOLD_DETAIL[HoldReason.LEASE], None
+    held = HeldEffect(
+        op.record_id,
+        scope.session_id,
+        op.name,
+        op.key,
+        op.namespace,
+        reason,
+        detail,
+        None if retry is None else datetime.fromtimestamp(retry, UTC),
+        op.revision,
+        scope.tool_call_id,
+    )
+    scope.held.append(held)
+    _finish_event(scope, op, "held", reason=reason)
+    _reach(scope, op, rule, "held")
+    if reason == HoldReason.WINDOW_EXPIRED:
+        _reach(scope, op, rule, "held_after_window")
+    if effect.on_unknown == "fail_run":
+        raise HeldEffectsError(scope.held, retry_after=held.retry_after)
+    if effect.on_unknown == "tell_model":
+        raise ToolError(
+            prompts.EFFECT_OUTCOME_UNKNOWN.format(
+                effect=op.name,
+                key=op.key,
+                committed=", ".join(f"{name} for {key}" for name, key in scope.committed)
+                or prompts.EFFECT_NONE_DONE,
+            )
+        )
+    raise EffectHeld(held)
+
+
+def _conflict(op: Operation) -> None:
+    status = {
+        "C": "committed",
+        "R": "rejected",
+        "D": "held",
+        "NA": "not_applied",
+        "CU": "closed_unknown",
+        "X": "conflict",
+        "N": "claimed",
+    }[op.state]
+    raise EffectConflictError(
+        prompts.EFFECT_CONFLICT.format(effect=op.name, key=op.key, status=status),
+        effect=op.name,
+        key=op.key,
+        record_id=op.record_id,
+        existing_status=status,
+    )
+
+
+def _dedupe_allowed(effect: Effect, op: Operation, scope: CallScope, now: float) -> bool:
+    journal = scope.journal
+    contract = effect.dedupe
+    if (
+        isinstance(contract, Dedupe)
+        and contract.replays_errors
+        and any(
+            a.generation == op.generation and a.terminal == "unknown" and a.raised
+            for a in op.attempts
+        )
+    ):
+        return False
+    return quiescence._dedupe_window_covers(
+        now,
+        quiescence._window_start(op),
+        effect,
+        journal.timing,
+    ) and quiescence._concurrency_permits(effect, op, journal.view(), journal.timing, now)
+
+
+async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any:
+    journal = scope.journal
+    key = (prepared.namespace, effect.name, prepared.key)
+    view = journal.view()
+    op = view.get(*key) or _new_operation(
+        kinds.EffectRefData(
+            namespace=key[0],
+            name=key[1],
+            key=key[2],
+            record_id=canonical.record_id(*key),
+        )
+    )
+    for finding in list(op.findings):
+        await _lookup_conflict(journal, _reference(op), finding.what, finding.seqs, finding.detail)
+
+    claim = None
+    claim_kind = "none"
+    if (
+        (op.state == "N" or op.via == "claim")
+        and not effect.key.is_per_call
+        and ("claims" in journal.store.features)
+    ):
+        claim = await journal.store.get_claim(*key)
+        if op.via == "claim" and (
+            claim is None or claim.descriptor_digest != prepared.descriptor.digest()
+        ):
+            _conflict(op)
+        if claim is not None:
+            if claim.descriptor_digest != prepared.descriptor.digest():
+                claim_kind = "other_descriptor"
+            elif claim.status == "committed":
+                claim_kind = "committed_same"
+            elif claim.status in ("rejected", "not_sent"):
+                claim_kind = claim.status
+            else:
+                claim_kind = "held_elsewhere"
+
+    lookup = "none_declared" if effect.lookup_fn is None or not op.attempts else "not_run"
+    reason = None
+    retry_blocked = False
+    while True:
+        now = await journal.store_now()
+        view = journal.view()
+        op = view.get(*key) or op
+        same_call = scope.operation_id in op.operation_ids
+        args_diverged = (
+            scope.original_arguments_digest is not None
+            and scope.arguments_digest != scope.original_arguments_digest
+        )
+        own_rejection = any(
+            a.generation == op.generation
+            and a.terminal == "rejected"
+            and a.intent.operation_id == scope.operation_id
+            for a in op.attempts
+        )
+        pending = op.pending_resend
+        resend_seq = (pending.model_extra or {}).get("seq") if pending is not None else None
+        dedupe = op.state == "D" and not retry_blocked and _dedupe_allowed(effect, op, scope, now)
+        if op.state == "D" and send_running(journal.store, scope.session_id, op.record_id):
+            await _hold(effect, op, scope, HoldReason.SEND_STILL_RUNNING)
+        auth_rule = (
+            "D3" if dedupe else "D4" if op.state == "D" else "D2" if op.state == "R" else "D1"
+        )
+        invalid = _authorization_valid(auth_rule, scope, now)
+        situation = table.PerformSituation(
+            allowed=True,
+            same_call=same_call,
+            descriptor_differs=op.descriptor is not None
+            and not table._descriptor_matches(op, prepared.descriptor),
+            arguments_diverged=args_diverged,
+            key_changed=table._key_changed(view, scope, effect, key, prepared.occurrence),
+            version_changed=bool(op.version and op.version != effect.version),
+            own_rejection=own_rejection,
+            claim=claim_kind,
+            lookup=lookup,
+            fence_ok=not journal.lease.lost(),
+            auth_valid=invalid is None,
+            dedupe_valid=dedupe,
+            resend_accepted=resend_seq is not None and not retry_blocked,
+        )
+        if op.state in ("N", "R") and invalid is not None and not own_rejection:
+            raise ConfigurationError("The tool attempt has no valid authorization to send.")
+        row = table.decide(table.TState(op.state), table.TEvent.PERFORM, situation)
+
+        if row is table.NEED_LOOKUP:
+            prior_state, prior_commit = op.state, op.commit_seq
+            verdict = await lookup_and_record(
+                effect,
+                op,
+                journal=journal,
+                deps=scope.deps,
+                purpose="perform",
+                state_values=scope.committed_values,
+            )
+            view = journal.view()
+            current = view.get(*key)
+            if current.state == "C":
+                # The lookup helper journals the patch. Reuse its exact durable delta.
+                entries = await journal.store.load(scope.session_id)
+                commit = next(
+                    (
+                        item
+                        for item in entries
+                        if item.seq == current.commit_seq
+                        and item.seq != prior_commit
+                        and item.data.get("via") == "lookup"
+                    ),
+                    None,
+                )
+                if commit is not None and commit.data.get("state_patch") is not None:
+                    scope.apply_patch(StatePatchData.model_validate(commit.data["state_patch"]))
+                if commit is not None:
+                    _reach(scope, current, "L2" if prior_state == "R" else "L1", "found_by_lookup")
+                return _receipt(effect, current, scope, replayed=commit is None)
+            lookup = "unknown"
+            if isinstance(verdict, NotYetVisible):
+                lookup, reason = "not_yet_visible", HoldReason.NOT_YET_VISIBLE
+            elif isinstance(verdict, Absent):
+                lookup = "absent"
+                q = quiescence._all_quiescent(current, view, journal.timing)
+                started = current.hold.started_at if current.hold else None
+                if (
+                    effect.authoritative
+                    and started is not None
+                    and quiescence._lookup_after_quiescence(started, q)
+                ):
+                    observation = current.hold.model_copy(update={"final": True})
+                    await _append_outcome(scope, kinds.KIND_EFFECT_OBSERVED, observation)
+                    if not retry_blocked:
+                        lookup = "absent_authoritative_after_q"
+                elif effect.authoritative:
+                    reason = HoldReason.NOT_YET_QUIESCENT
+            continue
+
+        if row.rule == "P1k":
+            prior = view.by_call[(scope.operation_id, effect.name, prepared.occurrence)]
+            await _hold(
+                effect, view.operations[prior], scope, HoldReason.KEY_CHANGED, rule=row.rule
+            )
+        if row.rule == "P1":
+            await _hold(effect, op, scope, HoldReason.DIVERGED, rule=row.rule)
+        if row.rule == "P2":
+            _conflict(op)
+        if row.rule == "P3":
+            if situation.version_changed:
+                logging.getLogger(FINDINGS_LOGGER).warning(
+                    "%s replayed a receipt written by effect version %s", effect.name, op.version
+                )
+            _reach(scope, op, "P3", "receipt_replayed")
+            return _receipt(effect, op, scope, replayed=True)
+        if row.rule == "P3r":
+            _reject(scope, op)
+        if row.rule == "P4":
+            raise EffectRejected(
+                prompts.EFFECT_NOT_APPLIED.format(
+                    effect=op.name,
+                    key=op.key,
+                    evidence=op.settlements[-1].evidence,
+                ),
+                effect=op.name,
+                key=op.key,
+            )
+        if row.rule == "P5":
+            raise ToolError(
+                prompts.EFFECT_CLOSED_UNKNOWN.format(
+                    effect=op.name,
+                    key=op.key,
+                    reason=op.settlements[-1].reason,
+                )
+            )
+        if row.rule in ("P6", "P7"):
+            await _hold(
+                effect,
+                op,
+                scope,
+                HoldReason.CONFLICT if row.rule == "P6" else HoldReason.VERSION_CHANGED,
+                rule=row.rule,
+            )
+        if row.rule == "C1":
+            if claim_kind == "other_descriptor":
+                _conflict(op)
+            if claim_kind == "held_elsewhere":
+                await _hold(
+                    effect,
+                    op,
+                    scope,
+                    HoldReason.CLAIMED_ELSEWHERE,
+                    rule="C1",
+                    detail=f"Claimed by {claim.session_id}, record {claim.record_id}.",
+                )
+            if claim_kind == "committed_same":
+                receipt, receipt_error = receipt_json(effect, claim.receipt)
+                await _append_outcome(
+                    scope,
+                    kinds.KIND_EFFECT_COMMITTED,
+                    kinds.EffectCommittedData(
+                        **_reference(op),
+                        attempt=None,
+                        intent_seq=None,
+                        via="claim",
+                        receipt=receipt,
+                        receipt_error=receipt_error,
+                        identity_digest=canonical.identity_digest(receipt, effect.receipt_identity)
+                        if receipt is not None
+                        else None,
+                        claim_owner={"session_id": claim.session_id, "record_id": claim.record_id},
+                    ),
+                    receipt=claim.receipt,
+                )
+                _reach(scope, op, "C1", "claim_replayed")
+                return _receipt(effect, view.get(*key), scope, replayed=True)
+            # The atomic claim append checks for intervening changes and transfers ownership.
+            op = replace(op, generation=claim.generation, first_use_at=claim.first_use_at)
+            row = table.decide(
+                table.TState.R if claim_kind == "rejected" else table.TState.N,
+                table.TEvent.PERFORM,
+                replace(situation, claim="none", same_call=False),
+            )
+        if row.rule == "F1":
+            raise LeaseError("Effect dispatch refused: no safe lease margin.")
+        if not row.sends:
+            if (
+                reason is None
+                and isinstance(effect.dedupe, Dedupe)
+                and not quiescence._dedupe_window_covers(
+                    now,
+                    quiescence._window_start(op),
+                    effect,
+                    journal.timing,
+                )
+            ):
+                reason = HoldReason.WINDOW_EXPIRED
+            await _hold(effect, op, scope, invalid or reason or HoldReason.DISPATCH_UNKNOWN)
+
+        dispatch_scope = scope
+        generation = op.generation
+        if row.rule == "D2":
+            _, generation = _d2_plan(effect, op)
+        if row.rule == "D5":
+            dispatch_scope = replace(
+                scope,
+                authorization=ports.Authorization(
+                    "resend",
+                    settlement_seq=resend_seq,
+                ),
+            )
+        token = _DISPATCH_INPUT.set(prepared)
+        try:
+            outcome = await _dispatch(
+                effect, op, prepared.frozen, dispatch_scope, row.rule, generation
+            )
+        finally:
+            _DISPATCH_INPUT.reset(token)
+        op = journal.view().get(*key) or op
+        if outcome.kind == "committed":
+            return _receipt(effect, op, scope, replayed=False)
+        if outcome.kind == "rejected":
+            _reject(scope, op, outcome.error)
+        reason = outcome.reason
+        if outcome.kind == "not_sent" or reason in {
+            HoldReason.CONFLICT,
+            HoldReason.LEASE,
+            HoldReason.APPROVAL_EXPIRED,
+            HoldReason.APPROVAL_UNVERIFIABLE,
+            HoldReason.SEND_STILL_RUNNING,
+            HoldReason.REJECTED_WHILE_IN_FLIGHT,
+            HoldReason.WINDOW_EXPIRED,
+        }:
+            await _hold(effect, op, scope, reason or HoldReason.LEASE)
+        # A failed response permits one lookup, and at most one automatic re-send.
+        retry_blocked = row.rule in ("D3", "D4", "D5") or outcome.error_kind == "duplicate_key"
+        lookup = "not_run" if effect.lookup_fn is not None else "none_declared"
 
 
 async def lookup_and_record(
@@ -774,7 +1254,266 @@ async def lookup_and_record(
     via=lookup on a bound Found (on_commit on state_values()); a mismatched Found
     journals effect_conflict found_mismatch; a Found on NA or CU journals
     late_found_after_settlement."""
-    raise NotImplementedError("Effects implementation is pending its owning stage.")
+    if effect.lookup_fn is None:
+        raise ConfigurationError(f"{effect.name}: no lookup is declared.")
+    # The caller's view and the model in Inquiry can both change while lookup awaits.
+    # Binding always uses the original durable JSON, independently of either object.
+    original = deepcopy(op)
+    if original.request is None or original.descriptor is None or not original.attempts:
+        raise ConfigurationError("Lookup requires a journaled effect intent.")
+    request = json.loads(jcs(original.request))
+    inquiry = types.Inquiry(
+        request=effect.request_type.model_validate_json(jcs(request)),
+        key=original.key,
+        operation_tag=canonical.operation_tag(
+            original.namespace, original.name, original.key, original.descriptor.request_digest
+        ),
+        idempotency_keys=tuple(dict.fromkeys(a.intent.idempotency_key for a in original.attempts)),
+        attempts=tuple(
+            types.AttemptInfo(
+                a.number,
+                a.generation,
+                a.intent.idempotency_key,
+                a.intent.epoch,
+                a.intent.store_ts,
+                a.terminal,
+            )
+            for a in original.attempts
+        ),
+        first_use_at=original.first_use_at,
+    )
+    ctx = types.EffectContext(deps, session_id=journal.session_id)
+    started_at = await journal.store_now()
+    verdict = await _lookup_verdict(effect, ctx, inquiry, journal)
+    receipt = receipt_error = identity = None
+    tag = seen = None
+    binding_error = None
+    if isinstance(verdict, Found):
+        # Capture all mutable evidence before the next store await.
+        tag = verdict.tag
+        try:
+            seen = json.loads(jcs(dict(verdict.seen))) if verdict.seen is not None else None
+            if tag is not None and tag != inquiry.operation_tag:
+                binding_error = "The destination operation tag differs from the frozen operation."
+            if seen is not None and any(
+                key not in request or jcs(value) != jcs(request[key]) for key, value in seen.items()
+            ):
+                binding_error = "The destination request fields differ from the frozen request."
+        except Exception as error:
+            binding_error = f"Invalid destination request binding: {type(error).__name__}: {error}"
+        receipt, receipt_error = receipt_json(effect, verdict.receipt)
+        if receipt is not None:
+            identity = canonical.identity_digest(receipt, effect.receipt_identity)
+            if binding_error is None:
+                verdict = Found(
+                    effect.receipt_type.model_validate_json(jcs(receipt)), tag=tag, seen=seen
+                )
+    retry_after = None
+    if isinstance(verdict, NotYetVisible) and verdict.retry_after_s is not None:
+        hint = verdict.retry_after_s
+        if type(hint) not in (int, float) or not math.isfinite(hint) or hint < 0:
+            verdict = Unknown("Lookup returned an invalid retry_after_s.")
+        else:
+            retry_after = started_at + hint
+            if not math.isfinite(retry_after):
+                verdict, retry_after = Unknown("Lookup retry time is not finite."), None
+    ref = {
+        "record_id": original.record_id,
+        "namespace": original.namespace,
+        "name": original.name,
+        "key": original.key,
+    }
+    observed = kinds.EffectObservedData(
+        **ref,
+        attempts=[a.number for a in original.attempts],
+        verdict="found"
+        if isinstance(verdict, Found)
+        else "absent"
+        if isinstance(verdict, Absent)
+        else "not_yet_visible"
+        if isinstance(verdict, NotYetVisible)
+        else "unknown",
+        authoritative=effect.authoritative,
+        started_at=started_at,
+        reason=HoldReason.NOT_YET_VISIBLE
+        if isinstance(verdict, NotYetVisible)
+        else HoldReason.LOOKUP_INCONCLUSIVE
+        if isinstance(verdict, (Unknown, Absent))
+        else None,
+        detail=verdict.reason if isinstance(verdict, Unknown) else None,
+        retry_after=retry_after,
+    )
+    observed_seq = (
+        await journal.append_effect(
+            [Entry(kind=kinds.KIND_EFFECT_OBSERVED, data=observed.model_dump(mode="json"))]
+        )
+    )[0]
+    if not isinstance(verdict, Found):
+        return verdict
+    current = journal.view().get(original.namespace, original.name, original.key)
+    if binding_error is not None:
+        await _lookup_conflict(journal, ref, "found_mismatch", [observed_seq], binding_error)
+        return verdict
+    closure_seq = next(
+        (
+            (settlement.model_extra or {})["seq"]
+            for settlement in reversed(current.settlements)
+            if settlement.outcome != "resend"
+            and not (settlement.model_extra or {}).get("voided", False)
+            and (settlement.model_extra or {})["seq"] >= current._resolution_seq
+        ),
+        None,
+    )
+    if closure_seq is not None:
+        if not _lookup_evidence_seen(current, "late_found_after_settlement", identity, closure_seq):
+            await _lookup_conflict(
+                journal,
+                ref,
+                "late_found_after_settlement",
+                [closure_seq, observed_seq],
+                "A bound result was found after operator closure.",
+                identity_digest=identity,
+                lookup_base_seq=closure_seq,
+            )
+        return verdict
+    # A send may have committed while the read was in flight. Evidence is still
+    # compared, but a successful patch must never run a second time.
+    if current.commit_seq is not None and (identity is None or identity == current.identity_digest):
+        return verdict
+    if _lookup_evidence_seen(current, "receipts_differ", identity, current._resolution_seq):
+        return verdict
+    patch = patch_error = None
+    if receipt is not None and current.commit_seq is None and current.state != "X":
+        patch, patch_error = on_commit_patch(effect, state_values(), request, receipt)
+    target = original.attempts[-1]
+    committed = kinds.EffectCommittedData(
+        **ref,
+        attempt=target.number,
+        intent_seq=target.intent_seq,
+        via="lookup",
+        receipt=receipt,
+        receipt_error=receipt_error,
+        identity_digest=identity,
+        state_patch=patch,
+        on_commit_error=patch_error,
+        found_tag=tag,
+        found_seen=seen,
+    )
+    await journal.append_effect(
+        [Entry(kind=kinds.KIND_EFFECT_COMMITTED, data=committed.model_dump(mode="json"))]
+    )
+    current = journal.view().get(original.namespace, original.name, original.key)
+    for finding in list(current.findings):
+        await _lookup_conflict(
+            journal,
+            ref,
+            finding.what,
+            finding.seqs,
+            finding.detail,
+            identity_digest=identity if finding.what == "receipts_differ" else None,
+            lookup_base_seq=current._resolution_seq if finding.what == "receipts_differ" else None,
+        )
+    return verdict
+
+
+def _lookup_evidence_seen(op: Operation, what: str, identity: str | None, base_seq: int) -> bool:
+    """Only identical positive evidence in the active resolution interval is replayed."""
+    return identity is not None and any(
+        finding.what == what
+        and (finding.model_extra or {}).get("identity_digest") == identity
+        and (finding.model_extra or {}).get("lookup_base_seq") == base_seq
+        and (finding.what, tuple(finding.seqs)) not in op._resolved_conflicts
+        for finding in op.conflicts
+    )
+
+
+async def _lookup_conflict(
+    journal: EffectJournal,
+    ref: dict[str, str],
+    what: str,
+    seqs: list[int],
+    detail: str | None,
+    *,
+    identity_digest: str | None = None,
+    lookup_base_seq: int | None = None,
+):
+    evidence = (
+        {}
+        if identity_digest is None
+        else {
+            "identity_digest": identity_digest,
+            "lookup_base_seq": lookup_base_seq,
+        }
+    )
+    finding = kinds.EffectConflictData(**ref, what=what, seqs=seqs, detail=detail, **evidence)
+    await journal.append_effect(
+        [
+            Entry(
+                id=kinds.conflict_entry_id(finding.record_id, what, seqs),
+                kind=kinds.KIND_EFFECT_CONFLICT,
+                data=finding.model_dump(mode="json"),
+            )
+        ]
+    )
+
+
+async def _lookup_verdict(
+    effect: Effect, ctx: types.EffectContext, inquiry: types.Inquiry, journal: EffectJournal
+) -> Verdict:
+    """Bound the read without waiting indefinitely for a cancellation-resistant callback."""
+    from qagents import tools
+
+    async def call_lookup():
+        fn = effect.lookup_fn
+        if inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(type(fn).__call__):
+            value = fn(ctx, inquiry)
+        else:
+            wrapped, raw = tools.start_thread("effect-lookup", partial(fn, ctx, inquiry))
+            journal.track(raw)
+            value = await wrapped
+        return await value if inspect.isawaitable(value) else value
+
+    async def invoke():
+        token = ports._INQUIRY.set(inquiry)
+        try:
+            transport = ports.TRANSPORT.get()
+            return (
+                await call_lookup()
+                if transport is None
+                else await transport.lookup(effect, ctx, inquiry, call_lookup)
+            )
+        finally:
+            ports._INQUIRY.reset(token)
+
+    task = asyncio.create_task(invoke())
+    journal.track(task)
+    # Timed-out reads may finish later. Retrieve their exception without turning a
+    # late result into proof, and retain them in the lease's drain accounting.
+    task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    try:
+        done, _ = await asyncio.wait({task}, timeout=effect.timeout_s)
+        if not done:
+            task.cancel()
+            return Unknown("Lookup timed out.")
+        if task.cancelled():
+            return Unknown("Lookup cancelled itself.")
+        value = task.result()
+        if not isinstance(value, (Found, NotYetVisible, Absent, Unknown)):
+            return Unknown("Lookup returned an unsupported verdict.")
+        if (
+            isinstance(value, Unknown)
+            and value.reason is not None
+            and not isinstance(value.reason, str)
+        ):
+            return Unknown("Lookup returned an invalid reason.")
+        return value
+    except ConfigurationError:
+        raise
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    except Exception as error:
+        return Unknown(f"{type(error).__name__}: {error}")
 
 
 def on_commit_patch(
