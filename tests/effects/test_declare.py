@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from qagents.effects import _types
 from qagents.effects._declare import Dedupe, Unique
+from qagents.effects._types import EffectContext, Found, current_attempt
 from qagents.errors import (
     ApprovalConflictError,
     ClaimConflict,
@@ -132,3 +134,49 @@ def test_unique_keeps_its_declared_duplicate_types():
     for bad in ((), [Duplicate], (42,), (object,)):
         with pytest.raises(ConfigurationError):
             Unique("constraint", bad)
+
+
+def test_found_requires_a_keyword_binding():
+    receipt = object()
+    assert Found(receipt, tag="op_1").tag == "op_1"
+    assert Found(receipt, seen={"request_id": "R1"}).seen == {"request_id": "R1"}
+    with pytest.raises(TypeError, match="tag= or seen="):
+        Found(receipt)
+    with pytest.raises(TypeError):
+        Found(receipt, "op_1")
+    for invalid in ({"tag": ""}, {"seen": {}}, {"tag": 1}, {"seen": []}):
+        with pytest.raises(TypeError):
+            Found(receipt, **invalid)
+
+
+def test_effect_context_distinguishes_missing_and_explicit_none_dependencies():
+    with pytest.raises(ConfigurationError, match="pass deps=.*--deps"):
+        _ = EffectContext().deps
+    assert EffectContext(None).deps is None
+    events = []
+    context = EffectContext({"tenant": "one"}, session_id="s", emit=events.append)
+    assert context.deps == {"tenant": "one"}
+    assert context.session_id == "s"
+    assert context.logger.name == "qagents.effects"
+    context.emit("diagnostic")
+    assert events == ["diagnostic"]
+    with pytest.raises(AttributeError):
+        context.state = {}
+
+
+async def test_current_attempt_is_task_local_and_restored():
+    import asyncio
+
+    assert current_attempt() is None
+    first, second = object(), object()
+
+    async def one(value):
+        token = _types._ATTEMPT.set(value)
+        try:
+            await asyncio.sleep(0)
+            return current_attempt()
+        finally:
+            _types._ATTEMPT.reset(token)
+
+    assert await asyncio.gather(one(first), one(second)) == [first, second]
+    assert current_attempt() is None
