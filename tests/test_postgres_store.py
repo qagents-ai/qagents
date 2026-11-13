@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 
 from qagents import Agent, RunContext, Session, SQLiteStore, tool
-from qagents.errors import ConfigurationError, SessionError
+from qagents.errors import ConfigurationError, EntryConflict, SessionError
 from qagents.models.testing import ScriptedModel, call
 from qagents.session import Entry, InMemoryStore, SessionStore
 
@@ -42,6 +42,72 @@ def run(coroutine: Awaitable[None]) -> None:
 
 def new_schema() -> str:
     return f"qagents_test_{uuid.uuid4().hex[:12]}"
+
+
+@needs_postgres
+def test_v1_ids_migrate_and_replay_before_stale_lease():
+    schema = new_schema()
+
+    async def check():
+        import psycopg
+
+        from qagents.stores.postgres import PostgresStore
+
+        async with await psycopg.AsyncConnection.connect(DSN, autocommit=True) as conn:
+            await conn.execute(f'CREATE SCHEMA "{schema}"')
+            await conn.execute(f'CREATE TABLE "{schema}".schema_version (version integer)')
+            await conn.execute(f'INSERT INTO "{schema}".schema_version VALUES (1)')
+            await conn.execute(f'''CREATE TABLE "{schema}".entries (
+                session_id text, seq bigint, ts float8, run_id text, kind text, data jsonb,
+                PRIMARY KEY(session_id, seq))''')
+            await conn.execute(f'''CREATE TABLE "{schema}".sessions (
+                session_id text PRIMARY KEY, status text NOT NULL DEFAULT 'idle',
+                open_run_id text, agent text, failures integer NOT NULL DEFAULT 0,
+                last_seq bigint NOT NULL DEFAULT 0, updated_at timestamptz,
+                lease_owner text, lease_expires_at timestamptz)''')
+            await conn.execute(f'''INSERT INTO "{schema}".entries
+                VALUES ('s', 1, 1.0, NULL, 'custom', '{{"legacy":true}}')''')
+            await conn.execute(f'''INSERT INTO "{schema}".sessions (session_id, last_seq)
+                VALUES ('s', 1)''')
+        async with PostgresStore(DSN, schema=schema) as db:
+            legacy = await db.load("s")
+            assert legacy[0].id == "seq:1"
+            incarnation = (await db.status("s")).incarnation
+            assert incarnation is not None
+            assert await db.append("s", legacy) == [1]
+            assert await db.acquire_lease("s", "old", 10)
+            batch = [Entry(kind="custom"), Entry(kind="custom")]
+            assert await db.append_leased("s", batch, "old") == [2, 3]
+            await db.release_lease("s", "old")
+            assert await db.acquire_lease("s", "new", 10)
+            assert await db.append_leased("s", batch, "old") == [2, 3]
+            with pytest.raises(EntryConflict):
+                await db.append_leased("s", [batch[0], Entry(kind="custom")], "old")
+            assert [entry.id for entry in await db.load("s")] == ["seq:1", *[e.id for e in batch]]
+            assert (await db.status("s")).incarnation == incarnation
+            await db.delete("s")
+            await db.append("s", [Entry(kind="custom")])
+            assert (await db.status("s")).incarnation not in (None, incarnation)
+
+    try:
+        run(check())
+    finally:
+        drop_schemas(schema)
+
+
+@needs_postgres
+def test_public_kit_reports_must_tier_postgres_limits():
+    from qagents.testing.stores import check_store
+
+    async def check(store, schema):
+        report = await check_store(lambda: store)
+        assert report.ok, report.checks
+        assert "claims and tombstones" in report.not_checked
+        assert "epochs and grace" in report.not_checked
+        assert "durability after killed writer" in report.not_checked
+        assert len(report.checks) == 2
+
+    postgres_check(check)
 
 
 def drop_schemas(*schemas: str) -> None:
@@ -440,9 +506,9 @@ def test_a_delete_that_races_an_append_leaves_nothing_behind():
                     ("chat-1",),
                 )
                 await other.execute(
-                    f'INSERT INTO "{schema}".entries (session_id, seq, ts, run_id, kind, data)'
-                    " VALUES ('chat-1', 4, 0, NULL, 'note', '{\"n\": 3}'),"
-                    " ('chat-1', 5, 0, NULL, 'note', '{\"n\": 4}')"
+                    f'INSERT INTO "{schema}".entries (session_id, seq, ts, run_id, kind, data, id)'
+                    " VALUES ('chat-1', 4, 0, NULL, 'note', '{\"n\": 3}', 'fixture:4'),"
+                    " ('chat-1', 5, 0, NULL, 'note', '{\"n\": 4}', 'fixture:5')"
                 )
                 await other.execute(
                     f'UPDATE "{schema}".sessions SET last_seq = 5 WHERE session_id = %s',

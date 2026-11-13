@@ -314,7 +314,10 @@ async def test_a_copy_of_an_answered_pause_appended_again_is_refused():
     pause = next(e for e in entries if e.kind == "run_paused")
     await session.store.append(
         session.id,  # replay the first, already answered, pause in the open run
-        [assistant.model_copy(update={"seq": 0}), pause.model_copy(update={"seq": 0})],
+        [
+            assistant.model_copy(update={"seq": 0, "id": "forged-assistant"}),
+            pause.model_copy(update={"seq": 0, "id": "forged-pause"}),
+        ],
     )
     with pytest.raises(ApprovalTokenError):
         await agent.resume(session, approvals={first.tool_call_id: Approval.for_call(first)})

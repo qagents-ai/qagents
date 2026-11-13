@@ -289,10 +289,11 @@ class Backend:
 
     def store(self) -> SessionStore:
         if self.kind == "memory":
-            self._memory = self._memory or InMemoryStore()
+            # SPEC 7.7.6: legacy recovery tests deliberately use sub-second takeover.
+            self._memory = self._memory or InMemoryStore(takeover_grace_s=0.0)
             return self._memory
         if self.kind == "sqlite":
-            store: SessionStore = SQLiteStore(self.path)
+            store: SessionStore = SQLiteStore(self.path, takeover_grace_s=0.0)
         else:
             from qagents.stores.postgres import PostgresStore
 
@@ -477,7 +478,8 @@ async def test_runs_of_unknown_agents_and_workflow_sessions_are_left_alone(caplo
 
 
 async def test_session_prefix_limits_recovery():
-    store = InMemoryStore()
+    # SPEC 7.7.6: this legacy test expects takeover below the default one-second grace.
+    store = InMemoryStore(takeover_grace_s=0.0)
     log: list[str] = []
     await crash_worker(store, log)
     await asyncio.sleep(FAST["lease_ttl_s"] + 0.1)
@@ -749,7 +751,8 @@ async def test_limits_given_to_a_plain_run_are_journaled_and_kept_by_recovery():
 
 
 async def test_a_recovered_run_keeps_the_max_turns_it_was_started_with():
-    store = InMemoryStore()
+    # SPEC 7.7.6: this legacy test expects takeover below the default one-second grace.
+    store = InMemoryStore(takeover_grace_s=0.0)
     gate, started = asyncio.Event(), asyncio.Event()
 
     @tool(read_only=True)
@@ -814,7 +817,8 @@ async def test_a_run_that_crashes_its_worker_every_time_is_left_to_a_person(capl
 
 
 async def test_each_recovery_is_journaled_and_progress_resets_the_count():
-    store = InMemoryStore()
+    # SPEC 7.7.6: this legacy test expects takeover below the default one-second grace.
+    store = InMemoryStore(takeover_grace_s=0.0)
     log: list[str] = []
     await crash_worker(store, log)
     await store.append(
@@ -912,7 +916,8 @@ async def test_shutdown_waits_for_a_start_in_flight_which_then_backs_out():
 
 
 async def test_shutdown_during_recover_launches_nothing_and_frees_the_lease():
-    store = InMemoryStore()
+    # SPEC 7.7.6: this legacy test expects takeover below the default one-second grace.
+    store = InMemoryStore(takeover_grace_s=0.0)
     log: list[str] = []
     await crash_worker(store, log)
     await asyncio.sleep(FAST["lease_ttl_s"] + 0.1)
@@ -1230,7 +1235,8 @@ async def test_a_slow_start_keeps_its_lease_so_no_worker_resumes_the_old_run():
 
 
 async def test_a_slow_recovery_keeps_its_lease_so_only_one_worker_resumes_the_run():
-    store = InMemoryStore()
+    # SPEC 7.7.6: this legacy test expects takeover below the default one-second grace.
+    store = InMemoryStore(takeover_grace_s=0.0)
     log: list[str] = []
     await crash_worker(store, log)
     await asyncio.sleep(FAST["lease_ttl_s"] + 0.1)
@@ -1295,7 +1301,8 @@ async def test_an_interrupted_run_that_recover_holds_back_says_so():
 
 
 async def test_a_recovery_stopped_by_shutdown_before_it_resumed_is_not_counted():
-    store = InMemoryStore()
+    # SPEC 7.7.6: this legacy test expects takeover below the default one-second grace.
+    store = InMemoryStore(takeover_grace_s=0.0)
     log: list[str] = []
     await crash_worker(store, log)
     await asyncio.sleep(FAST["lease_ttl_s"] + 0.1)

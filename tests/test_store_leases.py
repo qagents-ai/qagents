@@ -57,10 +57,11 @@ class Backend:
 
     def store(self) -> SessionStore:
         if self.kind == "memory":  # one process: every "instance" is the same store
-            self._memory = self._memory or InMemoryStore()
+            # SPEC 7.7.6: these legacy short-TTL tests opt out of takeover grace.
+            self._memory = self._memory or InMemoryStore(takeover_grace_s=0.0)
             return self._memory
         if self.kind == "sqlite":
-            store: SessionStore = SQLiteStore(self.path)
+            store: SessionStore = SQLiteStore(self.path, takeover_grace_s=0.0)
         else:
             from qagents.stores.postgres import PostgresStore
 
@@ -232,7 +233,10 @@ def test_seq_stays_gap_free_and_status_matches_after_many_appends(backend):
         store = backend.store()
         await store.append("g", [Entry(kind="run_started", run_id="r1", data={"agent": "x"})])
         await asyncio.gather(
-            *[store.append("g", [Entry(kind="note", data={"i": i})] * 3) for i in range(10)]
+            *[
+                store.append("g", [Entry(kind="note", data={"i": i}) for _ in range(3)])
+                for i in range(10)
+            ]
         )
         entries = await backend.store().load("g")
         assert [entry.seq for entry in entries] == list(range(1, 32))
@@ -428,10 +432,10 @@ async def test_sqlite_migrates_a_v01_database_without_losing_entries(tmp_path):
     assert statuses["waiting"].agent == "billing" and statuses["broken"].failures == 1
     assert statuses["crashed"].updated_at == 21.0  # the time of its last entry
     await store.aclose()
-    assert dump(path) == before  # no entry was changed
+    assert [row[:6] for row in dump(path)] == before  # original columns are unchanged
 
     connection = sqlite3.connect(path)
-    assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+    assert connection.execute("PRAGMA user_version").fetchone() == (2,)
     connection.close()
 
     # The migrated database works as usual: resume the crashed run in "another process".

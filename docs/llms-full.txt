@@ -5090,14 +5090,14 @@ and `qagents.stores.postgres.PostgresStore` implement both.
 - `SessionStatus` (class): What a store tracks about a session next to its journal.
 - `LeaseGrant` (class)
 - `SessionStore` (class): Where journals live.
+- `Lease` (class): One acquisition, its monotonic self-fence, and the sends it must outlive.
+- `LeasedWriter` (class): The shared journal writer for runs, operators, runtimes and workflows.
 - `InMemoryStore` (class): Keeps journals in a dict.
 - `SQLiteStore` (class): Journals in one SQLite file (WAL mode).
 - `Session` (class): One conversation in a store.
-- `Lease` (class): One lease's token, epoch, deadline, renewals and running sends; implementation pending.
-- `LeasedWriter` (class): Frozen leased-writer contract; implementation is pending the store owner stage.
 - `derive_state(entries: list[Entry], *, session_id: str | None = None) -> SessionState` (function): Replay a journal into the current `SessionState`.
 - `advance_status(status: SessionStatus, entry: Entry) -> None` (function): Update ``status`` in place for one appended entry.
-- `append_fenced(store, session_id, entries, owner, *, fence, attempts) -> list[int] | None` (function): SPEC 7.7.2-3 in one place: first append (append_leased with owner, or append when owner is None); a definite refusal (LeaseError, validation SessionError,...
+- `append_fenced(store, session_id, entries, owner, *, fence, attempts) -> list[int] | None` (function): Resolve uncertain writes by identical retries and read-back (SPEC 7.7.2–3).
 - `SessionRunStatus` (attribute): Where a session's latest run stands, as the store tracks it (`SessionStatus.status`).
 
 ---

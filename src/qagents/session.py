@@ -78,22 +78,25 @@ import concurrent.futures
 import copy
 import functools
 import json
+import secrets
 import sqlite3
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .effects._fold import EffectView
+from .effects._claims import Claim, next_claim
+from .effects._fold import EffectView, fold_effects
+from .effects._kinds import EFFECT_KINDS, LIFECYCLE_KINDS, REQUIRES_EFFECTS, lease_entry_id
 from .effects._ports import Timing
 from .effects._types import EffectRecord, HeldEffect
-from .errors import LeaseError, SessionError
+from .errors import ClaimConflict, EntryConflict, JournalOutcomeUnknown, LeaseError, SessionError
 from .messages import Message, ToolResultPart, Usage
 
 
@@ -104,6 +107,7 @@ def _owner_token(worker: str) -> str:
 
 class Entry(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    """Stable identity, preserved when an uncertain append is retried."""
     kind: str
     data: dict[str, Any] = Field(default_factory=dict)
     run_id: str | None = None
@@ -206,6 +210,19 @@ class SessionState(BaseModel):
         )
 
 
+def _provisional_counts(entry: Entry, later_results: set[str]) -> bool:
+    """Only a later result for the same operation commits a provisional snapshot (M21)."""
+    return not entry.data.get("provisional", False) or (
+        isinstance(entry.data.get("operation_id"), str)
+        and entry.data["operation_id"] in later_results
+    )
+
+
+def _restore_message(data: dict[str, Any]) -> Message:
+    """Restore one journaled message (M28)."""
+    return Message.model_validate(data)
+
+
 def derive_state(entries: list[Entry], *, session_id: str | None = None) -> SessionState:
     """Replay a journal into the current `SessionState`.
 
@@ -217,6 +234,21 @@ def derive_state(entries: list[Entry], *, session_id: str | None = None) -> Sess
         not change the journal.
     """
     state = SessionState()
+    state.effects = fold_effects(entries)
+    accepted = []
+    closed = set()
+    for entry in entries:
+        if entry.kind == "run_finished":
+            closed.add(entry.run_id)
+        if entry.run_id is None or entry.run_id not in closed or entry.kind == "run_finished":
+            accepted.append(entry)
+    later_results: set[str] = set()
+    provisional_counts: dict[str, bool] = {}
+    for entry in reversed(accepted):
+        if entry.kind == "tool_result" and isinstance(entry.data.get("operation_id"), str):
+            later_results.add(entry.data["operation_id"])
+        elif entry.kind == "state_updated":
+            provisional_counts[entry.id] = _provisional_counts(entry, later_results)
     started: dict[str, None] = {}
     inputs: dict[str, PendingInput] = {}
     values: dict[str, Any] = {}
@@ -227,20 +259,32 @@ def derive_state(entries: list[Entry], *, session_id: str | None = None) -> Sess
     abandoned while it still ran) is ignored, so the conversation stays valid."""
     for entry in entries:
         kind, data = entry.kind, entry.data
+        if kind == "effect_committed" and data.get("state_patch") is not None:
+            patch = data["state_patch"]
+            values.update(copy.deepcopy(patch.get("set", {})))
+            for key in patch.get("unset", []):
+                values.pop(key, None)
+        if kind == "message" and data.get("message", {}).get("role") == "assistant":
+            state.assistant_messages += 1
         if entry.run_id is not None and entry.run_id in finished and kind != "run_finished":
             continue
         if kind == "message":
-            state.messages.append(Message.model_validate(data["message"]))
+            state.messages.append(_restore_message(data["message"]))
             state.run_messages += 1
             state.tool_results = {}
             state.pending_approvals = []
             started = {}
             inputs = {}
             checkpoints = {}  # a new message closes the turn whose calls recorded them
+            state.open_turn_starts = {}
             if entry.run_id is not None and entry.run_id == state.open_run_id:
                 _count_usage(state, data)
                 state.run_turns = max(state.run_turns, int(data.get("turn") or 0))
         elif kind == "tool_started":
+            state.open_turn_starts.setdefault(data["tool_call_id"], []).append(copy.deepcopy(data))
+            operation_id = data.get("operation_id")
+            if isinstance(operation_id, str):
+                state.tool_attempts[operation_id] = state.tool_attempts.get(operation_id, 0) + 1
             started[data["tool_call_id"]] = None
             counted[data["tool_call_id"]] = None
         elif kind == "tool_result":
@@ -257,6 +301,7 @@ def derive_state(entries: list[Entry], *, session_id: str | None = None) -> Sess
                 _count_usage(state, data)
         elif kind == "tool_deferred":
             waiting = PendingInput.model_validate(data["input"])
+            waiting.held_record_id = data.get("held_record_id", waiting.held_record_id)
             started.pop(waiting.tool_call_id, None)
             inputs[waiting.tool_call_id] = waiting
             counted[waiting.tool_call_id] = None
@@ -267,8 +312,11 @@ def derive_state(entries: list[Entry], *, session_id: str | None = None) -> Sess
                     checkpoints.setdefault(operation, {})[key] = data.get("value")
                 _count_usage(state, data)  # usage from ctx.add_usage may ride on it
         elif kind == "state_updated":
-            values = data.get("values", {})
+            if provisional_counts.get(entry.id, False):
+                values = copy.deepcopy(data.get("values", {}))
         elif kind == "run_started":
+            if entry.run_id is not None:
+                state.run_requires[entry.run_id] = list(data.get("requires", []))
             state.open_run_id = entry.run_id
             state.agent = data.get("agent")
             state.run_messages = 0
@@ -277,6 +325,18 @@ def derive_state(entries: list[Entry], *, session_id: str | None = None) -> Sess
             state.run_turns = 0
             counted = {}
             checkpoints = {}
+        elif kind == "run_resumed":
+            if entry.run_id is not None:
+                state.run_requires[entry.run_id] = list(data.get("requires", []))
+        elif kind == "approval_decided":
+            operation_id = data.get("operation_id")
+            if isinstance(operation_id, str):
+                state.decisions[operation_id] = copy.deepcopy(data)
+                state.decision_counts[operation_id] = state.decision_counts.get(operation_id, 0) + 1
+        elif kind == "memo_recorded":
+            state.memos.setdefault(data["operation_id"], {})[data["name"]] = copy.deepcopy(
+                data["value"]
+            )
         elif kind == "agent_switched":
             state.agent = data.get("agent")
         elif kind == "run_paused":
@@ -300,11 +360,15 @@ def derive_state(entries: list[Entry], *, session_id: str | None = None) -> Sess
                 state.pending_approvals = []
                 inputs = {}
         elif kind == "compaction":
-            state.messages = [Message.model_validate(item) for item in data["messages"]]
+            state.messages = [_restore_message(item) for item in data["messages"]]
         elif kind == "guardrail_tripped" and data.get("stage") == "output":
             _mark_blocked(state.messages)
     state.started_tools = list(started)
     state.pending_inputs = list(inputs.values())
+    if session_id is not None:
+        held = {item.id: item for item in state.effects.held(session_id)}
+        for waiting in state.pending_inputs:
+            waiting.held = held.get(waiting.held_record_id)
     state.run_tool_call_ids = list(counted)
     state.values = copy.deepcopy(values)
     if state.open_run_id is not None:  # only the open run's last turn can repeat a call
@@ -376,11 +440,6 @@ class SessionStatus(BaseModel):
     """
 
     session_id: str
-    lease_epoch: int = 0
-    lease_acquired_at: float | None = None
-    has_effects: bool = False
-    retry_after: float | None = None
-    incarnation: str | None = None
     status: SessionRunStatus = "idle"
     open_run_id: str | None = None
     """Id of the run that started and has not finished."""
@@ -398,6 +457,11 @@ class SessionStatus(BaseModel):
     when the lease was released or never taken."""
     lease_expires_at: float | None = None
     """When the lease expires, in seconds since the epoch on the store's clock."""
+    lease_epoch: int = 0
+    lease_acquired_at: float | None = None
+    has_effects: bool = False
+    retry_after: float | None = None
+    incarnation: str | None = None
 
     def lease_active(self, now: float | None = None) -> bool:
         """True when a worker holds a lease that has not expired.
@@ -423,24 +487,37 @@ def advance_status(status: SessionStatus, entry: Entry) -> None:
     older run) leave the status as it is.
     """
     kind = entry.kind
+    if (
+        kind in EFFECT_KINDS
+        or kind == "lease_acquired"
+        or (kind == "run_started" and REQUIRES_EFFECTS in entry.data.get("requires", []))
+    ):
+        status.has_effects = True
+    if entry.run_id is None or kind == "lease_acquired":
+        return
     if kind == "run_started":
         status.status = "running"
         status.open_run_id = entry.run_id
         status.agent = entry.data.get("agent")
         status.failures = 0
+        status.retry_after = None
     elif status.open_run_id is None or entry.run_id != status.open_run_id:
         return
     elif kind == "run_finished":
         status.status = "idle"
         status.open_run_id = None
         status.failures = 0
+        status.retry_after = None
     elif kind == "run_paused":
         status.status = "paused"
     elif kind == "run_failed":
         status.status = "failed"
         status.failures += 1
+        status.retry_after = entry.data.get("retry_after")
     else:
         status.status = "running"
+        if kind == "run_resumed":
+            status.retry_after = None
 
 
 class LeaseGrant(BaseModel):
@@ -470,18 +547,21 @@ class SessionStore(ABC):
     takeover_grace_s: float = 1.0
 
     async def now(self) -> float:
-        raise NotImplementedError(_unsupported(self, "store clock"))
+        """Return the store clock, required when the store advertises ``now``."""
+        raise NotImplementedError(_unsupported(self, "store time"))
 
     async def acquire_lease_grant(
         self, session_id: str, owner: str, ttl_s: float
     ) -> LeaseGrant | None:
+        """Acquire or renew a lease with a monotonic per-session epoch."""
         raise NotImplementedError(_unsupported(self, "lease epochs"))
 
-    async def get_claim(self, namespace: str, effect: str, key: str):
-        raise NotImplementedError(_unsupported(self, "effect claims"))
+    async def get_claim(self, namespace: str, effect: str, key: str) -> Claim | None:
+        raise NotImplementedError(_unsupported(self, "claims"))
 
     async def purge_claims(self, *, older_than: float) -> int:
-        raise NotImplementedError(_unsupported(self, "effect claims"))
+        """Remove claims last changed before this store-clock timestamp."""
+        raise NotImplementedError(_unsupported(self, "claims"))
 
     async def register_effect(
         self, effect: str, version: str, key_spec_digest: str, request_schema_digest: str
@@ -489,17 +569,19 @@ class SessionStore(ABC):
         raise NotImplementedError(_unsupported(self, "effect registry"))
 
     async def salt(self) -> bytes:
-        raise NotImplementedError(_unsupported(self, "effect salt"))
+        """Return the random salt created once for this store."""
+        raise NotImplementedError(_unsupported(self, "salt"))
 
     @abstractmethod
-    async def append(self, session_id: str, entries: list[Entry]) -> None:
+    async def append(self, session_id: str, entries: list[Entry]) -> list[int] | None:
         """Durably add ``entries`` to the end of the session, in order.
 
-        One call is all or nothing: it writes every entry or, when it raises,
-        none of them. The agent relies on this to journal related entries
-        together (the start of a run, an answer with its turn, a handoff with
-        its switch), so a crash never leaves half of them. A store that writes
-        entries one at a time must wrap a call in one transaction.
+        One batch is atomic. Repeated entry ids return their original positions;
+        a partial overlap raises EntryConflict. Validation SessionError means
+        nothing was written. Other errors may have lost an acknowledgement and
+        require identical retries or read-back through append_fenced. A failed
+        call must finish deciding its write before returning, including cancellation.
+        Built-in stores return positions; a legacy store may return None.
         """
 
     @abstractmethod
@@ -577,10 +659,13 @@ class SessionStore(ABC):
         """Give up ``owner``'s lease. Does nothing when ``owner`` does not hold it."""
         raise NotImplementedError(_unsupported(self, "leases"))
 
-    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
+    async def append_leased(
+        self, session_id: str, entries: list[Entry], owner: str
+    ) -> list[int] | None:
         """Append like `append`, but only while ``owner`` holds the session's lease.
 
-        The lease check and the write happen in one transaction, so a worker
+        Entry identities are checked before the owner: a fully repeated batch
+        succeeds even after takeover. The lease check and write are atomic, so a worker
         whose lease was taken over can no longer write to the journal (the
         lease acts as a fencing token). Like `append`, one call writes all of
         its entries or none.
@@ -631,6 +716,559 @@ def _check_ttl(ttl_s: float) -> None:
         raise ValueError(f"A lease needs a finite ttl_s above 0 seconds, not {ttl_s!r}.")
 
 
+def _check_grace(grace: float) -> None:
+    if not 0 <= grace < float("inf"):
+        raise ValueError("takeover_grace_s must be finite and nonnegative.")
+
+
+def _admit_batch(
+    existing_ids: Mapping[str, int], entries: list[Entry], holder: str | None, owner: str | None
+) -> Literal["write", "duplicate"]:
+    """Check identities before the lease, without changing the journal (M38)."""
+    ids = [entry.id for entry in entries]
+    if any(not entry_id for entry_id in ids) or len(set(ids)) != len(ids):
+        raise EntryConflict("An append needs distinct, nonempty entry ids.")
+    present = sum(entry_id in existing_ids for entry_id in ids)
+    if present == len(ids):
+        return "duplicate"
+    if present:
+        raise EntryConflict("Only part of this append is already present in the journal.")
+    if owner is not None and holder != owner:
+        raise LeaseError(_lease_lost("<current>", owner, holder))
+    return "write"
+
+
+def _check_unleased(entry: Entry, status: SessionStatus, owner: str | None) -> None:
+    if owner is None and (
+        entry.kind in EFFECT_KINDS or (status.has_effects and entry.kind in LIFECYCLE_KINDS)
+    ):
+        raise SessionError("Effect and effect-session lifecycle entries require a leased writer.")
+
+
+def _claim_key(entry: Entry) -> tuple[str, str, str]:
+    try:
+        key = tuple(entry.data[name] for name in ("namespace", "name", "key"))
+        if not all(isinstance(value, str) and value for value in key):
+            raise ValueError("invalid effect reference")
+        return key
+    except (KeyError, ValueError) as error:
+        raise SessionError("Effect entries need a namespace, name and key.") from error
+
+
+def _registry_result(old: tuple[str, str] | None, key: str, schema: str) -> str:
+    if old is None:
+        return "registered"
+    if old[0] != key:
+        return "key_changed"
+    return "matches" if old[1] == schema else "schema_changed"
+
+
+def _apply_fold(view: EffectView, entry: Entry) -> None:
+    try:
+        view.apply(entry)
+    except (ValueError, TypeError, KeyError) as error:
+        raise SessionError("Invalid effect journal entry.") from error
+
+
+def _reconcile_claim(claim: Claim, view: EffectView, session_id: str, incarnation: str) -> Claim:
+    """Only all-attempt fold evidence can release earlier uncertainty."""
+    if (claim.session_id, claim.incarnation) != (session_id, incarnation):
+        return claim
+    operation = view.get(claim.namespace, claim.effect, claim.key)
+    if operation is None:
+        return claim
+    result = claim.model_copy(deep=True)
+    if operation.state == "C":
+        result.status = "committed"
+        result.receipt = copy.deepcopy(operation.receipt)
+    elif operation.state == "R":
+        result.status = "rejected"
+    elif operation.state == "N" and operation.attempts:
+        result.status = "not_sent"
+    elif operation.state in ("X", "NA", "CU"):
+        result.status = "held"
+    elif any(attempt.terminal is not None for attempt in operation.attempts):
+        result.status = "held"
+    return result
+
+
+def _check_delete(
+    entries: list[Entry],
+    session_id: str,
+    features: frozenset[str],
+    force: bool | Literal["forget_effects"],
+) -> None:
+    if type(force) is not bool and force != "forget_effects":
+        raise ValueError("force must be False, True or 'forget_effects'.")
+    if "claims" not in features and any(e.kind in EFFECT_KINDS for e in entries):
+        if force != "forget_effects":
+            raise SessionError("This store has no claims; use force='forget_effects' explicitly.")
+    if not force and fold_effects(entries).held(session_id):
+        raise SessionError("The session has held effects; use force=True to retain tombstones.")
+
+
+def _reappend_entries(entries: list[Entry]) -> list[Entry]:
+    """Preserve every entry identity and payload during uncertain append retries (M19)."""
+    return entries
+
+
+async def append_fenced(
+    store: SessionStore,
+    session_id: str,
+    entries: list[Entry],
+    owner: str | None,
+    *,
+    fence: Callable[[], bool],
+    attempts: int = 3,
+) -> list[int] | None:
+    """Resolve uncertain writes by identical retries and read-back (SPEC 7.7.2–3)."""
+    if type(attempts) is not int or attempts < 0:
+        raise ValueError("attempts must be a nonnegative integer.")
+
+    async def write(batch):
+        if owner is None:
+            return await store.append(session_id, batch)
+        return await store.append_leased(session_id, batch, owner)
+
+    cancelled = None
+    try:
+        return await write(entries)
+    except (LeaseError, EntryConflict, ClaimConflict):
+        raise
+    except SessionError as error:
+        if not isinstance(error, JournalOutcomeUnknown):
+            raise
+        last_error = error
+    except BaseException as error:
+        if not isinstance(error, (Exception, asyncio.CancelledError)):
+            raise
+        last_error = error
+        if isinstance(error, asyncio.CancelledError):
+            cancelled = error
+
+    async def decide():
+        nonlocal last_error, cancelled
+        for _ in range(attempts):
+            if not fence():
+                break
+            try:
+                return await write(_reappend_entries(entries))
+            except (Exception, asyncio.CancelledError) as error:
+                last_error = error
+                if isinstance(error, asyncio.CancelledError):
+                    cancelled = error
+        try:
+            found = {entry.id: entry.seq for entry in await store.load(session_id)}
+        except (Exception, asyncio.CancelledError) as error:
+            raise JournalOutcomeUnknown("Append outcome could not be read back.") from error
+        present = [entry.id in found for entry in entries]
+        if all(present):
+            return [found[entry.id] for entry in entries]
+        if any(present):
+            raise JournalOutcomeUnknown("Read-back found only part of an atomic append.")
+        raise last_error
+
+    deciding = asyncio.create_task(decide())
+    while not deciding.done():
+        try:
+            await asyncio.shield(deciding)
+        except asyncio.CancelledError as error:
+            cancelled = error
+        except Exception:
+            break
+    if cancelled is not None:
+        if not deciding.cancelled():
+            error = deciding.exception()
+            if isinstance(error, JournalOutcomeUnknown):
+                raise error
+        raise cancelled
+    return deciding.result()
+
+
+_DETACHED: set[asyncio.Task[Any]] = set()
+
+
+def _detach(task: asyncio.Task[Any]) -> None:
+    _DETACHED.add(task)
+
+    def finished(done):
+        _DETACHED.discard(done)
+        if not done.cancelled():
+            done.exception()
+
+    task.add_done_callback(finished)
+
+
+class Lease:
+    """One acquisition, its monotonic self-fence, and the sends it must outlive."""
+
+    owner: str
+    worker: str
+    epoch: int | None
+    acquired_at: float | None
+    ttl_s: float
+    timing: Timing
+
+    def __init__(
+        self,
+        store: SessionStore,
+        session_id: str,
+        *,
+        worker: str,
+        ttl_s: float,
+        purpose: Literal["run", "recovery", "settle", "recheck", "workflow"],
+        timing: Timing,
+    ) -> None:
+        _check_ttl(ttl_s)
+        self.store, self.session_id, self.worker = store, session_id, worker
+        self.ttl_s, self.timing, self.purpose = ttl_s, timing, purpose
+        self.owner = _owner_token(worker)
+        self.epoch: int | None = None
+        self.acquired_at: float | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._deadline = float("-inf")
+        self._lost = False
+        self._first_written = False
+        self._counter_lock = threading.Lock()
+        self._tracked: set[Any] = set()
+        self._drained: asyncio.Event | None = None
+
+    async def acquire(self) -> bool:
+        self._loop = asyncio.get_running_loop()
+        self._drained = asyncio.Event()
+        self._drained.set()
+        sent_at = self._loop.time()
+        if "epochs" in self.store.features:
+            grant = await self.store.acquire_lease_grant(self.session_id, self.owner, self.ttl_s)
+            if grant is None:
+                return False
+            self.epoch, self.acquired_at = grant.epoch, grant.acquired_at
+        elif not await self.store.acquire_lease(self.session_id, self.owner, self.ttl_s):
+            return False
+        self._deadline = sent_at + self.ttl_s * (1 - self.timing.rho)
+        return True
+
+    async def renew(self) -> bool:
+        if self._loop is None:
+            return False
+        sent_at = self._loop.time()
+        renewed = await self.store.renew_lease(self.session_id, self.owner, self.ttl_s)
+        if renewed:
+            self._deadline = sent_at + self.ttl_s * (1 - self.timing.rho)
+        return renewed
+
+    def remaining(self) -> float:
+        return self._deadline - self._loop.time() if self._loop else float("-inf")
+
+    def lost(self) -> bool:
+        return self._lost or self.remaining() <= 0
+
+    def first_entries(self) -> list[Entry]:
+        if self.epoch is None or self._first_written:
+            return []
+        return [
+            Entry(
+                id=lease_entry_id(self.owner),
+                kind="lease_acquired",
+                data={
+                    "epoch": self.epoch,
+                    "acquired_at": self.acquired_at,
+                    "worker": self.worker,
+                    "purpose": self.purpose,
+                },
+            )
+        ]
+
+    def mark_first_written(self) -> None:
+        self._first_written = True
+
+    def track(self, fut: asyncio.Future[Any] | concurrent.futures.Future[Any]) -> None:
+        if self._loop is None or self._drained is None:
+            raise SessionError("Acquire the lease before tracking a send.")
+        with self._counter_lock:
+            if fut in self._tracked:
+                return
+            self._tracked.add(fut)
+        self._loop.call_soon_threadsafe(self._drained.clear)
+
+        def ended(_):
+            self._loop.call_soon_threadsafe(self._untrack, fut)
+
+        fut.add_done_callback(ended)
+
+    def _untrack(self, fut) -> None:
+        with self._counter_lock:
+            self._tracked.discard(fut)
+            empty = not self._tracked
+        if empty and self._drained is not None:
+            self._drained.set()
+
+    def running_sends(self) -> int:
+        with self._counter_lock:
+            return len(self._tracked)
+
+    async def sends_drained(self) -> None:
+        if self._drained is None:
+            return
+        while self.running_sends():
+            self._drained.clear()
+            await self._drained.wait()
+
+    async def keep(self, *, on_lost: Callable[[str], None]) -> None:
+        notified = False
+        renewing = None
+
+        def lose(reason):
+            nonlocal notified
+            self._lost = True
+            if not notified:
+                notified = True
+                on_lost(reason)
+
+        try:
+            while True:
+                remaining = self.remaining() - self.timing.m_s
+                if self._lost or remaining <= 0:
+                    lose("Lease self-fence reached its safety margin.")
+                    if not self.running_sends():
+                        return
+                # Loss stops new sends permanently, but existing sends and their
+                # completion watchers still need renewal until they finish.
+                await asyncio.sleep(
+                    self.ttl_s / 3 if self._lost else min(self.ttl_s / 3, remaining)
+                )
+                remaining = self.remaining() - self.timing.m_s
+                if remaining <= 0 and not self._lost:
+                    continue
+                if renewing is None:
+                    renewing = asyncio.create_task(self.renew())
+                timeout = self.ttl_s / 3 if self._lost else remaining
+                done, _ = await asyncio.wait({renewing}, timeout=timeout)
+                if not done:
+                    lose("Lease renewal did not finish before the self-fence.")
+                    continue  # retain one in-flight renewal, not an unbounded queue
+                try:
+                    renewed = renewing.result()
+                except (Exception, asyncio.CancelledError):
+                    renewed = False
+                renewing = None
+                if not renewed or self.remaining() < self.timing.m_s:
+                    lose("Lease renewal failed or arrived after the self-fence.")
+        finally:
+            if renewing is not None:
+                _detach(renewing)
+
+    async def release(self) -> None:
+        await self.store.release_lease(self.session_id, self.owner)
+        self._lost = True
+
+
+class LeasedWriter:
+    """The shared journal writer for runs, operators, runtimes and workflows."""
+
+    store: SessionStore
+    session_id: str
+    worker: str
+    lease: Lease
+    timing: Timing
+    leased: bool
+    wrapped: SessionStore
+
+    def __init__(
+        self,
+        store: SessionStore,
+        session_id: str,
+        *,
+        worker: str,
+        ttl_s: float,
+        purpose: Literal["run", "recovery", "settle", "recheck", "workflow"],
+        journal_acquisition: bool | None = None,
+    ) -> None:
+        self.store, self.wrapped, self.session_id, self.worker = store, store, session_id, worker
+        self.timing = Timing.for_lease(
+            ttl_s, store.takeover_grace_s, effects=journal_acquisition is True
+        )
+        self.lease = Lease(
+            store, session_id, worker=worker, ttl_s=ttl_s, purpose=purpose, timing=self.timing
+        )
+        self.leased = True
+        self._journal_acquisition = journal_acquisition
+        self._view = EffectView()
+        self._poisoned = False
+        self._opened = False
+        self._closed = False
+        self._append_lock = asyncio.Lock()
+        self._closing: asyncio.Task[None] | None = None
+
+    async def open(self) -> bool:
+        if self._opened or self._closed:
+            raise SessionError("A LeasedWriter can be opened only once.")
+        try:
+            if not await self.lease.acquire():
+                return False
+        except NotImplementedError:
+            if "leases" in self.store.features or "epochs" in self.store.features:
+                raise
+            self.leased = False
+        try:
+            if self._journal_acquisition is None:
+                try:
+                    self._journal_acquisition = (
+                        await self.store.status(self.session_id)
+                    ).has_effects
+                except NotImplementedError:
+                    self._journal_acquisition = False
+            self.timing = Timing.for_lease(
+                self.lease.ttl_s, self.store.takeover_grace_s, effects=self._journal_acquisition
+            )
+            self.lease.timing = self.timing
+            self._opened = True
+            return True
+        except BaseException:
+            if self.leased:
+                await self.lease.release()
+            raise
+
+    def _ready_to_write(self, *, completion: bool = False) -> None:
+        if not self._opened or self._closed or (self._closing is not None and not completion):
+            raise SessionError("Open this writer before use; a closing writer cannot write.")
+        if self._poisoned:
+            raise JournalOutcomeUnknown("This writer is poisoned after an unresolved append.")
+
+    async def load(self) -> list[Entry]:
+        self._ready_to_write()
+        async with self._append_lock:
+            entries = await self.store.load(self.session_id)
+            self._view = fold_effects(entries)
+            return entries
+
+    async def _append(self, entries: Sequence[Entry], *, effect: bool) -> list[int] | None:
+        completion = effect and bool(entries) and all(self._admitted_completion(e) for e in entries)
+        self._ready_to_write(completion=completion)
+        async with self._append_lock:
+            self._ready_to_write(completion=completion)
+            if effect and not self.leased:
+                raise SessionError("Effect writes require a lease.")
+            first = self.lease.first_entries() if self._journal_acquisition else []
+            batch = [*first, *entries]
+            try:
+                seqs = await append_fenced(
+                    self.store,
+                    self.session_id,
+                    batch,
+                    self.lease.owner if self.leased else None,
+                    fence=lambda: (
+                        self.lease.remaining() >= self.timing.m_s
+                        if effect
+                        else not self.lease.lost()
+                    ),
+                )
+            except JournalOutcomeUnknown:
+                self._poisoned = True
+                raise
+            except asyncio.CancelledError:
+                # append_fenced resolved the outcome before preserving cancellation.
+                # Refresh acquisition bookkeeping so a later cleanup write cannot
+                # accidentally combine an existing acquisition with fresh entry ids.
+                reading = asyncio.create_task(self.store.load(self.session_id))
+                while not reading.done():
+                    try:
+                        await asyncio.shield(reading)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                try:
+                    loaded = reading.result()
+                    self._view = fold_effects(loaded)
+                    if first and any(e.id == first[0].id for e in loaded):
+                        self.lease.mark_first_written()
+                except (Exception, asyncio.CancelledError) as error:
+                    self._poisoned = True
+                    raise JournalOutcomeUnknown(
+                        "Cancelled append could not refresh the view."
+                    ) from error
+                raise
+            if seqs is not None:
+                for entry, seq in zip(batch, seqs, strict=True):
+                    self._view.apply(entry.model_copy(update={"seq": seq}))
+            else:
+                self._view = fold_effects(await self.store.load(self.session_id))
+            if first:
+                self.lease.mark_first_written()
+            return seqs[len(first) :] if seqs is not None else None
+
+    def _admitted_completion(self, entry: Entry) -> bool:
+        if entry.kind not in {"effect_send_ended", "effect_committed", "effect_failed"}:
+            return False
+        data = entry.data
+        operation = self._view.get(data.get("namespace"), data.get("name"), data.get("key"))
+        return (
+            operation is not None
+            and operation.record_id == data.get("record_id")
+            and any(
+                attempt.number == data.get("attempt")
+                and attempt.intent_seq == data.get("intent_seq")
+                for attempt in operation.attempts
+            )
+        )
+
+    async def append(self, entries: Sequence[Entry]) -> list[int] | None:
+        return await self._append(entries, effect=False)
+
+    async def append_effect(self, entries: Sequence[Entry]) -> list[int]:
+        seqs = await self._append(entries, effect=True)
+        if seqs is None:
+            raise SessionError("Effect writes require entry-id acknowledgements.")
+        return seqs
+
+    def view(self) -> EffectView:
+        return self._view
+
+    async def store_now(self) -> float:
+        return await self.store.now()
+
+    async def salt(self) -> bytes:
+        return await self.store.salt()
+
+    def poisoned(self) -> bool:
+        return self._poisoned
+
+    def track(self, fut: asyncio.Future[Any] | concurrent.futures.Future[Any]) -> None:
+        """Track sends and their already-created completion watchers before closing."""
+        self.lease.track(fut)
+
+    async def keep(self, *, on_lost: Callable[[str], None]) -> None:
+        if self.leased:
+            await self.lease.keep(on_lost=on_lost)
+
+    async def _close(self) -> None:
+        keeper = (
+            asyncio.create_task(self.lease.keep(on_lost=lambda _: None)) if self.leased else None
+        )
+        try:
+            await self.lease.sends_drained()
+            async with self._append_lock:
+                if self.leased:
+                    await self.lease.release()
+                self._closed = True
+        finally:
+            if keeper is not None:
+                keeper.cancel()
+                await asyncio.gather(keeper, return_exceptions=True)
+
+    async def close(self) -> None:
+        if not self._opened or self._closed:
+            return
+        if self._closing is None:
+            self._closing = asyncio.create_task(self._close())
+        try:
+            await asyncio.shield(self._closing)
+        except asyncio.CancelledError:
+            _detach(self._closing)
+            raise
+
+
 def _lease_lost(session_id: str, owner: str, holder: str | None) -> str:
     who = f"worker {holder!r} holds it now" if holder else "nobody holds it now"
     return (
@@ -642,49 +1280,85 @@ def _lease_lost(session_id: str, owner: str, holder: str | None) -> str:
 class InMemoryStore(SessionStore):
     """Keeps journals in a dict. For tests and for sessions that need not survive a restart.
 
-    Run status and leases are supported, with ``time.time()`` as the clock.
+    Run status and leases use an injectable store clock (``time.time`` by default)
+    and a one-second takeover grace.
     They only coordinate tasks of one process, since nothing else can see
     the store.
     """
 
+    features = FEATURES
+
     def __init__(
         self, *, clock: Callable[[], float] | None = None, takeover_grace_s: float = 1.0
     ) -> None:
+        _check_grace(takeover_grace_s)
         self._clock = clock or time.time
         self.takeover_grace_s = takeover_grace_s
         self._sessions: dict[str, list[Entry]] = {}
         self._status: dict[str, SessionStatus] = {}
+        self._epochs: dict[str, int] = {}
+        self._claims: dict[tuple[str, str, str], Claim] = {}
+        self._registry: dict[tuple[str, str], tuple[str, str]] = {}
+        self._salt = secrets.token_bytes(32)
+
+    async def now(self) -> float:
+        return self._clock()
 
     def _row(self, session_id: str) -> SessionStatus:
         return self._status.setdefault(session_id, SessionStatus(session_id=session_id))
 
-    def _write(self, session_id: str, entries: list[Entry]) -> None:
-        if not entries:
-            return
-        journal = self._sessions.setdefault(session_id, [])
-        row = self._row(session_id)
-        for entry in entries:
-            stored = entry.model_copy(update={"seq": len(journal) + 1})
-            journal.append(stored)
+    def _write(self, session_id: str, entries: list[Entry], owner: str | None = None) -> list[int]:
+        journal = self._sessions.get(session_id, [])
+        row = self._status.get(session_id, SessionStatus(session_id=session_id)).model_copy()
+        ids = {entry.id: entry.seq for entry in journal}
+        if _admit_batch(ids, entries, row.lease_owner, owner) == "duplicate":
+            return [ids[entry.id] for entry in entries]
+        now = self._clock()
+        row.incarnation = row.incarnation or uuid.uuid4().hex
+        claims = self._claims.copy()
+        view = fold_effects(journal) if any(e.kind in EFFECT_KINDS for e in entries) else None
+        added = []
+        for offset, entry in enumerate(entries, start=1):
+            _check_unleased(entry, row, owner)
+            _entry_json(entry)  # validate the entire batch before publishing it
+            stored = entry.model_copy(deep=True, update={"seq": len(journal) + offset})
+            added.append(stored)
+            if view is not None:
+                _apply_fold(view, stored)
+            if entry.kind in EFFECT_KINDS:
+                key = _claim_key(entry)
+                try:
+                    claim = next_claim(
+                        claims.get(key),
+                        stored,
+                        session_id=session_id,
+                        incarnation=row.incarnation,
+                        now=now,
+                    )
+                except ValueError as error:
+                    raise SessionError("Invalid effect journal entry.") from error
+                if claim is not None:
+                    claims[key] = _reconcile_claim(claim, view, session_id, row.incarnation)
             advance_status(row, stored)
-        row.updated_at = time.time()
+        row.updated_at = now
+        self._sessions[session_id] = journal + added
+        self._status[session_id] = row
+        self._claims = claims
+        return [entry.seq for entry in added]
 
-    async def append(self, session_id: str, entries: list[Entry]) -> None:
-        self._write(session_id, entries)
+    async def append(self, session_id: str, entries: list[Entry]) -> list[int]:
+        return self._write(session_id, entries)
 
-    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
-        row = self._status.get(session_id)
-        holder = row.lease_owner if row is not None else None
-        if holder != owner:
-            raise LeaseError(_lease_lost(session_id, owner, holder))
-        self._write(session_id, entries)
+    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> list[int]:
+        return self._write(session_id, entries, owner)
 
     async def load(self, session_id: str) -> list[Entry]:
-        return list(self._sessions.get(session_id, []))
+        return [entry.model_copy(deep=True) for entry in self._sessions.get(session_id, [])]
 
     async def delete(
         self, session_id: str, *, force: bool | Literal["forget_effects"] = False
     ) -> None:
+        _check_delete(self._sessions.get(session_id, []), session_id, self.features, force)
         self._sessions.pop(session_id, None)
         self._status.pop(session_id, None)
 
@@ -711,20 +1385,37 @@ class InMemoryStore(SessionStore):
         return [row.model_copy() for row in rows[:limit]]
 
     async def acquire_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
+        return await self.acquire_lease_grant(session_id, owner, ttl_s) is not None
+
+    async def acquire_lease_grant(
+        self, session_id: str, owner: str, ttl_s: float
+    ) -> LeaseGrant | None:
         _check_ttl(ttl_s)
-        now = time.time()
+        now = self._clock()
         row = self._row(session_id)
-        if row.lease_owner not in (None, owner) and (row.lease_expires_at or 0.0) > now:
-            return False
+        if (
+            row.lease_owner not in (None, owner)
+            and (row.lease_expires_at or 0.0) + self.takeover_grace_s > now
+        ):
+            return None
+        if row.lease_owner != owner or row.lease_epoch == 0:
+            row.lease_epoch = self._epochs.get(session_id, 0) + 1
+            self._epochs[session_id] = row.lease_epoch
+            row.lease_acquired_at = now
         row.lease_owner, row.lease_expires_at = owner, now + ttl_s
-        return True
+        return LeaseGrant(
+            owner=owner,
+            epoch=row.lease_epoch,
+            acquired_at=row.lease_acquired_at,
+            expires_at=row.lease_expires_at,
+        )
 
     async def renew_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
         _check_ttl(ttl_s)
         row = self._status.get(session_id)
         if row is None or row.lease_owner != owner:
             return False
-        row.lease_expires_at = time.time() + ttl_s
+        row.lease_expires_at = self._clock() + ttl_s
         return True
 
     async def release_lease(self, session_id: str, owner: str) -> None:
@@ -732,12 +1423,35 @@ class InMemoryStore(SessionStore):
         if row is not None and row.lease_owner == owner:
             row.lease_owner, row.lease_expires_at = None, None
 
+    async def get_claim(self, namespace: str, effect: str, key: str) -> Claim | None:
+        claim = self._claims.get((namespace, effect, key))
+        return claim.model_copy(deep=True) if claim is not None else None
 
-_SQLITE_SCHEMA_VERSION = 1
+    async def purge_claims(self, *, older_than: float) -> int:
+        keys = [key for key, claim in self._claims.items() if claim.updated_at < older_than]
+        for key in keys:
+            del self._claims[key]
+        return len(keys)
+
+    async def register_effect(
+        self, effect: str, version: str, key_spec_digest: str, request_schema_digest: str
+    ) -> Literal["registered", "matches", "key_changed", "schema_changed"]:
+        key = effect, version
+        result = _registry_result(self._registry.get(key), key_spec_digest, request_schema_digest)
+        if result == "registered":
+            self._registry[key] = key_spec_digest, request_schema_digest
+        return result
+
+    async def salt(self) -> bytes:
+        return self._salt
+
+
+_SQLITE_SCHEMA_VERSION = 2
 """Stored in ``PRAGMA user_version``. 0 is a 0.1 database: the entries table only."""
 
 _SQLITE_STATUS_COLUMNS = (
-    "session_id, status, open_run_id, agent, failures, updated_at, lease_owner, lease_expires_at"
+    "session_id, status, open_run_id, agent, failures, updated_at, lease_owner, lease_expires_at,"
+    " lease_epoch, lease_acquired_at, has_effects, retry_after, incarnation"
 )
 
 
@@ -758,6 +1472,8 @@ class SQLiteStore(SessionStore):
     process on the host shares; do not share the file across hosts.
     """
 
+    features = FEATURES
+
     def __init__(
         self,
         path: str | Path,
@@ -765,12 +1481,16 @@ class SQLiteStore(SessionStore):
         clock: Callable[[], float] | None = None,
         takeover_grace_s: float = 1.0,
     ) -> None:
+        _check_grace(takeover_grace_s)
         self._clock = clock or time.time
         self.takeover_grace_s = takeover_grace_s
         self.path = str(path)
         self._lock = threading.Lock()
         self._connection: sqlite3.Connection | None = None
         self._executor: ThreadPoolExecutor | None = None
+
+    async def now(self) -> float:
+        return self._clock()
 
     def _connect(self) -> sqlite3.Connection:
         if self._connection is None:
@@ -818,6 +1538,43 @@ class SQLiteStore(SessionStore):
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS sessions_by_status ON sessions (status, updated_at)"
                 )
+            if version < 2:
+                connection.execute("ALTER TABLE entries ADD COLUMN id TEXT")
+                connection.execute("UPDATE entries SET id = 'seq:' || seq")
+                connection.execute("CREATE UNIQUE INDEX entries_by_id ON entries (session_id, id)")
+                for definition in (
+                    "lease_epoch INTEGER NOT NULL DEFAULT 0",
+                    "lease_acquired_at REAL",
+                    "has_effects INTEGER NOT NULL DEFAULT 0",
+                    "retry_after REAL",
+                    "incarnation TEXT",
+                ):
+                    connection.execute(f"ALTER TABLE sessions ADD COLUMN {definition}")
+                for (session_id,) in connection.execute(
+                    "SELECT session_id FROM sessions WHERE updated_at IS NOT NULL"
+                ).fetchall():
+                    connection.execute(
+                        "UPDATE sessions SET incarnation = ? WHERE session_id = ?",
+                        (uuid.uuid4().hex, session_id),
+                    )
+                connection.execute(
+                    "CREATE TABLE lease_epochs (session_id TEXT PRIMARY KEY,"
+                    " epoch INTEGER NOT NULL)"
+                )
+                connection.execute(
+                    "CREATE TABLE claims (namespace TEXT, effect TEXT, key TEXT,"
+                    " data TEXT NOT NULL,"
+                    " updated_at REAL NOT NULL, PRIMARY KEY(namespace, effect, key))"
+                )
+                connection.execute(
+                    "CREATE TABLE effect_registry (effect TEXT, version TEXT, key_spec_digest TEXT,"
+                    " request_schema_digest TEXT, PRIMARY KEY(effect, version))"
+                )
+                connection.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value BLOB)")
+                connection.execute(
+                    "INSERT INTO store_meta VALUES ('salt', ?)", (secrets.token_bytes(32),)
+                )
+            if version < 1:
                 self._backfill(connection)
             connection.execute(f"PRAGMA user_version = {_SQLITE_SCHEMA_VERSION}")
             connection.execute("COMMIT")
@@ -832,7 +1589,7 @@ class SQLiteStore(SessionStore):
         current: SessionStatus | None = None
         cursor = connection.execute(
             "SELECT session_id, ts, run_id, kind,"
-            " CASE WHEN kind = 'run_started' THEN data END"
+            " CASE WHEN kind IN ('run_started', 'run_failed') THEN data END"
             " FROM entries ORDER BY session_id, seq"
         )
         for session_id, ts, run_id, kind, data in cursor:
@@ -844,8 +1601,9 @@ class SQLiteStore(SessionStore):
             current.updated_at = ts
         connection.executemany(
             "INSERT OR REPLACE INTO sessions"
-            " (session_id, status, open_run_id, agent, failures, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            " (session_id, status, open_run_id, agent, failures, updated_at,"
+            " retry_after, incarnation)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     row.session_id,
@@ -854,31 +1612,44 @@ class SQLiteStore(SessionStore):
                     row.agent,
                     row.failures,
                     row.updated_at,
+                    row.retry_after,
+                    uuid.uuid4().hex,
                 )
                 for row in rows
             ],
         )
 
-    def _append(self, session_id: str, entries: list[Entry], owner: str | None = None) -> None:
+    def _append(self, session_id: str, entries: list[Entry], owner: str | None = None) -> list[int]:
         with self._lock:
             connection = self._connect()
             connection.execute("BEGIN IMMEDIATE")
             try:
                 found = connection.execute(
-                    "SELECT status, open_run_id, agent, failures, lease_owner FROM sessions"
-                    " WHERE session_id = ?",
+                    f"SELECT {_SQLITE_STATUS_COLUMNS} FROM sessions WHERE session_id = ?",
                     (session_id,),
                 ).fetchone()
-                if owner is not None and (found is None or found[4] != owner):
-                    raise LeaseError(_lease_lost(session_id, owner, found and found[4]))
-                status = SessionStatus(session_id=session_id)
-                if found is not None:
-                    status.status, status.open_run_id, status.agent, status.failures = found[:4]
+                status = _status_row(found) if found else SessionStatus(session_id=session_id)
+                ids = dict(
+                    connection.execute(
+                        "SELECT id, seq FROM entries WHERE session_id = ?", (session_id,)
+                    )
+                )
+                if _admit_batch(ids, entries, status.lease_owner, owner) == "duplicate":
+                    connection.execute("COMMIT")
+                    return [ids[entry.id] for entry in entries]
+                status.incarnation = status.incarnation or uuid.uuid4().hex
+                now = self._clock()
                 (last,) = connection.execute(
                     "SELECT COALESCE(MAX(seq), 0) FROM entries WHERE session_id = ?", (session_id,)
                 ).fetchone()
                 rows = []
+                view = (
+                    fold_effects(self._load_locked(connection, session_id))
+                    if any(e.kind in EFFECT_KINDS for e in entries)
+                    else None
+                )
                 for offset, entry in enumerate(entries, start=1):
+                    _check_unleased(entry, status, owner)
                     rows.append(
                         (
                             session_id,
@@ -887,56 +1658,92 @@ class SQLiteStore(SessionStore):
                             entry.run_id,
                             entry.kind,
                             _entry_json(entry),
+                            entry.id,
                         )
                     )
+                    if view is not None:
+                        _apply_fold(view, entry.model_copy(update={"seq": last + offset}))
+                    if entry.kind in EFFECT_KINDS:
+                        key = _claim_key(entry)
+                        existing = connection.execute(
+                            "SELECT data FROM claims WHERE namespace = ?"
+                            " AND effect = ? AND key = ?",
+                            key,
+                        ).fetchone()
+                        try:
+                            claim = next_claim(
+                                Claim.model_validate_json(existing[0]) if existing else None,
+                                entry,
+                                session_id=session_id,
+                                incarnation=status.incarnation,
+                                now=now,
+                            )
+                        except ValueError as error:
+                            raise SessionError("Invalid effect journal entry.") from error
+                        if claim is not None:
+                            claim = _reconcile_claim(claim, view, session_id, status.incarnation)
+                            connection.execute(
+                                "INSERT INTO claims VALUES (?, ?, ?, ?, ?)"
+                                " ON CONFLICT(namespace, effect, key) DO UPDATE SET"
+                                " data = excluded.data, updated_at = excluded.updated_at",
+                                (*key, claim.model_dump_json(), claim.updated_at),
+                            )
                     advance_status(status, entry)
                 connection.executemany(
-                    "INSERT INTO entries (session_id, seq, ts, run_id, kind, data)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO entries (session_id, seq, ts, run_id, kind, data, id)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
                     rows,
                 )
                 connection.execute(
                     "INSERT INTO sessions"
-                    " (session_id, status, open_run_id, agent, failures, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET"
+                    " (session_id, status, open_run_id, agent, failures, updated_at, incarnation,"
+                    " has_effects, retry_after)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET"
                     " status = excluded.status, open_run_id = excluded.open_run_id,"
                     " agent = excluded.agent, failures = excluded.failures,"
-                    " updated_at = excluded.updated_at",
+                    " updated_at = excluded.updated_at, incarnation = excluded.incarnation,"
+                    " has_effects = excluded.has_effects, retry_after = excluded.retry_after",
                     (
                         session_id,
                         status.status,
                         status.open_run_id,
                         status.agent,
                         status.failures,
-                        time.time(),
+                        now,
+                        status.incarnation,
+                        status.has_effects,
+                        status.retry_after,
                     ),
                 )
                 connection.execute("COMMIT")
+                return list(range(last + 1, last + len(entries) + 1))
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
 
-    def _load(self, session_id: str) -> list[Entry]:
-        with self._lock:
-            rows = (
-                self._connect()
-                .execute(
-                    "SELECT seq, ts, run_id, kind, data FROM entries"
-                    " WHERE session_id = ? ORDER BY seq",
-                    (session_id,),
-                )
-                .fetchall()
-            )
+    @staticmethod
+    def _load_locked(connection: sqlite3.Connection, session_id: str) -> list[Entry]:
+        rows = connection.execute(
+            "SELECT seq, ts, run_id, kind, data, id FROM entries WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
         return [
-            Entry(seq=seq, ts=ts, run_id=run_id, kind=kind, data=json.loads(data))
-            for seq, ts, run_id, kind, data in rows
+            Entry(seq=seq, ts=ts, run_id=run_id, kind=kind, data=json.loads(data), id=entry_id)
+            for seq, ts, run_id, kind, data, entry_id in rows
         ]
 
-    def _delete(self, session_id: str) -> None:
+    def _load(self, session_id: str) -> list[Entry]:
+        with self._lock:
+            return self._load_locked(self._connect(), session_id)
+
+    def _delete(self, session_id: str, force: bool | Literal["forget_effects"] = False) -> None:
         with self._lock:
             connection = self._connect()
             connection.execute("BEGIN IMMEDIATE")
             try:
+                _check_delete(
+                    self._load_locked(connection, session_id), session_id, self.features, force
+                )
                 connection.execute("DELETE FROM entries WHERE session_id = ?", (session_id,))
                 connection.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
                 connection.execute("COMMIT")
@@ -974,24 +1781,60 @@ class SQLiteStore(SessionStore):
         with self._lock:
             return self._connect().execute(query, params).fetchall()
 
-    def _acquire(self, session_id: str, owner: str, ttl_s: float) -> bool:
-        now = time.time()
+    def _acquire(self, session_id: str, owner: str, ttl_s: float) -> LeaseGrant | None:
         with self._lock:
-            cursor = self._connect().execute(
-                "INSERT INTO sessions (session_id, lease_owner, lease_expires_at) VALUES (?, ?, ?)"
-                " ON CONFLICT (session_id) DO UPDATE SET lease_owner = excluded.lease_owner,"
-                " lease_expires_at = excluded.lease_expires_at"
-                " WHERE sessions.lease_owner IS NULL OR sessions.lease_owner = excluded.lease_owner"
-                " OR sessions.lease_expires_at <= ?",
-                (session_id, owner, now + ttl_s, now),
-            )
-            return cursor.rowcount == 1
+            connection = self._connect()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                now = self._clock()  # after both locks, never before waiting for a writer
+                found = connection.execute(
+                    f"SELECT {_SQLITE_STATUS_COLUMNS} FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                row = _status_row(found) if found else SessionStatus(session_id=session_id)
+                if (
+                    row.lease_owner not in (None, owner)
+                    and (row.lease_expires_at or 0.0) + self.takeover_grace_s > now
+                ):
+                    connection.execute("COMMIT")
+                    return None
+                if row.lease_owner != owner or row.lease_epoch == 0:
+                    old = connection.execute(
+                        "SELECT epoch FROM lease_epochs WHERE session_id = ?", (session_id,)
+                    ).fetchone()
+                    row.lease_epoch = (old[0] if old else 0) + 1
+                    row.lease_acquired_at = now
+                    connection.execute(
+                        "INSERT INTO lease_epochs VALUES (?, ?) ON CONFLICT(session_id)"
+                        " DO UPDATE SET epoch = excluded.epoch",
+                        (session_id, row.lease_epoch),
+                    )
+                connection.execute(
+                    "INSERT INTO sessions (session_id, lease_owner, lease_expires_at, lease_epoch,"
+                    " lease_acquired_at) VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(session_id) DO UPDATE SET lease_owner = excluded.lease_owner,"
+                    " lease_expires_at = excluded.lease_expires_at,"
+                    " lease_epoch = excluded.lease_epoch,"
+                    " lease_acquired_at = excluded.lease_acquired_at",
+                    (session_id, owner, now + ttl_s, row.lease_epoch, row.lease_acquired_at),
+                )
+                grant = LeaseGrant(
+                    owner=owner,
+                    epoch=row.lease_epoch,
+                    acquired_at=row.lease_acquired_at,
+                    expires_at=now + ttl_s,
+                )
+                connection.execute("COMMIT")
+                return grant
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
 
     def _renew(self, session_id: str, owner: str, ttl_s: float) -> bool:
         with self._lock:
             cursor = self._connect().execute(
                 "UPDATE sessions SET lease_expires_at = ? WHERE session_id = ? AND lease_owner = ?",
-                (time.time() + ttl_s, session_id, owner),
+                (self._clock() + ttl_s, session_id, owner),
             )
             return cursor.rowcount == 1
 
@@ -1009,13 +1852,11 @@ class SQLiteStore(SessionStore):
                 self._connection.close()
                 self._connection = None
 
-    async def append(self, session_id: str, entries: list[Entry]) -> None:
-        if entries:
-            await self._call(self._append, session_id, entries)
+    async def append(self, session_id: str, entries: list[Entry]) -> list[int]:
+        return await self._call(self._append, session_id, entries)
 
-    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
-        if entries:
-            await self._call(self._append, session_id, entries, owner)
+    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> list[int]:
+        return await self._call(self._append, session_id, entries, owner)
 
     async def load(self, session_id: str) -> list[Entry]:
         return await self._call(self._load, session_id)
@@ -1023,7 +1864,7 @@ class SQLiteStore(SessionStore):
     async def delete(
         self, session_id: str, *, force: bool | Literal["forget_effects"] = False
     ) -> None:
-        await self._call(self._delete, session_id)
+        await self._call(self._delete, session_id, force)
 
     async def status(self, session_id: str) -> SessionStatus:
         return await self._call(self._status, session_id)
@@ -1040,6 +1881,11 @@ class SQLiteStore(SessionStore):
         return [_status_row(row) for row in rows]
 
     async def acquire_lease(self, session_id: str, owner: str, ttl_s: float) -> bool:
+        return await self.acquire_lease_grant(session_id, owner, ttl_s) is not None
+
+    async def acquire_lease_grant(
+        self, session_id: str, owner: str, ttl_s: float
+    ) -> LeaseGrant | None:
         _check_ttl(ttl_s)
         return await self._call(self._acquire, session_id, owner, ttl_s)
 
@@ -1049,6 +1895,72 @@ class SQLiteStore(SessionStore):
 
     async def release_lease(self, session_id: str, owner: str) -> None:
         await self._call(self._release, session_id, owner)
+
+    def _get_claim(self, namespace: str, effect: str, key: str) -> Claim | None:
+        with self._lock:
+            found = (
+                self._connect()
+                .execute(
+                    "SELECT data FROM claims WHERE namespace = ? AND effect = ? AND key = ?",
+                    (namespace, effect, key),
+                )
+                .fetchone()
+            )
+        return Claim.model_validate_json(found[0]) if found else None
+
+    async def get_claim(self, namespace: str, effect: str, key: str) -> Claim | None:
+        return await self._call(self._get_claim, namespace, effect, key)
+
+    def _purge_claims(self, older_than: float) -> int:
+        with self._lock:
+            return (
+                self._connect()
+                .execute("DELETE FROM claims WHERE updated_at < ?", (older_than,))
+                .rowcount
+            )
+
+    async def purge_claims(self, *, older_than: float) -> int:
+        return await self._call(self._purge_claims, older_than)
+
+    def _register_effect(self, effect: str, version: str, key: str, schema: str) -> str:
+        with self._lock:
+            connection = self._connect()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                old = connection.execute(
+                    "SELECT key_spec_digest, request_schema_digest FROM effect_registry"
+                    " WHERE effect = ? AND version = ?",
+                    (effect, version),
+                ).fetchone()
+                result = _registry_result(old, key, schema)
+                if result == "registered":
+                    connection.execute(
+                        "INSERT INTO effect_registry VALUES (?, ?, ?, ?)",
+                        (effect, version, key, schema),
+                    )
+                connection.execute("COMMIT")
+                return result
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    async def register_effect(
+        self, effect: str, version: str, key_spec_digest: str, request_schema_digest: str
+    ) -> Literal["registered", "matches", "key_changed", "schema_changed"]:
+        return await self._call(
+            self._register_effect, effect, version, key_spec_digest, request_schema_digest
+        )
+
+    def _read_salt(self) -> bytes:
+        with self._lock:
+            return bytes(
+                self._connect()
+                .execute("SELECT value FROM store_meta WHERE key = 'salt'")
+                .fetchone()[0]
+            )
+
+    async def salt(self) -> bytes:
+        return await self._call(self._read_salt)
 
     async def aclose(self) -> None:
         if self._executor is None:
@@ -1062,7 +1974,20 @@ class SQLiteStore(SessionStore):
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qagents-sqlite")
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, functools.partial(function, *args))
+        pending = loop.run_in_executor(self._executor, functools.partial(function, *args))
+        cancelled = None
+        while not pending.done():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError as error:
+                cancelled = error
+        # A cancelled caller may read back as soon as this call returns. The worker
+        # must have decided its write before that happens (SPEC 7.7.3).
+        if cancelled is not None:
+            if not pending.cancelled():
+                pending.exception()  # consume a worker failure without replacing cancellation
+            raise cancelled
+        return pending.result()
 
 
 def _entry_json(entry: Entry) -> str:
@@ -1072,7 +1997,10 @@ def _entry_json(entry: Entry) -> str:
     cannot be encoded as UTF-8, so such an entry is written with ASCII escapes,
     which bring the same string back when it is read.
     """
-    text = json.dumps(entry.data, ensure_ascii=False)
+    try:
+        text = json.dumps(entry.data, ensure_ascii=False, allow_nan=False)
+    except (ValueError, TypeError) as error:
+        raise SessionError("Entry data must contain finite JSON values.") from error
     try:
         text.encode("utf-8")
     except UnicodeEncodeError:
@@ -1100,7 +2028,7 @@ def _enable_wal(connection: sqlite3.Connection, timeout_s: float = 5.0) -> None:
 
 
 def _status_row(row: Any) -> SessionStatus:
-    session_id, status, open_run_id, agent, failures, updated_at, owner, expires = row
+    session_id, status, open_run_id, agent, failures, updated_at, owner, expires, *extra = row
     return SessionStatus(
         session_id=session_id,
         status=status,
@@ -1110,6 +2038,13 @@ def _status_row(row: Any) -> SessionStatus:
         updated_at=updated_at,
         lease_owner=owner,
         lease_expires_at=expires,
+        **dict(
+            zip(
+                ("lease_epoch", "lease_acquired_at", "has_effects", "retry_after", "incarnation"),
+                extra,
+                strict=False,
+            )
+        ),
     )
 
 
@@ -1136,7 +2071,7 @@ class Session:
         return await self.store.load(self.id)
 
     async def state(self) -> SessionState:
-        return derive_state(await self.entries())
+        return derive_state(await self.entries(), session_id=self.id)
 
     async def messages(self) -> list[Message]:
         return (await self.state()).messages
@@ -1153,7 +2088,16 @@ class Session:
     async def effects(
         self, status: str | Iterable[str] | None = None, namespace: str | None = None
     ) -> list[EffectRecord]:
-        raise NotImplementedError("Effect session views are pending the store integration stage.")
+        records = fold_effects(await self.entries()).records(self.id)
+        wanted = (
+            {status} if isinstance(status, str) else set(status) if status is not None else None
+        )
+        return [
+            record
+            for record in records
+            if (wanted is None or record.status in wanted)
+            and (namespace is None or record.namespace == namespace)
+        ]
 
     async def clear(self, *, force: bool | Literal["forget_effects"] = False) -> None:
         await self._resolve()
@@ -1164,173 +2108,3 @@ class Session:
 
     def __repr__(self) -> str:
         return f"Session(id={self.id!r}, store={type(self.store).__name__})"
-
-
-async def append_fenced(
-    store: SessionStore,
-    session_id: str,
-    entries: list[Entry],
-    owner: str | None,
-    *,
-    fence: Callable[[], bool],
-    attempts: int = 3,
-) -> list[int] | None:
-    """SPEC 7.7.2-3 in one place: first append (append_leased with owner, or append when
-    owner is None); a definite refusal (LeaseError, validation SessionError,
-    EntryConflict, ClaimConflict) re-raised; any other error, CancelledError included,
-    is an unknown outcome: re-append the same ids while fence() holds, up to `attempts`,
-    then load(): all ids present -> their seqs, none -> the last error re-raised as
-    definite, a read that fails -> JournalOutcomeUnknown. A CancelledError during the
-    first append is an unknown outcome like any other: the outcome is decided first,
-    then the CancelledError is re-raised. What the caller does after that (record the
-    commit in the scope, return the receipt) is protected only by the engine's _shield
-    (3.7, M39)."""
-    raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-
-class Lease:
-    """One lease's token, epoch, deadline, renewals and running sends; implementation pending."""
-
-    def __init__(
-        self,
-        store: SessionStore,
-        session_id: str,
-        *,
-        worker: str,
-        ttl_s: float,
-        purpose: Literal["run", "recovery", "settle", "recheck", "workflow"],
-        timing: Timing,
-    ) -> None:
-        """owner = _owner_token(worker)."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    owner: str
-    worker: str
-    epoch: int | None
-    acquired_at: float | None
-    ttl_s: float
-    timing: Timing
-
-    async def acquire(self) -> bool:
-        """With feature "epochs": acquire_lease_grant. Without it: the 0.2 acquire_lease (epoch
-        None, nothing journaled). NotImplementedError from a store without leases propagates
-        (the caller runs unleased, as 0.2 did). Captures the running loop; t_sent =
-        loop.time() before the call; L = t_sent + ttl_s * (1 - rho)."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def renew(self) -> bool:
-        """Success moves L; failure leaves it."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    def remaining(self) -> float:
-        """L - captured_loop.time(); callable from any thread; -inf before a grant."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    def lost(self) -> bool:
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    def first_entries(self) -> list[Entry]:
-        """[lease_acquired] with the fixed id of 3.3 until mark_first_written(); [] without an
-        epoch."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    def mark_first_written(self) -> None:
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    def track(self, fut: asyncio.Future[Any] | concurrent.futures.Future[Any]) -> None:
-        """Count a running send (a task or a thread) until it is done; thread-safe; the
-        decrement is posted to the captured loop with call_soon_threadsafe from the future's
-        done callback."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    def running_sends(self) -> int:
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def sends_drained(self) -> None:
-        """Return when no tracked send runs (M47 seam)."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def keep(self, *, on_lost: Callable[[str], None]) -> None:
-        """Renew every ttl/3; call on_lost(reason) when a renewal returns False or remaining()
-        < timing.m_s (F2); keeps renewing while tracked sends run after the owner finished."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def release(self) -> None:
-        """release_lease; callers use LeasedWriter.close, which waits for sends first."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-
-class LeasedWriter:
-    """Frozen leased-writer contract; implementation is pending the store owner stage."""
-
-    def __init__(
-        self,
-        store: SessionStore,
-        session_id: str,
-        *,
-        worker: str,
-        ttl_s: float,
-        purpose: Literal["run", "recovery", "settle", "recheck", "workflow"],
-        journal_acquisition: bool | None = None,
-    ) -> None:
-        """journal_acquisition None: decided after acquisition from status().has_effects; True
-        for agents with effects tools and for operators. Timing from Timing.for_lease(ttl_s,
-        store.takeover_grace_s, effects=journal_acquisition is True)."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    store: SessionStore
-    session_id: str
-    worker: str
-    lease: Lease
-    timing: Timing
-    leased: bool
-
-    async def open(self) -> bool:
-        """Acquire before any read (7.3); False when another owner holds the lease. A store
-        without leases: leased=False, True."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def load(self) -> list[Entry]:
-        """Load the journal and rebuild view() from it."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def append(self, entries: Sequence[Entry]) -> list[int] | None:
-        """Every write of this writer, whoever calls it (the run, the runtime's limits,
-        run_recovered, a crash-loop run_failed). Prepends lease.first_entries() to the first
-        write; append_fenced with the lease owner (fence = not lease.lost()); folds every
-        entry it wrote into view(). None only from a 0.2-style store."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def append_effect(self, entries: Sequence[Entry]) -> list[int]:
-        """An effect entry as its own write, never batched: append_fenced with fence =
-        lease.remaining() >= timing.m_s; raises JournalOutcomeUnknown and poisons the writer
-        when the outcome stays unknown."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    def view(self) -> EffectView:
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def store_now(self) -> float:
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def salt(self) -> bytes:
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    def poisoned(self) -> bool:
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    def track(self, fut: asyncio.Future[Any] | concurrent.futures.Future[Any]) -> None:
-        """lease.track."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def keep(self, *, on_lost: Callable[[str], None]) -> None:
-        """lease.keep (the run's or the runtime's renewal task)."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    async def close(self) -> None:
-        """Wait for sends_drained() while renewing, then release. Never releases early: if the
-        wait is cancelled, the rest (renew until drained, release) moves to a detached task
-        kept in session._DETACHED, and the CancelledError is re-raised."""
-        raise NotImplementedError("Effects implementation is pending its owning stage.")
-
-    wrapped: SessionStore

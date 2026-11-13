@@ -55,18 +55,20 @@ import json
 import os
 import re
 import sys
+import uuid
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Literal
 
+from .. import session as _session
 from ..errors import ConfigurationError, SessionError
 from ..session import (
     Entry,
-    LeaseError,
     SessionStatus,
     SessionStore,
+    _check_delete,
     _check_limit,
     _check_ttl,
-    _lease_lost,
+    _check_unleased,
     _status_filter,
     _status_row,
     advance_status,
@@ -79,14 +81,15 @@ if TYPE_CHECKING:
 DSN_ENV = "QAGENTS_POSTGRES_DSN"
 """Environment variable read for the connection string when ``dsn`` is not given."""
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 """Version of the tables this module creates, kept in ``<schema>.schema_version``."""
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
 _STATUS_COLUMNS = (
     "session_id, status, open_run_id, agent, failures,"
     " extract(epoch FROM updated_at)::float8, lease_owner,"
-    " extract(epoch FROM lease_expires_at)::float8"
+    " extract(epoch FROM lease_expires_at)::float8, lease_epoch, lease_acquired_at,"
+    " has_effects, retry_after, incarnation"
 )
 
 
@@ -109,6 +112,9 @@ class PostgresStore(SessionStore):
         ConfigurationError: psycopg or psycopg-pool is not installed, or an
             argument is invalid.
     """
+
+    features = frozenset({"leases", "entry_ids"})
+    takeover_grace_s = 0.0
 
     def __init__(
         self,
@@ -233,7 +239,7 @@ class PostgresStore(SessionStore):
             row = await cursor.fetchone()
             version = row[0] if row is not None else None
             self._check_version(version)  # again, under the lock
-            if version is not None:
+            if version == SCHEMA_VERSION:
                 return
             await connection.execute(
                 f"CREATE TABLE IF NOT EXISTS {q}.entries ("
@@ -252,6 +258,30 @@ class PostgresStore(SessionStore):
                 f"CREATE INDEX IF NOT EXISTS sessions_by_status"
                 f" ON {q}.sessions (status, updated_at)"
             )
+            if version is None or version < 2:
+                await connection.execute(f"ALTER TABLE {q}.entries ADD COLUMN id text")
+                await connection.execute(f"UPDATE {q}.entries SET id = 'seq:' || seq")
+                await connection.execute(f"ALTER TABLE {q}.entries ALTER COLUMN id SET NOT NULL")
+                await connection.execute(
+                    f"CREATE UNIQUE INDEX entries_by_id ON {q}.entries (session_id, id)"
+                )
+                for definition in (
+                    "lease_epoch bigint NOT NULL DEFAULT 0",
+                    "lease_acquired_at float8",
+                    "has_effects boolean NOT NULL DEFAULT false",
+                    "retry_after float8",
+                    "incarnation text",
+                ):
+                    await connection.execute(f"ALTER TABLE {q}.sessions ADD COLUMN {definition}")
+                cursor = await connection.execute(
+                    f"SELECT session_id FROM {q}.sessions WHERE last_seq > 0"
+                )
+                for (session_id,) in await cursor.fetchall():
+                    await connection.execute(
+                        f"UPDATE {q}.sessions SET incarnation = %s WHERE session_id = %s",
+                        (uuid.uuid4().hex, session_id),
+                    )
+            await connection.execute(f"DELETE FROM {q}.schema_version")
             await connection.execute(
                 f"INSERT INTO {q}.schema_version (version) VALUES (%s)", (SCHEMA_VERSION,)
             )
@@ -264,18 +294,17 @@ class PostgresStore(SessionStore):
 
     # -- journal ---------------------------------------------------------------------
 
-    async def append(self, session_id: str, entries: list[Entry]) -> None:
-        await self._append(session_id, entries, None)
+    async def append(self, session_id: str, entries: list[Entry]) -> list[int]:
+        return await self._append(session_id, entries, None)
 
-    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
-        await self._append(session_id, entries, owner)
+    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> list[int]:
+        return await self._append(session_id, entries, owner)
 
-    async def _append(self, session_id: str, entries: list[Entry], owner: str | None) -> None:
+    async def _append(self, session_id: str, entries: list[Entry], owner: str | None) -> list[int]:
         if not entries:
-            return
+            return []
         import psycopg
 
-        documents = [_document(session_id, entry) for entry in entries]
         q = self._q
         pool = await self._ready()
         async with pool.connection() as connection:
@@ -284,27 +313,37 @@ class PostgresStore(SessionStore):
                     # One statement creates or locks the row and reads it, so a delete that
                     # commits in between cannot leave it missing (the row is then new).
                     cursor = await connection.execute(
-                        f"INSERT INTO {q}.sessions (session_id) VALUES (%s)"
-                        " ON CONFLICT (session_id) DO UPDATE SET session_id = excluded.session_id"
-                        " RETURNING status, open_run_id, agent, failures, last_seq, lease_owner",
-                        (session_id,),
+                        f"INSERT INTO {q}.sessions AS s (session_id, incarnation) VALUES (%s, %s)"
+                        " ON CONFLICT (session_id) DO UPDATE SET session_id = excluded.session_id,"
+                        " incarnation = COALESCE(s.incarnation, excluded.incarnation)"
+                        " RETURNING status, open_run_id, agent, failures, last_seq, lease_owner,"
+                        " has_effects, retry_after",
+                        (session_id, uuid.uuid4().hex),
                     )
                     found = await cursor.fetchone()
                     assert found is not None  # an upsert with RETURNING always returns the row
-                    if owner is not None and found[5] != owner:
-                        raise LeaseError(_lease_lost(session_id, owner, found[5]))
+                    cursor = await connection.execute(
+                        f"SELECT id, seq FROM {q}.entries WHERE session_id = %s", (session_id,)
+                    )
+                    ids = dict(await cursor.fetchall())
+                    if _session._admit_batch(ids, entries, found[5], owner) == "duplicate":
+                        return [ids[entry.id] for entry in entries]
+                    documents = [_document(session_id, entry) for entry in entries]
                     status = SessionStatus(
                         session_id=session_id,
                         status=found[0],
                         open_run_id=found[1],
                         agent=found[2],
                         failures=found[3],
+                        has_effects=found[6],
+                        retry_after=found[7],
                     )
                     last = found[4]
                     rows = []
                     for offset, (entry, document) in enumerate(
                         zip(entries, documents, strict=True), start=1
                     ):
+                        _check_unleased(entry, status, owner)
                         rows.append(
                             (
                                 session_id,
@@ -313,18 +352,20 @@ class PostgresStore(SessionStore):
                                 entry.run_id,
                                 entry.kind,
                                 document,
+                                entry.id,
                             )
                         )
                         advance_status(status, entry)
                     async with connection.cursor() as insert:
                         await insert.executemany(
-                            f"INSERT INTO {q}.entries (session_id, seq, ts, run_id, kind, data)"
-                            " VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
+                            f"INSERT INTO {q}.entries (session_id, seq, ts, run_id, kind, data, id)"
+                            " VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)",
                             rows,
                         )
                     await connection.execute(
                         f"UPDATE {q}.sessions SET status = %s, open_run_id = %s, agent = %s,"
-                        " failures = %s, last_seq = %s, updated_at = clock_timestamp()"
+                        " failures = %s, last_seq = %s, updated_at = clock_timestamp(),"
+                        " has_effects = %s, retry_after = %s"
                         " WHERE session_id = %s",
                         (
                             status.status,
@@ -332,9 +373,12 @@ class PostgresStore(SessionStore):
                             status.agent,
                             status.failures,
                             last + len(entries),
+                            status.has_effects,
+                            status.retry_after,
                             session_id,
                         ),
                     )
+                return list(range(last + 1, last + len(entries) + 1))
             except psycopg.errors.UntranslatableCharacter as error:
                 kinds = sorted({entry.kind for entry in entries})
                 raise SessionError(
@@ -348,14 +392,14 @@ class PostgresStore(SessionStore):
         pool = await self._ready()
         async with pool.connection() as connection:
             cursor = await connection.execute(
-                f"SELECT seq, ts, run_id, kind, data FROM {self._q}.entries"
+                f"SELECT seq, ts, run_id, kind, data, id FROM {self._q}.entries"
                 " WHERE session_id = %s ORDER BY seq",
                 (session_id,),
             )
             rows = await cursor.fetchall()
         return [
-            Entry(seq=seq, ts=ts, run_id=run_id, kind=kind, data=data)
-            for seq, ts, run_id, kind, data in rows
+            Entry(seq=seq, ts=ts, run_id=run_id, kind=kind, data=data, id=entry_id)
+            for seq, ts, run_id, kind, data, entry_id in rows
         ]
 
     async def delete(
@@ -363,6 +407,19 @@ class PostgresStore(SessionStore):
     ) -> None:
         pool = await self._ready()
         async with pool.connection() as connection, connection.transaction():
+            await connection.execute(
+                f"SELECT 1 FROM {self._q}.sessions WHERE session_id = %s FOR UPDATE", (session_id,)
+            )
+            cursor = await connection.execute(
+                f"SELECT seq, ts, run_id, kind, data, id FROM {self._q}.entries"
+                " WHERE session_id = %s ORDER BY seq",
+                (session_id,),
+            )
+            entries = [
+                Entry(seq=s, ts=t, run_id=r, kind=k, data=d, id=i)
+                for s, t, r, k, d, i in await cursor.fetchall()
+            ]
+            _check_delete(entries, session_id, self.features, force)
             # The sessions row first: it waits for an append in flight (which holds its
             # lock), and the entries delete that follows then sees what that append wrote.
             await connection.execute(
@@ -455,7 +512,7 @@ def _document(session_id: str, entry: Entry) -> str:
     """The ``jsonb`` text of an entry's data; refuses what ``jsonb`` cannot hold."""
     try:
         text = json.dumps(entry.data, ensure_ascii=False, allow_nan=False)
-    except ValueError as error:
+    except (ValueError, TypeError) as error:
         raise SessionError(
             f"PostgreSQL jsonb cannot store NaN or an infinity, which appears in a "
             f"{entry.kind} entry of session {session_id!r} ({error}). Nothing was written. "

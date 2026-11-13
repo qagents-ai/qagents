@@ -21,7 +21,7 @@ from qagents.effects._types import MISSING
 from ._inventory import INTERFACES, SEAMS
 
 ROOT = Path(__file__).resolve().parents[2]
-IMPLEMENTED_OWNERS = {"O1"}
+IMPLEMENTED_OWNERS = {"O1", "O3"}
 
 
 def resolve(module, name):
