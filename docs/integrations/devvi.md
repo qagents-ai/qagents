@@ -143,14 +143,16 @@ async with DevviAgent(workspace="C:/work/repo") as coder:
 A direct run has no calling run: its permission requests are decided by `stream(permissions=...)`
 or the agent's `permissions=`, and with neither, every request is refused.
 
-### As a durable workflow agent
+### As a workflow step
+
+Use a durable agent step for repository edits.
 
 ```python
 from qagents import Agent, Workflow
 from qagents.integrations.devvi import DevviAgent
 
 coder = DevviAgent(workspace="C:/work/repo", allow_unmetered=True)
-lead = Agent(model, tools=[coder.as_tool(name="code", requires_approval=True)])
+lead = Agent(model, tools=[coder.as_tool(name="code", timeout=600, requires_approval=True)])
 wf = Workflow(store, id=f"fix:{issue}")
 plan = await wf.run_agent("plan", planner, f"Plan a fix for {issue}")
 result = await wf.run_agent("code", lead, plan.text)
