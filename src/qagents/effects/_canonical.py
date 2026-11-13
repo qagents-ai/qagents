@@ -117,7 +117,9 @@ def freeze(effect: Effect, request: BaseModel) -> Frozen:
     if not isinstance(request, effect.request_type):
         raise TypeError(f"{effect.name} requires {effect.request_type.__name__}.")
     # Validate from values even if an instance came from model_construct().
-    validated = effect.request_type.model_validate(request.model_dump(mode="python", warnings=False))
+    validated = effect.request_type.model_validate(
+        request.model_dump(mode="python", warnings=False)
+    )
     data = validated.model_dump(mode="json", warnings="error")
     if not isinstance(data, dict):
         raise ValueError("An effect request must serialize as a JSON object.")
