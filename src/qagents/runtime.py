@@ -111,7 +111,7 @@ from .events import (
     ToolCallFinished,
     TurnStarted,
 )
-from .session import Entry, LeaseError, Session, SessionStatus, SessionStore
+from .session import Entry, LeaseError, Session, SessionStatus, SessionStore, _owner_token
 
 if TYPE_CHECKING:
     from .agent import Agent, Limits, RunStream
@@ -200,6 +200,7 @@ class RunHandle:
         self._wake_up = asyncio.Event()
         """Set by `cancel` and by a stop request: a queued run stops waiting for its slot."""
         self._lease_lost = False
+        self._lease_owner = ""  # set by _new_handle immediately after acquisition
         self._lease_deadline = asyncio.get_running_loop().time() + runtime.lease_ttl_s
         self._answers = answers
         """The run was resumed with approvals or results it has not finished using."""
@@ -345,9 +346,9 @@ class AgentRuntime:
             names must be unique, and a worker can only recover runs of
             agents it knows. Agents reached through handoffs need not be
             listed: the run is resumed on the agent that started it.
-        worker_id: This worker's name in leases. Defaults to host name,
-            process id and a random suffix. Give each runtime its own id: two
-            runtimes with one id would share leases.
+        worker_id: This worker's diagnostic name. Defaults to host name,
+            process id and a random suffix. Each acquisition appends a fresh
+            token, so runtimes that reuse a name still have distinct leases.
         lease_ttl_s: Seconds a lease lasts without a heartbeat. A dead
             worker's runs are recovered after about this long.
         heartbeat_s: Seconds between lease renewals. Defaults to a third of
@@ -597,7 +598,7 @@ class AgentRuntime:
             session_id = candidate.session_id
             if session_id in self._handles or session_id in self._claiming:
                 continue
-            if candidate.lease_owner not in (None, self.worker_id) and candidate.lease_active():
+            if candidate.lease_active():
                 continue  # another worker drives it; acquire_lease would only refuse
             if self._held_back.get(session_id) == _seen(candidate):
                 continue  # left to a person, and nothing changed since
@@ -755,8 +756,10 @@ class AgentRuntime:
 
     async def _recover_one(self, session_id: str) -> RunHandle | None:
         with self._claim(session_id):
+            owner = _owner_token(self.worker_id)
+            deadline = asyncio.get_running_loop().time() + self.lease_ttl_s
             try:
-                if not await self.store.acquire_lease(session_id, self.worker_id, self.lease_ttl_s):
+                if not await self.store.acquire_lease(session_id, owner, self.lease_ttl_s):
                     return None  # another worker is driving it, or won the race
             except Exception:
                 logger.warning(
@@ -771,10 +774,12 @@ class AgentRuntime:
                 # The run may have ended between the listing and the lease.
                 current = await self.store.status(session_id)
                 if current.status not in _RECOVERABLE or self._skip_reason(current) is not None:
-                    await self._release(session_id)
+                    await self._release(session_id, owner)
                     return None
                 agent = self.agents[current.agent or ""]
-                handle = self._new_handle(session_id, agent, resumed=True)
+                handle = self._new_handle(
+                    session_id, agent, owner=owner, deadline=deadline, resumed=True
+                )
                 entries = await self.store.load(session_id)
                 limits = _journaled_limits(entries, current.open_run_id)
                 held = self._held_reason(current, entries, limits or agent.limits)
@@ -784,7 +789,7 @@ class AgentRuntime:
                         await self.store.append_leased(
                             session_id,
                             [_crash_loop_entry(current.open_run_id, reason)],
-                            self.worker_id,
+                            owner,
                         )
                         current = await self.store.status(session_id)
                     self._held_back[session_id] = _seen(current)
@@ -799,7 +804,7 @@ class AgentRuntime:
                     session_id,
                 )
                 if handle is None:
-                    await self._release(session_id)
+                    await self._release(session_id, owner)
                 else:
                     await self._back_out(handle)
                 return None
@@ -848,7 +853,9 @@ class AgentRuntime:
                 f"runtime.get({session_id!r}) to finish before starting or resuming another."
             )
         with self._claim(session_id):
-            if not await self.store.acquire_lease(session_id, self.worker_id, self.lease_ttl_s):
+            owner = _owner_token(self.worker_id)
+            deadline = asyncio.get_running_loop().time() + self.lease_ttl_s
+            if not await self.store.acquire_lease(session_id, owner, self.lease_ttl_s):
                 holder = await self.store.status(session_id)
                 raise LeaseError(
                     f"Session {session_id!r} is being driven by worker {holder.lease_owner!r}. "
@@ -858,7 +865,13 @@ class AgentRuntime:
             # The heartbeat runs from now on: preparing the run (deps_factory, input
             # guardrails, toolkits) may take longer than the lease lasts.
             handle = self._new_handle(
-                session_id, agent, resumed=resumed, answers=answers, unsaved=unsaved
+                session_id,
+                agent,
+                owner=owner,
+                deadline=deadline,
+                resumed=resumed,
+                answers=answers,
+                unsaved=unsaved,
             )
             prepared: RunStream | None = None
             journal = limits  # limits given here are journaled for a recovery
@@ -873,7 +886,7 @@ class AgentRuntime:
                 if not resumed:
                     # Journal the run now, under the lease: a run that waits for a slot is
                     # then open in the journal, so a shutdown or a crash does not lose it.
-                    store = _LeasedStore(self.store, self.worker_id)
+                    store = _LeasedStore(self.store, handle._lease_owner)
                     prepared = open_stream(Session(store, session_id), deps, limits)
                     if journal is not None:  # before the run starts: it governs the whole run
                         await store.append(session_id, [_limits_entry(prepared.run_id, journal)])
@@ -915,6 +928,8 @@ class AgentRuntime:
         session_id: str,
         agent: Agent,
         *,
+        owner: str,
+        deadline: float,
         resumed: bool,
         answers: bool = False,
         unsaved: Iterable[str] = (),
@@ -924,6 +939,8 @@ class AgentRuntime:
             self, session_id, agent.name, resumed=resumed, buffer=self.event_buffer,
             answers=answers, unsaved=unsaved,
         )  # fmt: skip
+        handle._lease_owner = owner
+        handle._lease_deadline = deadline
         handle._heartbeat = asyncio.create_task(
             self._heartbeat(handle), name=f"qagents-lease:{session_id}"
         )
@@ -936,7 +953,7 @@ class AgentRuntime:
             heartbeat.cancel()
             await asyncio.wait([heartbeat])  # a renewal in flight ends before the release
         if not handle._lease_lost:
-            await self._release(handle.session_id)
+            await self._release(handle.session_id, handle._lease_owner)
 
     def _launch(
         self,
@@ -1028,7 +1045,7 @@ class AgentRuntime:
                 return  # shut down while queued: nothing more has run
             handle.status = "running"
             if stream is None:
-                handle._store = _LeasedStore(self.store, self.worker_id)
+                handle._store = _LeasedStore(self.store, handle._lease_owner)
                 stream = open_stream(Session(handle._store, session_id), deps, limits)
             handle._stream = stream
             if handle._cancel_reason is not None:
@@ -1123,7 +1140,7 @@ class AgentRuntime:
                 await stream.aclose()
         note = await self._interrupted(handle, why) if why is not None else None
         if not handle._lease_lost:
-            await self._release(handle.session_id)
+            await self._release(handle.session_id, handle._lease_owner)
         return note
 
     async def _heartbeat(self, handle: RunHandle) -> None:
@@ -1138,7 +1155,7 @@ class AgentRuntime:
             began = loop.time()
             try:
                 held = await asyncio.wait_for(
-                    self.store.renew_lease(session_id, self.worker_id, self.lease_ttl_s),
+                    self.store.renew_lease(session_id, handle._lease_owner, self.lease_ttl_s),
                     timeout=min(self.heartbeat_s, deadline - began),
                 )
             except Exception as failure:
@@ -1166,11 +1183,11 @@ class AgentRuntime:
         if task is not None:
             task.cancel()
 
-    async def _release(self, session_id: str) -> None:
+    async def _release(self, session_id: str, owner: str) -> None:
         """Release the lease; on failure it simply expires."""
         try:
             await asyncio.wait_for(
-                self.store.release_lease(session_id, self.worker_id),
+                self.store.release_lease(session_id, owner),
                 timeout=min(self.lease_ttl_s, 10.0),
             )
         except Exception as failure:

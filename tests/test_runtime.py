@@ -124,7 +124,7 @@ async def test_start_runs_in_the_background_and_releases_the_lease():
     assert isinstance(handle, RunHandle) and handle.session_id == "s1"
     assert runtime.get("s1") is handle
     lease = await store.status("s1")
-    assert lease.lease_owner == runtime.worker_id and lease.lease_active()
+    assert lease.lease_owner.startswith(runtime.worker_id + "#") and lease.lease_active()
 
     result = await handle.wait()
     assert result.status == "completed" and result.text == "Hello!"
@@ -369,7 +369,7 @@ def test_a_dead_workers_run_is_recovered_without_repeating_finished_tools(backen
         await crash_worker(backend.store(), log)
         store = backend.store()
         status = await store.status("order-7")
-        assert (status.status, status.lease_owner) == ("running", "worker-a")
+        assert status.status == "running" and status.lease_owner.startswith("worker-a#")
 
         worker = recovering_worker(store, log, "worker-b")
         assert status.lease_expires_at is not None
@@ -585,7 +585,7 @@ async def test_a_worker_that_loses_its_lease_stops_and_cannot_write():
     await asyncio.wait_for(started.wait(), 5)
 
     # w1 stalls past its lease; w2 takes the session over.
-    await store.release_lease("s", "w1")
+    await store.release_lease("s", handle._lease_owner)
     assert await store.acquire_lease("s", "w2", 30)
     entries = len(await store.load("s"))
     with pytest.raises(RunInterrupted, match="lost its lease"):
@@ -611,7 +611,7 @@ async def test_a_fenced_write_failure_marks_the_handle_interrupted():
     )
     handle = await worker.start("billing", "go", session_id="s")
     await asyncio.wait_for(started.wait(), 5)
-    await store.release_lease("s", "w1")
+    await store.release_lease("s", handle._lease_owner)
     assert await store.acquire_lease("s", "w2", 30)
     gate.set()  # the tool returns and the run tries to record its result
     with pytest.raises(RunInterrupted, match="lost its lease") as raised:
@@ -1369,3 +1369,37 @@ async def test_unconfirmed_lease_also_cancels_preparation():
         starting.cancel()
         await asyncio.gather(starting, return_exceptions=True)
         await runtime.shutdown(timeout_s=0)
+
+
+async def test_reused_worker_name_cannot_share_or_renew_another_acquisition():
+    store = InMemoryStore()
+    gate = asyncio.Event()
+
+    async def reply(request):
+        await gate.wait()
+        return "done"
+
+    agent = Agent(FunctionModel(reply), name="a")
+    first = AgentRuntime(store, [agent], worker_id="reused", **FAST)
+    second = AgentRuntime(store, [agent], worker_id="reused", **FAST)
+    try:
+        handle = await first.start("a", "go", session_id="s")
+        owner = (await store.status("s")).lease_owner
+        with pytest.raises(LeaseError):
+            await second.resume("s")
+        assert owner.startswith("reused#")
+        assert await second.recover() == []
+        assert (await store.status("s")).lease_owner == owner
+        gate.set()
+        await handle.wait()
+        again = await second.start("a", "again", session_id="s")
+        next_owner = (await store.status("s")).lease_owner
+        assert next_owner.startswith("reused#") and next_owner != owner
+        assert not await store.renew_lease("s", owner, 10)
+        await store.release_lease("s", owner)
+        assert (await store.status("s")).lease_owner == next_owner
+        await again.wait()
+    finally:
+        gate.set()
+        await first.shutdown(timeout_s=0)
+        await second.shutdown(timeout_s=0)

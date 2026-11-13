@@ -96,6 +96,7 @@ from .session import (
     PendingInput,
     Session,
     SessionState,
+    _owner_token,
     _usage_loads,
 )
 from .tools import (
@@ -1257,7 +1258,7 @@ class _Run:
         self._claimed = key
         if _fenced_by_runtime(store) or _append_overridden_alone(store):
             return
-        owner = f"qagents-run:{uuid.uuid4().hex}"
+        owner = _owner_token("qagents-run")
         try:
             held = await store.acquire_lease(session_id, owner, RUN_LEASE_TTL_S)
         except NotImplementedError:

@@ -544,7 +544,7 @@ async def test_a_run_holds_the_lease_while_it_runs_and_releases_it():
     await Agent(ScriptedModel([call("peek"), "done"]), tools=[peek]).run(
         "go", session=Session(store, id="s")
     )
-    assert seen[0] is not None and seen[0].startswith("qagents-run:")
+    assert seen[0] is not None and seen[0].startswith("qagents-run#")
     assert (await store.status("s")).lease_owner is None
 
 
