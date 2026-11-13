@@ -10,17 +10,28 @@ import logging
 import math
 import threading
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from qagents import prompts
-from qagents.errors import ConfigurationError, EffectConflictError, EffectRejected, ToolError
-from qagents.session import EFFECTS_REQUIRED, SessionStore
+from qagents import events, prompts
+from qagents.errors import (
+    ConfigurationError,
+    EffectConflictError,
+    EffectRejected,
+    LeaseError,
+    ToolError,
+)
+from qagents.session import EFFECTS_REQUIRED, Entry, SessionStore
 
 from . import _canonical as canonical
+from . import _kinds as kinds
+from . import _ports as ports
+from . import _table as table
+from . import _types as types
 from ._canonical import LIMIT_BYTES, JSONValue, check_model_numbers, jcs, resolve_namespace
 from ._declare import Dedupe, Effect, Unique
 from ._fold import Operation
@@ -163,6 +174,447 @@ class _Prepared:
     occurrence: int | None
     destination: JSONValue
     original: BaseModel
+
+
+_DISPATCH_INPUT: ContextVar[_Prepared | None] = ContextVar("qagents_dispatch_input", default=None)
+
+
+@dataclass(frozen=True)
+class Outcome:
+    kind: Literal["committed", "rejected", "held", "not_sent"]
+    receipt: dict[str, JSONValue] | None = None
+    receipt_error: str | None = None
+    error: BaseException | None = None
+    reason: HoldReason | None = None
+    error_kind: str | None = None
+
+
+class _DispatchNotSent(Exception):
+    """The callback was still queued when its original send deadline expired."""
+
+
+def _reference(op: Operation) -> dict[str, str]:
+    return dict(namespace=op.namespace, name=op.name, key=op.key, record_id=op.record_id)
+
+
+def _reach(scope: CallScope, op: Operation, rule: str, point: str | None = None) -> None:
+    ports.reached(ports.ReachEvent(scope.session_id, op.record_id, op.name, rule, point, None))
+
+
+async def _append_outcome(
+    scope: CallScope, kind: str, payload: BaseModel, *, receipt: dict[str, JSONValue] | None = None
+) -> None:
+    try:
+        await scope.journal.append_effect(
+            [Entry(kind=kind, data=payload.model_dump(mode="json"), run_id=scope.run_id)]
+        )
+    except BaseException:
+        if kind == kinds.KIND_EFFECT_COMMITTED:
+            logging.getLogger(FINDINGS_LOGGER).error(
+                "Effect commit could not be journaled: effect=%s key=%s receipt=%r",
+                payload.name,
+                payload.key,
+                receipt,
+            )
+        raise
+
+
+async def _finish_send(
+    effect: Effect,
+    op: Operation,
+    scope: CallScope,
+    number: int,
+    intent_seq: int,
+    rule: str,
+    *,
+    result: Any = None,
+    error: BaseException | None = None,
+    timeout: bool = False,
+    ended: bool = True,
+    overran: bool = False,
+) -> Outcome:
+    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        raise error
+    ended_at = await scope.journal.store_now() if ended else None
+    ref = _reference(op)
+    if isinstance(error, _DispatchNotSent):
+        await _append_outcome(
+            scope,
+            kinds.KIND_EFFECT_FAILED,
+            kinds.EffectFailedData(
+                **ref,
+                attempt=number,
+                intent_seq=intent_seq,
+                committed=False,
+                why="not_sent",
+                send_ended=True,
+                ended_at=ended_at,
+                overran=overran,
+            ),
+        )
+        _reach(scope, op, "E7")
+        return Outcome("not_sent", reason=HoldReason.LEASE)
+    if error is None and not timeout:
+        receipt, receipt_error = receipt_json(effect, result)
+        identity = None
+        patch, patch_error = None, None
+        if receipt is not None:
+            try:
+                identity = canonical.identity_digest(receipt, effect.receipt_identity)
+            except Exception as identity_error:
+                receipt, receipt_error = None, str(identity_error)
+            else:
+                # Lookup or an operator may have committed while this send ran.
+                # Its patch has already been applied and must not run a second time.
+                if op.commit_seq is None and op.state != "X":
+                    patch, patch_error = on_commit_patch(
+                        effect, scope.committed_values(), op.request, receipt
+                    )
+        outcome = "receipt" if receipt_error is None else "receipt_unstorable"
+        row = table.decide(
+            table.TState(op.state),
+            table.TEvent.OUTCOME,
+            table.OutcomeSituation(outcome, False, not effect.is_async),
+        )
+        payload = kinds.EffectCommittedData(
+            **ref,
+            attempt=number,
+            intent_seq=intent_seq,
+            via="dedupe" if rule == "D3" else "resend" if rule in ("D4", "D5") else "direct",
+            receipt=receipt,
+            receipt_error=receipt_error,
+            identity_digest=identity,
+            state_patch=patch,
+            on_commit_error=patch_error,
+            send_ended=ended,
+            ended_at=ended_at,
+        )
+        await _append_outcome(scope, kinds.KIND_EFFECT_COMMITTED, payload, receipt=receipt)
+        if patch is not None:
+            scope.apply_patch(patch)
+        current = scope.journal.view().get(op.namespace, op.name, op.key)
+        if current.state == "X":
+            return Outcome("held", reason=HoldReason.CONFLICT)
+        identity_pair = (op.name, op.key)
+        if identity_pair not in scope.committed:
+            scope.committed.append(identity_pair)
+        _reach(scope, op, row.rule, "committed")
+        return Outcome("committed", receipt=receipt, receipt_error=receipt_error)
+    classification = "unknown" if timeout else _classify_send_error(effect, error)
+    rejected = classification == "rejected"
+    error_kind = (
+        "timeout" if timeout else "duplicate_key" if classification == "duplicate" else "raised"
+    )
+    if isinstance(error, asyncio.CancelledError) and not timeout:
+        error_kind = "interrupted"
+    payload = kinds.EffectFailedData(
+        **ref,
+        attempt=number,
+        intent_seq=intent_seq,
+        committed=False if rejected else None,
+        why="rejected" if rejected else "interrupted" if error_kind == "interrupted" else "unknown",
+        error=str(error) if error is not None else None,
+        error_kind=error_kind,
+        send_ended=ended,
+        ended_at=ended_at,
+        overran=overran,
+    )
+    await _append_outcome(scope, kinds.KIND_EFFECT_FAILED, payload)
+    current = scope.journal.view().get(op.namespace, op.name, op.key)
+    resolved = current.state == "R"
+    kind = (
+        "timeout"
+        if timeout
+        else "rejected"
+        if rejected
+        else "duplicate"
+        if classification == "duplicate"
+        else "other_error"
+    )
+    row = table.decide(
+        table.TState(current.state),
+        table.TEvent.OUTCOME,
+        table.OutcomeSituation(kind, resolved, not effect.is_async),
+    )
+    _reach(scope, current, row.rule, "unknown_outcome" if not resolved else None)
+    if rejected and resolved:
+        if (op.name, op.key) not in scope.rejected:
+            scope.rejected.append((op.name, op.key))
+        return Outcome("rejected", error=error, error_kind=error_kind)
+    reason = (
+        HoldReason.REJECTED_WHILE_IN_FLIGHT
+        if rejected
+        else HoldReason.LOOKUP_INCONCLUSIVE
+        if classification == "duplicate"
+        else HoldReason.SEND_STILL_RUNNING
+        if not ended
+        else HoldReason.RESPONSE_LOST
+    )
+    return Outcome("held", error=error, reason=reason, error_kind=error_kind)
+
+
+async def _dispatch(
+    effect: Effect,
+    op: Operation,
+    frozen: canonical.Frozen,
+    scope: CallScope,
+    rule: str,
+    generation: int,
+) -> Outcome:
+    from qagents import tools
+
+    prepared = _DISPATCH_INPUT.get()
+    if prepared is None or prepared.frozen is not frozen:
+        raise ConfigurationError("Dispatch requires the current frozen perform input.")
+    journal = scope.journal
+    store_now = await journal.store_now()
+    invalid = _authorization_valid(rule, scope, store_now)
+    if invalid is not None:
+        if op.state in ("N", "R"):
+            raise ConfigurationError("The tool attempt has no valid authorization to send.")
+        return Outcome("held", reason=invalid)
+    if not await _self_fence(journal, effect):
+        if op.state in ("N", "R"):
+            raise LeaseError("Effect dispatch refused: no safe lease margin.")
+        return Outcome("held", reason=HoldReason.LEASE)
+    slot = None
+    if not effect.is_async:
+        slot = tools.reserve_thread()
+        if slot is None:
+            if op.state == "D":
+                return Outcome("held", reason=HoldReason.SEND_STILL_RUNNING)
+            raise ToolError(
+                prompts.TOOL_THREADS_EXHAUSTED.format(name=effect.name, count=tools.TOOL_THREADS)
+            )
+    try:
+        number = max((item.number for item in op.attempts), default=0) + 1
+        store_now = await journal.store_now()
+        salt = await journal.salt()
+        idem = canonical.idempotency_key(
+            salt, op.namespace, op.name, op.key, generation, effect.idempotency_key_max_len
+        )
+        tag = canonical.operation_tag(op.namespace, op.name, op.key, frozen.digest)
+        not_after = store_now + effect.timeout_s + journal.timing.m_s
+        contract = effect.dedupe
+        payload = kinds.EffectIntentData(
+            **_reference(op),
+            key_spec_digest=effect.key_spec_digest,
+            version=effect.version,
+            operation_id=scope.operation_id,
+            tool_call_id=scope.tool_call_id,
+            occurrence=prepared.occurrence,
+            attempt=number,
+            generation=generation,
+            idempotency_key=idem,
+            operation_tag=tag,
+            request_digest=frozen.digest,
+            destination_digest=prepared.descriptor.destination_digest,
+            request=frozen.json,
+            destination=prepared.destination,
+            epoch=journal.lease.epoch,
+            store_ts=store_now,
+            first_use_at=op.first_use_at if op.first_use_at is not None else store_now,
+            not_after=not_after,
+            may_overrun=_may_overrun(effect),
+            authorization=(
+                scope.original_authorization if rule in ("D3", "D4") else scope.authorization
+            ).data(),
+            rule=rule,
+            timing=kinds.IntentTiming(
+                timeout_s=effect.timeout_s,
+                applies_within_s=effect.applies_within_s,
+                m_s=journal.timing.m_s,
+                sigma_s=journal.timing.sigma_s,
+                window_s=contract.window_s if isinstance(contract, Dedupe) else None,
+                margin_s=contract.margin() if isinstance(contract, Dedupe) else None,
+                unique=isinstance(contract, Unique),
+                concurrent=contract.concurrent if isinstance(contract, Dedupe) else "unknown",
+            ),
+            receipt_identity=list(effect.receipt_identity)
+            if effect.receipt_identity is not None
+            else None,
+        )
+        [intent_seq] = await journal.append_effect(
+            [
+                Entry(
+                    kind=kinds.KIND_EFFECT_INTENT,
+                    data=payload.model_dump(mode="json"),
+                    run_id=scope.run_id,
+                )
+            ]
+        )
+        op = journal.view().get(op.namespace, op.name, op.key)
+        scope.emit(
+            events.EffectStarted(
+                record_id=op.record_id,
+                effect=op.name,
+                namespace=op.namespace,
+                key=op.key,
+                attempt=number,
+                generation=generation,
+                rule=rule,
+                tool_call_id=scope.tool_call_id,
+            )
+        )
+        invalid = _authorization_valid(rule, scope, await journal.store_now())
+        if not await _self_fence(journal, effect) or invalid is not None:
+            ended_at = await journal.store_now()
+            await _append_outcome(
+                scope,
+                kinds.KIND_EFFECT_FAILED,
+                kinds.EffectFailedData(
+                    **_reference(op),
+                    attempt=number,
+                    intent_seq=intent_seq,
+                    committed=False,
+                    why="not_sent",
+                    send_ended=True,
+                    ended_at=ended_at,
+                ),
+            )
+            _reach(scope, op, "E7")
+            return Outcome("not_sent", reason=invalid or HoldReason.LEASE)
+        loop = asyncio.get_running_loop()
+        attempt = types.Attempt(
+            _request_for_send(effect, frozen, prepared.original),
+            op.key,
+            idem,
+            tag,
+            loop.time() + effect.timeout_s,
+            not_after,
+            types.AttemptDebug(number, generation, journal.lease.epoch, journal.lease.epoch or 0),
+        )
+        ctx = types.EffectContext(scope.deps, session_id=scope.session_id, emit=scope.emit)
+        raw = None
+
+        async def invoke() -> Any:
+            nonlocal raw
+            token = types._ATTEMPT.set(attempt)
+            ports._set_attempt_live(attempt, True)
+            try:
+
+                async def call_send() -> Any:
+                    nonlocal raw
+                    if loop.time() >= attempt.deadline:
+                        raise _DispatchNotSent()
+                    if effect.is_async:
+                        return await effect.send(ctx, attempt)
+
+                    def call_sync() -> Any:
+                        if loop.time() >= attempt.deadline:
+                            raise _DispatchNotSent()
+                        return effect.send(ctx, attempt)
+
+                    wrapped, raw = tools.start_thread(effect.name, call_sync, slot=slot)
+                    journal.track(raw)
+                    return await wrapped
+
+                transport = ports.TRANSPORT.get()
+                return (
+                    await call_send()
+                    if transport is None
+                    else await transport.send(effect, ctx, attempt, call_send)
+                )
+            finally:
+                ports._set_attempt_live(attempt, False)
+                types._ATTEMPT.reset(token)
+
+        send = asyncio.create_task(invoke())
+        journal.track(send)
+        _reach(
+            scope,
+            op,
+            rule,
+            {
+                "D1": "first_send",
+                "D2": "retry_after_rejection",
+                "D3": "dedupe_resend",
+                "D4": "absence_resend",
+                "D5": "operator_resend",
+            }[rule],
+        )
+        done, _ = await asyncio.wait({send}, timeout=effect.timeout_s)
+        timed_out = not done
+        if timed_out:
+            ports._set_attempt_live(attempt, False)
+        if timed_out and effect.is_async:
+            send.cancel()
+            done, _ = await asyncio.wait({send}, timeout=journal.timing.m_s)
+        if not done:
+            gate = asyncio.Event()
+            if raw is not None:
+                tools._abandon(effect.name, raw, "exceeded the effect timeout")
+                _track_abandoned(journal.store, scope.session_id, op.record_id, raw)
+
+            async def late() -> None:
+                await gate.wait()
+                result, error = None, None
+                try:
+                    result = await send
+                except BaseException as caught:
+                    error = caught
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise error
+                await _finish_send(
+                    effect,
+                    op,
+                    scope,
+                    number,
+                    intent_seq,
+                    rule,
+                    result=result,
+                    error=error,
+                    overran=True,
+                )
+                await _append_outcome(
+                    scope,
+                    kinds.KIND_EFFECT_SEND_ENDED,
+                    kinds.EffectSendEndedData(
+                        **_reference(op),
+                        attempt=number,
+                        intent_seq=intent_seq,
+                        overran=True,
+                        outcome="raised" if error is not None else "returned",
+                        ended_at=await journal.store_now(),
+                    ),
+                )
+                _reach(scope, op, "E5o")
+
+            watcher = asyncio.create_task(late())
+            journal.track(watcher)
+            try:
+                return await _finish_send(
+                    effect,
+                    op,
+                    scope,
+                    number,
+                    intent_seq,
+                    rule,
+                    timeout=True,
+                    ended=False,
+                    overran=True,
+                )
+            finally:
+                gate.set()
+        result, error = None, None
+        try:
+            result = send.result()
+        except BaseException as caught:
+            error = caught
+        return await _finish_send(
+            effect,
+            op,
+            scope,
+            number,
+            intent_seq,
+            rule,
+            result=result,
+            error=error,
+            timeout=timed_out and isinstance(error, asyncio.CancelledError),
+        )
+    finally:
+        if slot is not None:
+            slot.release()
 
 
 def _prepare(effect: Effect, request: Any, scope: CallScope, occurrence: int | None) -> _Prepared:
