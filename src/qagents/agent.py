@@ -2170,9 +2170,11 @@ class _Run:
                 ctx = self._ctx(tool_call_id=call.id)
                 result = await self.hooks.after_tool(ctx, call, self._supplied_result(call))
                 result = result.model_copy(update={"tool_call_id": call.id, "name": call.name})
-                if (updated := await self._save_state()) is not None:
+                async with self._state_lock, self._batched():
+                    updated = await self._save_state_locked()
+                    await self._record(result)
+                if updated is not None:
                     yield updated
-                await self._record(result)
                 yield ToolCallFinished(call=call, result=result, agent=self.agent.name)
                 continue
             if call.id in self.waiting:
@@ -2222,7 +2224,9 @@ class _Run:
                     if verdict == "run":
                         self._counted[call.id] = None  # once per call, also across resumes
                     if verdict == "run" and tool.deferred:
-                        unsignable = await self._defer(payload)  # never executed by the loop
+                        unsignable, updated = await self._defer(payload)
+                        if updated is not None:
+                            yield updated
                         if unsignable is None:
                             continue
                         verdict, payload = "deny", unsignable
@@ -2471,13 +2475,13 @@ class _Run:
             try:
                 result = await self._invoke(ctx, tool, hooked)
             except DeferToolCall as deferral:
-                if (updated := await self._save_state()) is not None:
-                    queue.put_nowait(updated)
-                unsignable = await self._defer(
+                unsignable, updated = await self._defer(
                     call.model_copy(update={"arguments": hooked.arguments}),
                     deferral.reason,
                     deferral.metadata,
                 )
+                if updated is not None:
+                    queue.put_nowait(updated)
                 if unsignable is None:
                     return
                 refusal = prompts.PERMISSION_DENIED.format(name=call.name, reason=unsignable)
@@ -2492,10 +2496,13 @@ class _Run:
                 note=note, content=result.content
             )
             result = result.model_copy(update={"content": content})
-        # State before result: after a crash, a recorded result implies its state.
-        if (updated := await self._save_state()) is not None:
+        # Keep the state lock through the atomic write: another task cannot persist
+        # a newer snapshot before this batch writes its older one.
+        async with self._state_lock, self._batched():
+            updated = await self._save_state_locked()
+            await self._record(result)
+        if updated is not None:
             queue.put_nowait(updated)
-        await self._record(result)
         queue.put_nowait(
             ToolCallFinished(
                 call=call,
@@ -2633,10 +2640,10 @@ class _Run:
         call: ToolCallPart,
         reason: str | None = None,
         metadata: Mapping[str, Any] | None = None,
-    ) -> str | None:
-        """Record that ``call`` waits for a result from outside the run (signed, if set up).
+    ) -> tuple[str | None, StateUpdated | None]:
+        """Atomically record changed state and a call waiting for an outside result.
 
-        Returns ``None``, or the refusal for a call whose pause cannot be signed.
+        Return a signing refusal, or the committed state event when state changed.
         """
         waiting = PendingInput(
             tool_call_id=call.id,
@@ -2654,15 +2661,17 @@ class _Run:
             ) from error
         try:
             waiting.token = self.permissions.sign(**self._pause_fields(waiting, "input"))
-        except ValueError:  # NaN, an infinity or a lone surrogate
-            return prompts.UNSIGNABLE_CALL
+        except ValueError:  # a number or string outside canonical JSON's domain
+            return prompts.UNSIGNABLE_CALL, None
         data["token"] = waiting.token
         self.waiting[call.id] = waiting
         self._running.discard(call.id)  # it waits now; it is not running
         self._call_emit.pop(call.id, None)
         self._call_tasks.pop(call.id, None)
-        await self._journal("tool_deferred", {"input": data})
-        return None
+        async with self._state_lock, self._batched():
+            updated = await self._save_state_locked()
+            await self._journal("tool_deferred", {"input": data})
+        return None, updated
 
     def _supplied_result(self, call: ToolCallPart) -> ToolResultPart:
         """Turn the value given to ``resume(results=...)`` for ``call`` into its result."""
@@ -2780,11 +2789,15 @@ class _Run:
         order of the changes, so concurrent tools cannot leave a stale state last.
         """
         async with self._state_lock:
-            snapshot = _state_json(self.state)
-            if snapshot == self._saved_state:
-                return None
-            await self._journal("state_updated", {"values": json.loads(snapshot)})
-            self._saved_state = snapshot
+            return await self._save_state_locked()
+
+    async def _save_state_locked(self) -> StateUpdated | None:
+        """Save a snapshot while the caller holds `_state_lock` through its write."""
+        snapshot = _state_json(self.state)
+        if snapshot == self._saved_state:
+            return None
+        await self._journal("state_updated", {"values": json.loads(snapshot)})
+        self._saved_state = snapshot
         return StateUpdated(values=json.loads(snapshot), agent=self.agent.name)
 
     def _journal_closed(self) -> bool:
@@ -3036,10 +3049,15 @@ class _Run:
                             note=note, content=result.content
                         )
                         result = result.model_copy(update={"content": content})
-                # State before result: after a crash, a recorded result implies its state.
-                if (updated := await self._save_state_now()) is not None:
+                finished: list[Any] = []
+                async with self._state_lock, self._batched():
+                    updated = None if self._journal_closed() else await self._save_state_locked()
+                    result = await self._outside_record(call, result, finished.append, tags, began)
+                if updated is not None:
                     emit(updated)
-                return await self._outside_record(call, result, emit, tags, began)
+                for event in finished:
+                    emit(event)
+                return result
         except asyncio.CancelledError:
             if started:  # D1: only a read-only call is harmless when it is cut short
                 wording = prompts.TOOL_CANCELLED if tool.read_only else prompts.TOOL_INTERRUPTED

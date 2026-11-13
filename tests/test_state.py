@@ -288,3 +288,49 @@ async def test_concurrent_batches_are_atomic_and_do_not_inherit_a_parent_batch()
     await task
     assert store.batches == [["parent-1", "parent-2"], ["child-1", "child-2"]]
     assert len(await session.entries()) == 4
+
+
+@pytest.mark.parametrize("path", ["normal", "supplied", "defer", "served"])
+async def test_final_tool_state_and_terminal_entry_share_one_append(path):
+    from qagents import DeferToolCall, InMemoryStore
+
+    class RecordingStore(InMemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        async def append(self, session_id, entries):
+            entries = list(entries)
+            self.batches.append(entries)
+            await super().append(session_id, entries)
+
+    class SaveResult(Hooks):
+        async def after_tool(self, ctx, call, result):
+            if path == "supplied":
+                ctx.state["saved"] = True
+
+    @tool(deferred=path == "supplied")
+    async def save(ctx: RunContext) -> str:
+        """Save a result."""
+        ctx.state["saved"] = True
+        if path == "defer":
+            raise DeferToolCall("waiting")
+        return "saved"
+
+    @tool
+    async def serve(ctx: RunContext) -> str:
+        """Serve the save tool."""
+        return (await ctx.call_tool(save, {}, source="test")).content
+
+    store = RecordingStore()
+    session = Session(store)
+    target = "serve" if path == "served" else "save"
+    agent = Agent(ScriptedModel([call(target), "done"]), tools=[save, serve], hooks=[SaveResult()])
+    result = await agent.run("go", session=session)
+    if path == "supplied":
+        result = await agent.resume(session, results={result.pending_inputs[0].tool_call_id: "ok"})
+    batches = [batch for batch in store.batches if any(e.kind == "state_updated" for e in batch)]
+    assert len(batches) == 1
+    terminal = "tool_deferred" if path == "defer" else "tool_result"
+    assert [e.kind for e in batches[0]] == ["state_updated", terminal]
+    assert (await session.state()).values == {"saved": True}
