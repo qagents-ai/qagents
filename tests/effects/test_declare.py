@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from qagents.effects import _types
 from qagents.effects._declare import REACH_NAMES, Dedupe, Key, Unique, effect
 from qagents.effects._types import Absent, Attempt, EffectContext, Found, current_attempt
+from qagents.effects.contracts import STRIPE_IDEMPOTENCY_V1
 from qagents.errors import (
     ApprovalConflictError,
     ClaimConflict,
@@ -346,3 +347,16 @@ def test_local_forward_annotations_resolve_at_declaration():
     }
     declared = effect("local", key=Key("local", "key"))(send)
     assert declared.request_type is LocalRequest
+
+
+def test_stripe_contract_is_documented_and_keeps_probes_pending():
+    import inspect
+
+    from qagents.effects import contracts
+
+    preset = STRIPE_IDEMPOTENCY_V1
+    assert preset.window_s == 86400
+    assert preset.concurrent == "rejects"
+    assert preset.replays_errors and preset.replays_rejections and preset.binds_params
+    assert "2026-10-28.endive" in preset.contract
+    assert "probes pending" in inspect.getsource(contracts)
