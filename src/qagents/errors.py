@@ -24,12 +24,15 @@ defined here too, so you can catch them without importing the integration.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from . import prompts
+
+if TYPE_CHECKING:
+    from .effects._types import HeldEffect
 
 
 class QAgentsError(Exception):
@@ -135,9 +138,10 @@ class DeferToolCall(QAgentsError):
     once the other calls of the turn are done. Continue with
     ``agent.resume(session, results={tool_call_id: value})``.
 
-    The tool is never run again for this call, not even on resume: its result
-    comes only from ``results=``. Whatever the tool did before raising is
-    therefore done once.
+    An ordinary deferred tool is never run again for this call, not even on
+    resume: its result comes only from ``results=``. An `EffectHeld` is the
+    exception: its call runs again on resume so the effect's recovery table
+    can inspect the recorded outcome. Do not catch that control-flow signal.
 
         @tool
         async def render_video(ctx: RunContext, script: str) -> str:
@@ -490,3 +494,138 @@ class ExternalToolError(ToolError):
     def __init__(self, message: str, *, metadata: Mapping[str, Any] | None = None) -> None:
         super().__init__(message)
         self.metadata: dict[str, Any] = dict(metadata or {})
+
+
+class EffectRejected(ToolError):
+    """The destination definitely did nothing; tool code may catch this error.
+
+    A send function may raise it with only a message. The effect engine fills
+    in the effect and key when it handles the refusal.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        effect: str | None = None,
+        key: str | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.effect = effect
+        self.key = key
+        self.error = error
+
+
+class EffectConflictError(ToolError):
+    """The key already holds a different request; tool code may catch this error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        effect: str,
+        key: str,
+        record_id: str,
+        existing_status: str,
+    ) -> None:
+        super().__init__(message)
+        self.effect = effect
+        self.key = key
+        self.record_id = record_id
+        self.existing_status = existing_status
+
+
+class EffectReceiptError(ToolError):
+    """The action happened but its receipt cannot be stored; tool code may catch it."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        effect: str,
+        key: str,
+        receipt_error: BaseException,
+    ) -> None:
+        super().__init__(message)
+        self.effect = effect
+        self.key = key
+        self.receipt_error = receipt_error
+
+
+class EffectHeld(DeferToolCall):
+    """An effect waits for evidence; let the loop pause rather than catching this signal."""
+
+    def __init__(self, held: HeldEffect) -> None:
+        super().__init__(held.detail)
+        self.held = held
+
+
+class HeldEffectsError(SessionError):
+    """A run is refused or stopped because effects need attention; handle at the run boundary."""
+
+    def __init__(
+        self,
+        held: Iterable[HeldEffect],
+        *,
+        retry_after: datetime | None = None,
+    ) -> None:
+        self.held = tuple(held)
+        self.retry_after = retry_after
+        super().__init__(f"{len(self.held)} held effect(s) need recheck, resume, or settlement.")
+
+
+class SettlementConflict(SessionError):
+    """A settlement was refused; reload the record before an operator retries."""
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        reason: Literal[
+            "revision", "session_busy", "too_early", "contradicted", "refused", "already_settled"
+        ],
+        earliest: datetime | None = None,
+    ) -> None:
+        super().__init__(message or f"Settlement refused: {reason}.")
+        self.reason = reason
+        self.earliest = earliest
+
+
+class ApprovalConflictError(SessionError):
+    """A durable approval contradicts the supplied decision; do not continue the tool call."""
+
+    def __init__(self, message: str, *, tool_call_id: str) -> None:
+        super().__init__(message)
+        self.tool_call_id = tool_call_id
+
+
+class EntryConflict(SessionError):
+    """Only part of a batch's entry IDs already exists; the store writes nothing."""
+
+
+class ClaimConflict(SessionError):
+    """Another session owns the business key; this write made no change."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        namespace: str,
+        effect: str,
+        key: str,
+        owner_session: str,
+    ) -> None:
+        super().__init__(message)
+        self.namespace = namespace
+        self.effect = effect
+        self.key = key
+        self.owner_session = owner_session
+
+
+class JournalOutcomeUnknown(SessionError):
+    """Read-back could not resolve an append; stop using the poisoned journal writer."""
+
+
+class WorkflowBusy(SessionError):
+    """Another pass holds this workflow's lease; wait for it before continuing."""

@@ -6443,6 +6443,17 @@ defined here too, so you can catch them without importing the integration.
 - `ExternalAgentTimeoutError` (class): A request to the agent got no answer in time.
 - `ExternalAgentUnavailableError` (class): A failure that will repeat: authentication, billing, a missing credential.
 - `ExternalToolError` (class): The error result of an external agent used as a tool, with its metadata.
+- `EffectRejected` (class): The destination definitely did nothing; tool code may catch this error.
+- `EffectConflictError` (class): The key already holds a different request; tool code may catch this error.
+- `EffectReceiptError` (class): The action happened but its receipt cannot be stored; tool code may catch it.
+- `EffectHeld` (class): An effect waits for evidence; let the loop pause rather than catching this signal.
+- `HeldEffectsError` (class): A run is refused or stopped because effects need attention; handle at the run boundary.
+- `SettlementConflict` (class): A settlement was refused; reload the record before an operator retries.
+- `ApprovalConflictError` (class): A durable approval contradicts the supplied decision; do not continue the tool call.
+- `EntryConflict` (class): Only part of a batch's entry IDs already exists; the store writes nothing.
+- `ClaimConflict` (class): Another session owns the business key; this write made no change.
+- `JournalOutcomeUnknown` (class): Read-back could not resolve an append; stop using the poisoned journal writer.
+- `WorkflowBusy` (class): Another pass holds this workflow's lease; wait for it before continuing.
 
 ---
 
