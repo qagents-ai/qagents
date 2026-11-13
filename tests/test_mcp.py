@@ -22,7 +22,7 @@ from mcp import StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from qagents import Agent, Permissions, RunContext, Session, prompts
-from qagents.errors import ConfigurationError, ToolArgumentError, ToolError
+from qagents.errors import ConfigurationError, MCPAmbiguousError, ToolArgumentError, ToolError
 from qagents.messages import ToolResultPart
 from qagents.models.testing import ScriptedModel, call
 from qagents.toolkits.mcp import (
@@ -392,7 +392,7 @@ async def test_timeout_is_an_error_result_and_the_connection_survives():
     async with fixture_toolkit(timeout=0.5) as tk:
         tools = by_name(await tk.tools())
         began = time.monotonic()
-        with pytest.raises(ToolError, match="did not finish within 0.5 seconds"):
+        with pytest.raises(MCPAmbiguousError, match="did not finish within 0.5 seconds"):
             await run(tools["slow"], seconds=5)
         assert time.monotonic() - began < 3
         assert await run(tools["echo"], text="still here") == "still here"
@@ -400,7 +400,7 @@ async def test_timeout_is_an_error_result_and_the_connection_survives():
 
 async def test_run_limit_applies_when_the_tool_has_no_timeout(toolkit):
     tools = by_name(await toolkit.tools())
-    with pytest.raises(ToolError, match="within 0.3 seconds"):
+    with pytest.raises(MCPAmbiguousError, match="within 0.3 seconds"):
         await tools["slow"].run(RunContext(), {"seconds": 5}, timeout=0.3)
 
 
@@ -686,3 +686,73 @@ async def test_streamable_http(http_server):
         with pytest.raises(ToolError, match="failed on purpose"):
             await run(tools["web__fail"])
     assert seen_headers and all(h.get("x-fixture-token") == "t-123" for h in seen_headers)
+
+
+@pytest.mark.parametrize(
+    "failure", ["timeout", "rpc_timeout", "closed", "invalid", "os", "eof", "transport"]
+)
+async def test_post_send_mcp_failures_preserve_unknown_outcome(monkeypatch, failure):
+    import anyio
+    from mcp.shared.exceptions import MCPError
+    from pydantic import BaseModel, ValidationError
+
+    class Answer(BaseModel):
+        count: int
+
+    try:
+        Answer.model_validate({"count": "not-an-integer"})
+    except ValidationError as invalid:
+        validation = invalid
+    errors = {
+        "timeout": TimeoutError(),
+        "rpc_timeout": MCPError(mcp_types.REQUEST_TIMEOUT, "timeout"),
+        "closed": MCPError(mcp_types.CONNECTION_CLOSED, "closed"),
+        "invalid": validation,
+        "os": OSError("lost"),
+        "eof": EOFError(),
+        "transport": anyio.BrokenResourceError(),
+    }
+
+    class Client:
+        async def call_tool(self, *args, **kwargs):
+            raise errors[failure]
+
+    toolkit = MCPToolkit(lambda: None)
+
+    async def connected():
+        return Client()
+
+    monkeypatch.setattr(toolkit, "_client", connected)
+    target = toolkit._make_tool(
+        mcp_types.Tool(name="publish", input_schema={"type": "object"}), "public_publish"
+    )
+    with pytest.raises(MCPAmbiguousError) as raised:
+        await run(target)
+    assert raised.value.tool == "public_publish"
+    assert raised.value.__cause__ is errors[failure]
+
+
+@pytest.mark.parametrize("failure", ["connect", "rpc_error", "tool_error"])
+async def test_mcp_definite_refusals_are_not_ambiguous(monkeypatch, failure):
+    from mcp.shared.exceptions import MCPError
+
+    class Client:
+        async def call_tool(self, *args, **kwargs):
+            if failure == "rpc_error":
+                raise MCPError(mcp_types.INVALID_PARAMS, "bad arguments")
+            return mcp_types.CallToolResult(content=[], is_error=True)
+
+    toolkit = MCPToolkit(lambda: None)
+
+    async def connected():
+        if failure == "connect":
+            raise MCPConnectionError("not connected")
+        return Client()
+
+    monkeypatch.setattr(toolkit, "_client", connected)
+    target = toolkit._make_tool(
+        mcp_types.Tool(name="publish", input_schema={"type": "object"}), "publish"
+    )
+    with pytest.raises(ToolError) as raised:
+        await run(target)
+    assert not isinstance(raised.value, MCPAmbiguousError)

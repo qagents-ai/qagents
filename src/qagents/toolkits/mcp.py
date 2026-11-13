@@ -82,6 +82,7 @@ except ImportError as error:  # pragma: no cover - depends on the environment
 from .. import prompts
 from ..errors import (
     ConfigurationError,
+    MCPAmbiguousError,
     MCPConnectionError,
     MCPToolChangedError,
     ToolArgumentError,
@@ -273,8 +274,10 @@ class MCPTool(Tool):
 
         Raises:
             ToolArgumentError: The arguments do not match the input schema.
-            ToolError: The server reported an error, the call timed out, or the
-                connection failed. The message is written for the model.
+            MCPAmbiguousError: A timeout, lost connection or unreadable answer
+                leaves the outcome unknown; the server may have performed the call.
+            ToolError: The server reported an error, or the call could not be sent.
+                The message is written for the model.
         """
         validated = self.validate(arguments)
         limit = self.timeout if self.timeout is not None else timeout
@@ -678,18 +681,20 @@ class MCPToolkit(Toolkit):
                     tool.mcp_name, arguments, progress_callback=progress
                 )
         except TimeoutError as error:
-            raise ToolError(
-                prompts.MCP_TOOL_TIMEOUT.format(name=tool.name, seconds=limit or 0)
+            raise MCPAmbiguousError(
+                prompts.MCP_TOOL_TIMEOUT.format(name=tool.name, seconds=limit or 0), tool=tool.name
             ) from error
         except MCPError as error:
             if error.code == mcp_types.REQUEST_TIMEOUT:
-                raise ToolError(
-                    prompts.MCP_TOOL_TIMEOUT.format(name=tool.name, seconds=limit or 0)
+                raise MCPAmbiguousError(
+                    prompts.MCP_TOOL_TIMEOUT.format(name=tool.name, seconds=limit or 0),
+                    tool=tool.name,
                 ) from error
             if error.code == mcp_types.CONNECTION_CLOSED:
                 self._mark_dead()
-                raise ToolError(
-                    prompts.MCP_CONNECTION_LOST.format(name=tool.name, server=self.name)
+                raise MCPAmbiguousError(
+                    prompts.MCP_CONNECTION_LOST.format(name=tool.name, server=self.name),
+                    tool=tool.name,
                 ) from error
             raise ToolError(
                 prompts.MCP_REQUEST_FAILED.format(
@@ -697,17 +702,20 @@ class MCPToolkit(Toolkit):
                 )
             ) from error
         except ValidationError as error:
-            raise ToolError(prompts.MCP_INVALID_RESPONSE.format(name=tool.name)) from error
+            raise MCPAmbiguousError(
+                prompts.MCP_INVALID_RESPONSE.format(name=tool.name), tool=tool.name
+            ) from error
         except (OSError, EOFError) as error:
             self._mark_dead()
-            raise ToolError(
-                prompts.MCP_CONNECTION_LOST.format(name=tool.name, server=self.name)
+            raise MCPAmbiguousError(
+                prompts.MCP_CONNECTION_LOST.format(name=tool.name, server=self.name), tool=tool.name
             ) from error
         except Exception as error:
             if _is_transport_failure(error):
                 self._mark_dead()
-                raise ToolError(
-                    prompts.MCP_CONNECTION_LOST.format(name=tool.name, server=self.name)
+                raise MCPAmbiguousError(
+                    prompts.MCP_CONNECTION_LOST.format(name=tool.name, server=self.name),
+                    tool=tool.name,
                 ) from error
             raise
         return self._render(tool, result)
