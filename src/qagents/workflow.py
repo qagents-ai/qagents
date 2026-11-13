@@ -191,8 +191,7 @@ class Workflow:
 
     async def _completed_map(self) -> dict[str, Any]:
         """What this object remembers of the finished steps; the steps add to it."""
-        if self._completed is None:
-            await self._scan()
+        await self._scan()
         assert self._completed is not None
         return self._completed
 
@@ -226,8 +225,9 @@ class Workflow:
                 result = await result
             recorded = to_jsonable_python(result)
             await self._journal.append("workflow_step", {"name": name, "result": recorded})
-            completed[name] = recorded
-            return result
+            await self._scan()
+            winner = completed[name]
+            return result if winner == recorded else _revive(winner, type)
 
     async def map(
         self,
@@ -394,8 +394,8 @@ class Workflow:
             unrecorded = self._finished_unrecorded(name, session.id, entries)
             if unrecorded is not None:  # the bound run completed before the step was recorded
                 await self._journal.append("workflow_step", {"name": name, "result": unrecorded})
-                completed[name] = unrecorded
-                return self._revive_result(name, unrecorded, agent)
+                await self._scan()
+                return self._revive_result(name, completed[name], agent)
             if current.open_run_id is not None and current.messages:
                 bound = self._agent_runs.get(name)
                 if bound is not None and current.open_run_id != bound:
@@ -422,7 +422,9 @@ class Workflow:
             if result.status == "completed":
                 recorded = to_jsonable_python(result)
                 await self._journal.append("workflow_step", {"name": name, "result": recorded})
-                completed[name] = recorded
+                await self._scan()
+                if completed[name] != recorded:
+                    return self._revive_result(name, completed[name], agent)
             return result
 
     # -- signals and timers --------------------------------------------------------------
@@ -595,7 +597,7 @@ class Workflow:
         for entry in await self._journal.entries():
             kind, data = entry.kind, entry.data
             if kind == "workflow_step":
-                journal.completed[data["name"]] = data["result"]
+                journal.completed.setdefault(data["name"], data["result"])
             elif kind == "workflow_signal":
                 journal.signals.setdefault(data["name"], data.get("value"))
             elif kind == "workflow_waiting":
@@ -611,8 +613,7 @@ class Workflow:
         if self._completed is None:
             self._completed = dict(journal.completed)
         else:
-            for name, result in journal.completed.items():
-                self._completed.setdefault(name, result)
+            self._completed.update(journal.completed)
         for name, value in journal.signals.items():
             self._signals.setdefault(name, value)
         for name, due in journal.timers.items():

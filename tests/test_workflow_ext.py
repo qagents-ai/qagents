@@ -566,3 +566,21 @@ async def test_a_legacy_step_collision_is_refused_before_journal_writes():
     with pytest.raises(SessionError, match="already an agent-step session"):
         await Workflow(store, "a:b").step("value", lambda: 1)
     assert await session.entries() == before
+
+
+async def test_workflow_replay_and_live_cache_both_keep_the_first_result():
+    store = InMemoryStore()
+    workflow = Workflow(store, "first-wins")
+    assert await workflow.completed_steps() == {}  # warm an empty cache
+    await workflow._journal.append("workflow_step", {"name": "old", "result": "first"})
+    await workflow._journal.append("workflow_step", {"name": "old", "result": "second"})
+    assert await workflow.step("old", lambda: pytest.fail("cached step ran")) == "first"
+    assert await Workflow(store, "first-wins").step("old", lambda: "third") == "first"
+
+    async def race():
+        await workflow._journal.append("workflow_step", {"name": "race", "result": "winner"})
+        return "later"
+
+    assert await workflow.step("race", race) == "winner"
+    assert (await workflow.completed_steps())["race"] == "winner"
+    assert (await Workflow(store, "first-wins").completed_steps())["race"] == "winner"
