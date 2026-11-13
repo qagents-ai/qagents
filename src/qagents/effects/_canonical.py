@@ -9,14 +9,14 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
+from pydantic import JsonValue as JSONValue
 
 if TYPE_CHECKING:
     from ._declare import Effect
 
-JSONValue: TypeAlias = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
 LIMIT_BYTES = 16 * 1024
 
 

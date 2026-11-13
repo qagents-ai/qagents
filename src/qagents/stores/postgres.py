@@ -56,7 +56,7 @@ import os
 import re
 import sys
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..errors import ConfigurationError, SessionError
 from ..session import (
@@ -358,7 +358,9 @@ class PostgresStore(SessionStore):
             for seq, ts, run_id, kind, data in rows
         ]
 
-    async def delete(self, session_id: str) -> None:
+    async def delete(
+        self, session_id: str, *, force: bool | Literal["forget_effects"] = False
+    ) -> None:
         pool = await self._ready()
         async with pool.connection() as connection, connection.transaction():
             # The sessions row first: it waits for an append in flight (which holds its

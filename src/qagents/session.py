@@ -74,6 +74,7 @@ and `qagents.stores.postgres.PostgresStore` implement both.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
 import functools
 import json
@@ -82,13 +83,16 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Literal, Self, get_args
+from typing import Any, ClassVar, Literal, Self, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from .effects._fold import EffectView
+from .effects._ports import Timing
+from .effects._types import EffectRecord, HeldEffect
 from .errors import LeaseError, SessionError
 from .messages import Message, ToolResultPart, Usage
 
@@ -99,6 +103,7 @@ def _owner_token(worker: str) -> str:
 
 
 class Entry(BaseModel):
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     kind: str
     data: dict[str, Any] = Field(default_factory=dict)
     run_id: str | None = None
@@ -137,10 +142,22 @@ class PendingInput(BaseModel):
     """Data the tool attached with `DeferToolCall`, for example an external job id."""
     token: str | None = None
     """Opaque token that proves the pause is genuine, when pauses are signed."""
+    held: HeldEffect | None = None
+    held_record_id: str | None = None
 
 
 class SessionState(BaseModel):
     """What the journal says about a session right now."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    effects: EffectView = Field(default_factory=EffectView)
+    open_turn_starts: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    tool_attempts: dict[str, int] = Field(default_factory=dict)
+    decisions: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    decision_counts: dict[str, int] = Field(default_factory=dict)
+    memos: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    run_requires: dict[str, list[str]] = Field(default_factory=dict)
+    assistant_messages: int = 0
 
     messages: list[Message] = Field(default_factory=list)
     open_run_id: str | None = None
@@ -189,7 +206,7 @@ class SessionState(BaseModel):
         )
 
 
-def derive_state(entries: list[Entry]) -> SessionState:
+def derive_state(entries: list[Entry], *, session_id: str | None = None) -> SessionState:
     """Replay a journal into the current `SessionState`.
 
     Args:
@@ -359,6 +376,11 @@ class SessionStatus(BaseModel):
     """
 
     session_id: str
+    lease_epoch: int = 0
+    lease_acquired_at: float | None = None
+    has_effects: bool = False
+    retry_after: float | None = None
+    incarnation: str | None = None
     status: SessionRunStatus = "idle"
     open_run_id: str | None = None
     """Id of the run that started and has not finished."""
@@ -421,6 +443,17 @@ def advance_status(status: SessionStatus, entry: Entry) -> None:
         status.status = "running"
 
 
+class LeaseGrant(BaseModel):
+    owner: str
+    epoch: int
+    acquired_at: float
+    expires_at: float
+
+
+FEATURES = frozenset({"leases", "epochs", "entry_ids", "now", "salt", "registry", "claims"})
+EFFECTS_REQUIRED = FEATURES - {"claims"}
+
+
 class SessionStore(ABC):
     """Where journals live. Implement three methods to add a backend.
 
@@ -432,6 +465,31 @@ class SessionStore(ABC):
     status in the same transaction as the entries (see `advance_status`) and
     check the lease in the same transaction as an `append_leased` write.
     """
+
+    features: ClassVar[frozenset[str]] = frozenset()
+    takeover_grace_s: float = 1.0
+
+    async def now(self) -> float:
+        raise NotImplementedError(_unsupported(self, "store clock"))
+
+    async def acquire_lease_grant(
+        self, session_id: str, owner: str, ttl_s: float
+    ) -> LeaseGrant | None:
+        raise NotImplementedError(_unsupported(self, "lease epochs"))
+
+    async def get_claim(self, namespace: str, effect: str, key: str):
+        raise NotImplementedError(_unsupported(self, "effect claims"))
+
+    async def purge_claims(self, *, older_than: float) -> int:
+        raise NotImplementedError(_unsupported(self, "effect claims"))
+
+    async def register_effect(
+        self, effect: str, version: str, key_spec_digest: str, request_schema_digest: str
+    ) -> Literal["registered", "matches", "key_changed", "schema_changed"]:
+        raise NotImplementedError(_unsupported(self, "effect registry"))
+
+    async def salt(self) -> bytes:
+        raise NotImplementedError(_unsupported(self, "effect salt"))
 
     @abstractmethod
     async def append(self, session_id: str, entries: list[Entry]) -> None:
@@ -449,7 +507,9 @@ class SessionStore(ABC):
         """Return every entry of the session, oldest first."""
 
     @abstractmethod
-    async def delete(self, session_id: str) -> None:
+    async def delete(
+        self, session_id: str, *, force: bool | Literal["forget_effects"] = False
+    ) -> None:
         """Remove the session."""
 
     async def aclose(self) -> None:  # noqa: B027 - optional to override
@@ -587,7 +647,11 @@ class InMemoryStore(SessionStore):
     the store.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, clock: Callable[[], float] | None = None, takeover_grace_s: float = 1.0
+    ) -> None:
+        self._clock = clock or time.time
+        self.takeover_grace_s = takeover_grace_s
         self._sessions: dict[str, list[Entry]] = {}
         self._status: dict[str, SessionStatus] = {}
 
@@ -618,7 +682,9 @@ class InMemoryStore(SessionStore):
     async def load(self, session_id: str) -> list[Entry]:
         return list(self._sessions.get(session_id, []))
 
-    async def delete(self, session_id: str) -> None:
+    async def delete(
+        self, session_id: str, *, force: bool | Literal["forget_effects"] = False
+    ) -> None:
         self._sessions.pop(session_id, None)
         self._status.pop(session_id, None)
 
@@ -692,7 +758,15 @@ class SQLiteStore(SessionStore):
     process on the host shares; do not share the file across hosts.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        clock: Callable[[], float] | None = None,
+        takeover_grace_s: float = 1.0,
+    ) -> None:
+        self._clock = clock or time.time
+        self.takeover_grace_s = takeover_grace_s
         self.path = str(path)
         self._lock = threading.Lock()
         self._connection: sqlite3.Connection | None = None
@@ -946,7 +1020,9 @@ class SQLiteStore(SessionStore):
     async def load(self, session_id: str) -> list[Entry]:
         return await self._call(self._load, session_id)
 
-    async def delete(self, session_id: str) -> None:
+    async def delete(
+        self, session_id: str, *, force: bool | Literal["forget_effects"] = False
+    ) -> None:
         await self._call(self._delete, session_id)
 
     async def status(self, session_id: str) -> SessionStatus:
@@ -1074,9 +1150,187 @@ class Session:
         await self._resolve()
         await self.store.append(self.id, entries)
 
-    async def clear(self) -> None:
+    async def effects(
+        self, status: str | Iterable[str] | None = None, namespace: str | None = None
+    ) -> list[EffectRecord]:
+        raise NotImplementedError("Effect session views are pending the store integration stage.")
+
+    async def clear(self, *, force: bool | Literal["forget_effects"] = False) -> None:
         await self._resolve()
-        await self.store.delete(self.id)
+        if force is False:
+            await self.store.delete(self.id)
+        else:
+            await self.store.delete(self.id, force=force)
 
     def __repr__(self) -> str:
         return f"Session(id={self.id!r}, store={type(self.store).__name__})"
+
+
+async def append_fenced(
+    store: SessionStore,
+    session_id: str,
+    entries: list[Entry],
+    owner: str | None,
+    *,
+    fence: Callable[[], bool],
+    attempts: int = 3,
+) -> list[int] | None:
+    """SPEC 7.7.2-3 in one place: first append (append_leased with owner, or append when
+    owner is None); a definite refusal (LeaseError, validation SessionError,
+    EntryConflict, ClaimConflict) re-raised; any other error, CancelledError included,
+    is an unknown outcome: re-append the same ids while fence() holds, up to `attempts`,
+    then load(): all ids present -> their seqs, none -> the last error re-raised as
+    definite, a read that fails -> JournalOutcomeUnknown. A CancelledError during the
+    first append is an unknown outcome like any other: the outcome is decided first,
+    then the CancelledError is re-raised. What the caller does after that (record the
+    commit in the scope, return the receipt) is protected only by the engine's _shield
+    (3.7, M39)."""
+    raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+
+class Lease:
+    """One lease's token, epoch, deadline, renewals and running sends; implementation pending."""
+
+    def __init__(
+        self,
+        store: SessionStore,
+        session_id: str,
+        *,
+        worker: str,
+        ttl_s: float,
+        purpose: Literal["run", "recovery", "settle", "recheck", "workflow"],
+        timing: Timing,
+    ) -> None:
+        """owner = _owner_token(worker)."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    owner: str
+    worker: str
+    epoch: int | None
+    acquired_at: float | None
+    ttl_s: float
+    timing: Timing
+
+    async def acquire(self) -> bool:
+        """With feature "epochs": acquire_lease_grant. Without it: the 0.2 acquire_lease (epoch
+        None, nothing journaled). NotImplementedError from a store without leases propagates
+        (the caller runs unleased, as 0.2 did). Captures the running loop; t_sent =
+        loop.time() before the call; L = t_sent + ttl_s * (1 - rho)."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def renew(self) -> bool:
+        """Success moves L; failure leaves it."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def remaining(self) -> float:
+        """L - captured_loop.time(); callable from any thread; -inf before a grant."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def lost(self) -> bool:
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def first_entries(self) -> list[Entry]:
+        """[lease_acquired] with the fixed id of 3.3 until mark_first_written(); [] without an
+        epoch."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def mark_first_written(self) -> None:
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def track(self, fut: asyncio.Future[Any] | concurrent.futures.Future[Any]) -> None:
+        """Count a running send (a task or a thread) until it is done; thread-safe; the
+        decrement is posted to the captured loop with call_soon_threadsafe from the future's
+        done callback."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def running_sends(self) -> int:
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def sends_drained(self) -> None:
+        """Return when no tracked send runs (M47 seam)."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def keep(self, *, on_lost: Callable[[str], None]) -> None:
+        """Renew every ttl/3; call on_lost(reason) when a renewal returns False or remaining()
+        < timing.m_s (F2); keeps renewing while tracked sends run after the owner finished."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def release(self) -> None:
+        """release_lease; callers use LeasedWriter.close, which waits for sends first."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+
+class LeasedWriter:
+    """Frozen leased-writer contract; implementation is pending the store owner stage."""
+
+    def __init__(
+        self,
+        store: SessionStore,
+        session_id: str,
+        *,
+        worker: str,
+        ttl_s: float,
+        purpose: Literal["run", "recovery", "settle", "recheck", "workflow"],
+        journal_acquisition: bool | None = None,
+    ) -> None:
+        """journal_acquisition None: decided after acquisition from status().has_effects; True
+        for agents with effects tools and for operators. Timing from Timing.for_lease(ttl_s,
+        store.takeover_grace_s, effects=journal_acquisition is True)."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    store: SessionStore
+    session_id: str
+    worker: str
+    lease: Lease
+    timing: Timing
+    leased: bool
+
+    async def open(self) -> bool:
+        """Acquire before any read (7.3); False when another owner holds the lease. A store
+        without leases: leased=False, True."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def load(self) -> list[Entry]:
+        """Load the journal and rebuild view() from it."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def append(self, entries: Sequence[Entry]) -> list[int] | None:
+        """Every write of this writer, whoever calls it (the run, the runtime's limits,
+        run_recovered, a crash-loop run_failed). Prepends lease.first_entries() to the first
+        write; append_fenced with the lease owner (fence = not lease.lost()); folds every
+        entry it wrote into view(). None only from a 0.2-style store."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def append_effect(self, entries: Sequence[Entry]) -> list[int]:
+        """An effect entry as its own write, never batched: append_fenced with fence =
+        lease.remaining() >= timing.m_s; raises JournalOutcomeUnknown and poisons the writer
+        when the outcome stays unknown."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def view(self) -> EffectView:
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def store_now(self) -> float:
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def salt(self) -> bytes:
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def poisoned(self) -> bool:
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    def track(self, fut: asyncio.Future[Any] | concurrent.futures.Future[Any]) -> None:
+        """lease.track."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def keep(self, *, on_lost: Callable[[str], None]) -> None:
+        """lease.keep (the run's or the runtime's renewal task)."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    async def close(self) -> None:
+        """Wait for sends_drained() while renewing, then release. Never releases early: if the
+        wait is cancelled, the rest (renew until drained, release) moves to a detached task
+        kept in session._DETACHED, and the CancelledError is re-raised."""
+        raise NotImplementedError("Effects implementation is pending its owning stage.")
+
+    wrapped: SessionStore
