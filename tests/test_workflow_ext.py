@@ -245,7 +245,7 @@ async def test_run_agent_passes_results_to_a_deferred_tool_and_state_to_the_sess
     status = await workflow.status()
     (step,) = status.open_agent_steps
     assert (step.name, step.status, step.run_id) == ("analyse", "paused", paused.run_id)
-    assert step.session_id == "workflow:quarterly:analyse"
+    assert step.session_id == "workflow-step:quarterly:analyse"
     assert [item.tool_call_id for item in step.pending_inputs] == [waiting.tool_call_id]
 
     # Later, in another process, the external system's result arrives.
@@ -272,7 +272,7 @@ async def test_run_agent_passes_results_to_a_deferred_tool_and_state_to_the_sess
     again = await Workflow(store, id="quarterly").run_agent(
         "analyse", Agent(ScriptedModel([]), name="analyst"), "Analyse R-7", results={"x": 1}
     )
-    assert again.output == "Done." and again.session.id == "workflow:quarterly:analyse"
+    assert again.output == "Done." and again.session.id == "workflow-step:quarterly:analyse"
 
 
 async def test_run_agent_refuses_what_it_cannot_pass_on():
@@ -517,3 +517,52 @@ async def test_unrecorded_agent_step_recovers_its_bound_run_not_a_later_run(late
     assert [m.text for m in result.messages] == ["first prompt", "original"]
     assert binding.data["run_id"] == expected_run
     assert len(original.model.requests) == 1
+
+
+async def test_workflow_ids_are_injective_and_never_share_a_step_or_journal():
+    from qagents.runtime import WORKFLOW_PREFIX
+
+    store = InMemoryStore()
+    pairs = [("a:b", "c"), ("a", "b:c"), ("a/b", "#%"), ("a%2Fb", "#%"), ("", "")]
+    workflows = [Workflow(store, id=workflow_id) for workflow_id, _ in pairs]
+    ids = [wf.session(name).id for wf, (_, name) in zip(workflows, pairs, strict=True)]
+    ids += [wf._journal.id for wf in workflows]
+    assert len(ids) == len(set(ids))
+    assert all(session_id.startswith(WORKFLOW_PREFIX) for session_id in ids)
+    parent = Workflow(store, id="a")
+    child = Workflow(store, id="a:b")
+    await parent.run_agent("b", Agent(ScriptedModel(["step answer"])), "go")
+    await child.step("value", lambda: "workflow value")
+    assert set(await parent.completed_steps()) == {"b"}
+    assert await child.completed_steps() == {"value": "workflow value"}
+    assert all(e.kind.startswith("workflow_") for e in await child._journal.entries())
+
+
+async def test_legacy_workflow_sessions_and_signals_remain_readable_and_resumable():
+    store = InMemoryStore()
+    journal = Session(store, id="workflow:old:id")
+    legacy_step = Session(store, id="workflow:old:id:task")
+    await journal.append("workflow_step", {"name": "saved", "result": 7})
+    await journal.append("workflow_agent_started", {"name": "task", "session_id": legacy_step.id})
+    await Agent(ScriptedModel(["old answer"])).run("old prompt", session=legacy_step)
+    wf = Workflow(store, id="old:id")
+    session = wf.session("task")
+    assert [m.text for m in await session.messages()] == ["old prompt", "old answer"]
+    assert session.id == legacy_step.id
+    assert await wf.step("saved", lambda: pytest.fail("replayed step ran")) == 7
+    await Workflow.send_signal(store, "old:id", "review", "yes")
+    assert await wf.wait_for_signal("review") == "yes"
+    await Agent(ScriptedModel(["new answer"])).run(
+        "new prompt", session=Workflow(store, "old:id").session("task")
+    )
+    assert len(await legacy_step.messages()) == 4
+
+
+async def test_a_legacy_step_collision_is_refused_before_journal_writes():
+    store = InMemoryStore()
+    session = Session(store, id="workflow:a:b")
+    await Agent(ScriptedModel(["step answer"])).run("go", session=session)
+    before = await session.entries()
+    with pytest.raises(SessionError, match="already an agent-step session"):
+        await Workflow(store, "a:b").step("value", lambda: 1)
+    assert await session.entries() == before

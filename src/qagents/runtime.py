@@ -83,8 +83,9 @@ alone; continuing a session with ``result.session`` is safe. A store subclass
 that overrides ``append`` but not ``append_leased`` gets no lease from a
 plain run, and under a runtime its ``append`` is bypassed (every write goes
 through ``append_leased``): override both. Sessions that belong to a
-`qagents.workflow.Workflow` (ids starting with ``"workflow:"``) are never
-recovered: resume the workflow instead.
+`qagents.workflow.Workflow` (legacy ``"workflow:"`` ids and encoded
+``"workflow-journal:"`` / ``"workflow-step:"`` ids) are never recovered:
+resume the workflow instead.
 """
 
 from __future__ import annotations
@@ -135,7 +136,7 @@ HandleStatus = Literal["queued", "running", "finished", "failed", "interrupted"]
 DepsFactory = Callable[[str], Any]
 """Builds ``deps`` for a session id. May be async (return an awaitable)."""
 
-WORKFLOW_PREFIX = "workflow:"
+WORKFLOW_PREFIX = ("workflow:", "workflow-journal:", "workflow-step:")
 """Sessions whose id starts with this belong to a workflow and are not recovered."""
 
 LIMITS_KIND = "runtime_limits"

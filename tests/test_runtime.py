@@ -461,15 +461,18 @@ async def test_runs_of_unknown_agents_and_workflow_sessions_are_left_alone(caplo
     store = InMemoryStore()
     started = Entry(kind="run_started", run_id="r", data={"agent": "elsewhere"})
     await store.append("foreign", [started])
-    await store.append(
-        "workflow:report:research", [started.model_copy(update={"data": {"agent": "a"}})]
-    )
+    for session_id in (
+        "workflow:report:research",
+        "workflow-journal:report",
+        "workflow-step:report:research",
+    ):
+        await store.append(session_id, [started.model_copy(update={"data": {"agent": "a"}})])
     runtime = AgentRuntime(store, [Agent(ScriptedModel([]), name="a")])
     with caplog.at_level(logging.WARNING, logger="qagents.runtime"):
         assert await runtime.recover() == []
     messages = [r.message for r in caplog.records]
     assert any("'foreign'" in m and "agent 'elsewhere'" in m for m in messages)
-    assert not any("workflow:" in m for m in messages)
+    assert not any("workflow" in m for m in messages)
     await runtime.shutdown()
 
 

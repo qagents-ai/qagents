@@ -1244,6 +1244,7 @@ class _Run:
         store subclass that overrides ``append`` but not ``append_leased`` is
         written through its ``append`` without a lease.
         """
+        await self.session._resolve()
         store, session_id = self.session.store, self.session.id
         key = (id(store), session_id)
         live = _LIVE_RUNS.get(key)

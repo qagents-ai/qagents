@@ -1052,7 +1052,11 @@ class Session:
         self.store = store or InMemoryStore()
         self.id = id or uuid.uuid4().hex
 
+    async def _resolve(self) -> None:
+        """Resolve a specialized session's physical id before I/O (ordinary sessions are ready)."""
+
     async def entries(self) -> list[Entry]:
+        await self._resolve()
         return await self.store.load(self.id)
 
     async def state(self) -> SessionState:
@@ -1062,13 +1066,16 @@ class Session:
         return (await self.state()).messages
 
     async def append(self, kind: str, data: dict[str, Any], *, run_id: str | None = None) -> None:
+        await self._resolve()
         await self.store.append(self.id, [Entry(kind=kind, data=data, run_id=run_id)])
 
     async def append_entries(self, entries: list[Entry]) -> None:
         """Append several entries in one store call, which every store writes atomically."""
+        await self._resolve()
         await self.store.append(self.id, entries)
 
     async def clear(self) -> None:
+        await self._resolve()
         await self.store.delete(self.id)
 
     def __repr__(self) -> str:

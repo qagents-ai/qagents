@@ -51,7 +51,7 @@ again almost at once:
 signals and timers the workflow waits for, and which agent steps have a run
 that is still open (paused for approvals or inputs, failed, or running).
 
-Journal entry kinds (in the session ``workflow:<id>``; readers ignore kinds
+Journal entry kinds (in ``workflow-journal:<encoded-id>``; readers ignore kinds
 they do not know):
 
 | Kind | Meaning (data) |
@@ -73,6 +73,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from pydantic_core import PydanticSerializationError, to_jsonable_python
@@ -157,6 +158,10 @@ class Workflow:
 
     Create a new ``Workflow`` object every time the job runs (in any process):
     what the journal says has finished is replayed, and the rest runs.
+    New journals and step sessions have separate prefixes and percent-encoded
+    identities, so punctuation in ids cannot make them collide. Existing
+    ``workflow:`` journals keep their original ids; a step session resolves
+    its legacy id before its first read, write, or lease acquisition.
 
     Args:
         store: Where the workflow's journal and its agent steps' sessions live.
@@ -167,6 +172,8 @@ class Workflow:
         self.store = store
         self.id = id
         self._journal = Session(store, id=_journal_id(id))
+        self._layout_ready = False
+        self._legacy_layout = False
         self._completed: dict[str, Any] | None = None
         self._running: set[str] = set()
         self._agent_steps: set[str] | None = None
@@ -175,8 +182,8 @@ class Workflow:
         self._timers: dict[str, float] = {}
 
     def session(self, name: str) -> Session:
-        """A durable session that belongs to this workflow (for an agent step)."""
-        return Session(self.store, id=f"workflow:{self.id}:{name}")
+        """A durable agent-step session; existing legacy ids resolve on first I/O."""
+        return _StepSession(self, name)
 
     async def completed_steps(self) -> dict[str, Any]:
         """Names and recorded results of the steps that have finished (a copy)."""
@@ -447,8 +454,9 @@ class Workflow:
                 f"The value of signal {name!r} cannot be stored as JSON ({error}). Send strings, "
                 "numbers, booleans, None, lists, dicts or pydantic models."
             ) from error
-        journal = Session(store, id=_journal_id(workflow_id))
-        await journal.append("workflow_signal", {"name": name, "value": recorded})
+        workflow = cls(store, id=workflow_id)
+        await workflow._resolve_layout()
+        await workflow._journal.append("workflow_signal", {"name": name, "value": recorded})
 
     async def wait_for_signal(self, name: str, *, type: Any = None) -> Any:
         """Return the value of signal ``name``, or suspend the workflow until it is sent.
@@ -556,8 +564,33 @@ class Workflow:
 
     # -- plumbing -------------------------------------------------------------------------
 
+    async def _resolve_layout(self) -> None:
+        """Read legacy workflows at their original ids, and refuse ambiguous journals."""
+        if self._layout_ready:
+            return
+        current = await self._journal.entries()
+        if not current:
+            legacy = Session(self.store, id=f"workflow:{self.id}")
+            old = await legacy.entries()
+            if old:
+                self._check_journal(old, legacy.id)
+                self._journal = legacy
+                self._legacy_layout = True
+        else:
+            self._check_journal(current, self._journal.id)
+        self._layout_ready = True
+
+    @staticmethod
+    def _check_journal(entries: list[Entry], session_id: str) -> None:
+        if any(not entry.kind.startswith("workflow_") for entry in entries):
+            raise SessionError(
+                f"Workflow journal id {session_id!r} is already an agent-step session; "
+                "choose another workflow id. Nothing was written."
+            )
+
     async def _scan(self) -> _Journal:
         """Read the workflow journal and refresh what this object remembers of it."""
+        await self._resolve_layout()
         journal = _Journal()
         for entry in await self._journal.entries():
             kind, data = entry.kind, entry.data
@@ -691,8 +724,25 @@ class Workflow:
         return result
 
 
+class _StepSession(Session):
+    """Resolve a legacy step before reads, writes, or an agent takes its lease."""
+
+    def __init__(self, workflow: Workflow, name: str) -> None:
+        self._workflow, self._name = workflow, name
+        super().__init__(workflow.store, id=_step_id(workflow.id, name))
+
+    async def _resolve(self) -> None:
+        await self._workflow._resolve_layout()
+        if self._workflow._legacy_layout:
+            self.id = f"workflow:{self._workflow.id}:{self._name}"
+
+
 def _journal_id(workflow_id: str) -> str:
-    return f"workflow:{workflow_id}"
+    return f"workflow-journal:{quote(workflow_id, safe='')}"
+
+
+def _step_id(workflow_id: str, name: str) -> str:
+    return f"workflow-step:{quote(workflow_id, safe='')}:{quote(name, safe='')}"
 
 
 async def _drive(stream: RunStream, on_event: EventCallback | None) -> RunResult:
