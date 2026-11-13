@@ -16,6 +16,7 @@ Entry kinds:
 | `tool_started` | a tool call began executing (`tool_call_id`, `name`) |
 | `tool_result` | a tool call finished (`result`; see below) |
 | `tool_deferred` | a tool call waits for a result from outside the run (`input`) |
+| `child_usage` | a child run ended (`child_run_id`, `tool_call_id`, `added_usage`) |
 | `tool_checkpoint` | a running call noted a fact (`tool_call_id`, `operation_id`, `key`, `value`) |
 | `approval_decided` | an approval was applied to a call, before it ran (see below) |
 | `state_updated` | the session state changed; the full new values (`values`) |
@@ -35,8 +36,10 @@ Details:
 * A `tool_result` has `counted` when the call counts toward
   ``Limits.max_tool_calls``. A call waiting for approval counts only once an
   approval lets it run (its `tool_started`).
-* Usage added through ``ctx.add_usage`` (a sub-agent, a compactor's summary
-  request) is written as `added_usage` on the run's next `message`,
+* A child run's usage is written in its own `child_usage` entry when it ends,
+  linked to the delegating tool call. Usage added through ``ctx.add_usage``
+  (for example a compactor's summary request) is written as `added_usage` on
+  the run's next `message`,
   `tool_result`, `tool_checkpoint`, `run_paused`, `run_failed` or
   `run_finished` entry.
 * `approval_decided` has `tool_call_id`, `name`, `approved`, `reason`,
@@ -268,7 +271,7 @@ def derive_state(entries: list[Entry]) -> SessionState:
             if "inputs" in data:  # absent in journals written before 0.2
                 listed = [PendingInput.model_validate(item) for item in data["inputs"]]
                 inputs = {item.tool_call_id: item for item in listed}
-        elif kind == "run_failed":
+        elif kind in {"run_failed", "child_usage"}:
             if entry.run_id is not None and entry.run_id == state.open_run_id:
                 _count_usage(state, data)
         elif kind == "run_finished":

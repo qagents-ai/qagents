@@ -481,3 +481,43 @@ async def test_a_response_marked_unpriced_stops_a_run_with_a_cost_budget():
     free = FunctionModel(lambda request: "done", usage=Usage(requests=1))
     plain = await Agent(free, limits=limits).run("go")
     assert plain.completed and plain.usage.cost_complete
+
+
+async def test_child_usage_is_written_before_an_unrelated_parallel_tool_result():
+    from qagents.session import derive_state
+
+    child = Agent(ScriptedModel(["answer"], usage=Usage(input_tokens=37)), name="child")
+    child_ended = asyncio.Event()
+    sibling_ended = asyncio.Event()
+
+    @tool(read_only=True)
+    async def delegate(ctx: RunContext) -> str:
+        """Ask a child and wait for the sibling."""
+        result = await child.run("work", parent=ctx)
+        child_ended.set()
+        await sibling_ended.wait()
+        return result.text
+
+    @tool(read_only=True)
+    async def sibling(ctx: RunContext) -> str:
+        """Finish while the delegation is still running."""
+        await child_ended.wait()
+        await ctx.checkpoint("ready", True)
+        sibling_ended.set()
+        return "other"
+
+    session = Session()
+    agent = Agent(
+        ScriptedModel([[call("delegate"), call("sibling")], "done"]), tools=[delegate, sibling]
+    )
+    result = await agent.run("go", session=session)
+    entries = await session.entries()
+    carriers = [e for e in entries if e.data.get("added_usage", {}).get("input_tokens") == 37]
+    assert len(carriers) == 1
+    entry = carriers[0]
+    assert entry.kind == "child_usage"
+    delegated = result.messages[1].tool_calls[0]
+    assert entry.data["tool_call_id"] == delegated.id
+    before_finish = entries[: next(i for i, e in enumerate(entries) if e.kind == "run_finished")]
+    assert derive_state(before_finish).run_usage.input_tokens == result.usage.input_tokens == 37
+    assert len(entry.data["added_usage_by_operation"]) == 1

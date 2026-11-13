@@ -1185,21 +1185,35 @@ class _Run:
             self._stopped = True  # the claim goes next: from here the journal is not the run's
             if timer is not None:
                 timer.cancel()
-            self._hand_usage_to_parent()
-            await self._unclaim()
+            try:
+                await self._hand_usage_to_parent()
+            finally:
+                await self._unclaim()
         # Outside the try: a consumer that stops at this event does not stop a finished run.
         yield RunFinished(result=result)
 
-    def _hand_usage_to_parent(self) -> None:
-        """Add this child run's usage to its parent run, once, however the run ended."""
+    async def _hand_usage_to_parent(self) -> None:
+        """Add and journal child usage in its own parent entry, however the child ended."""
         parent = self.parent_run
         if parent is None or self not in parent._children:
             return
         parent._children.remove(self)  # in the same step as the add: never counted twice or 0
-        if self.usage != Usage():
-            parent._add_usage(self.usage)
         if self._result_usage is not None:
             parent._absorbed.append(self._result_usage)  # parent.add_usage(result.usage): no-op
+        if self.usage == Usage():
+            return
+        with parent._usage_lock:
+            parent.usage = parent.usage.add(self.usage)
+        if parent._journal_closed():
+            return  # a detached child cannot write after its parent's run closed
+        data: dict[str, Any] = {
+            "child_run_id": self.run_id,
+            "tool_call_id": self.parent.tool_call_id if self.parent is not None else None,
+            "added_usage": self.usage.model_dump(mode="json"),
+        }
+        if self.parent is not None and self.parent.operation_id is not None:
+            data["added_usage_by_operation"] = _usage_dumps({self.parent.operation_id: self.usage})
+        await parent._journal("child_usage", data)
 
     async def _fail(self, error: BaseException) -> None:
         """Journal ``run_failed`` for an open run that raised, then report it to the hooks."""
