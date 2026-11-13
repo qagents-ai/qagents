@@ -177,10 +177,10 @@ def _quiescent_at(
     if ended is None:
         if attempt.intent.may_overrun or attempt.overran or attempt.intent.epoch is None:
             return None
-        later = [at for epoch, at, seq in acquisitions if epoch > attempt.intent.epoch]
+        later = [(seq, at) for epoch, at, seq in acquisitions if epoch > attempt.intent.epoch]
         if not later:
             return None
-        ended = min(later)
+        ended = min(later)[1]
     return ended + timing.applies_within_s + timing.m_s + timing.sigma_s
 
 

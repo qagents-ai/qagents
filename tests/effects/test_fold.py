@@ -305,6 +305,39 @@ def test_generation_only_counts_its_own_attempts():
     assert op.state == "N"
 
 
+def test_takeover_uses_first_journaled_acquisition_even_after_backward_clock_step():
+    entries = [
+        entry(1, "effect_intent", intent()),
+        entry(
+            2,
+            "lease_acquired",
+            {
+                "owner_token": "two",
+                "epoch": 2,
+                "acquired_at": 110.0,
+                "worker": "two",
+                "purpose": "run",
+            },
+            run=None,
+        ),
+        entry(
+            3,
+            "lease_acquired",
+            {
+                "owner_token": "three",
+                "epoch": 3,
+                "acquired_at": 109.0,
+                "worker": "three",
+                "purpose": "run",
+            },
+            run=None,
+        ),
+        entry(4, "effect_intent", intent(attempt=2, store_ts=115.5)),
+        entry(5, "effect_failed", failed(attempt=2, intent_seq=4, why="rejected")),
+    ]
+    assert operation(entries).state == "D"
+
+
 @pytest.mark.parametrize(
     "outcome,state", [("not_applied", "NA"), ("close_unknown", "CU"), ("resend", "D")]
 )
