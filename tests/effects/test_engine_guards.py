@@ -184,6 +184,80 @@ def test_no_answer_overrides_effect_rejected_and_cancellation_bases():
     assert engine._classify_send_error(send, asyncio.CancelledError()) == "unknown"
 
 
+def _wrapped(inner: BaseException, outer: BaseException, style: str) -> BaseException:
+    """``outer`` as a client raises it while handling ``inner``, with Python's own links."""
+    try:
+        try:
+            raise inner
+        except BaseException as error:
+            if style == "from":
+                raise outer from error
+            if style == "from_none":
+                raise outer from None
+            raise outer  # noqa: B904
+    except BaseException as raised:
+        return raised
+    raise AssertionError("nothing was raised")
+
+
+@pytest.mark.parametrize("style", ["from", "context", "from_none"])
+@pytest.mark.parametrize(
+    "inner",
+    [
+        TimeoutError,
+        ConnectionResetError,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+        asyncio.CancelledError,
+    ],
+    ids=lambda inner: inner.__name__,
+)
+def test_refusal_raised_from_or_while_handling_a_no_answer_error_is_unknown(inner, style):
+    # AF-1 review: clients wrap the transport error instead of inheriting from it,
+    # `except httpx.HTTPError as e: raise PaymentsError(...) from e`.
+    send = declared(rejected_on=(_Refused,))
+    refused = _wrapped(inner("response lost"), _Refused("payments request failed"), style)
+    assert engine._classify_send_error(send, refused) == "unknown"
+    rejected = _wrapped(inner("response lost"), EffectRejected("refused"), style)
+    assert engine._classify_send_error(send, rejected) == "unknown"
+
+
+def test_a_no_answer_error_deeper_in_the_chain_is_unknown():
+    # The chain requests builds: a socket timeout, the urllib3 error raised from it,
+    # and the requests error raised while handling that.
+    class PoolReadTimeout(Exception):
+        pass
+
+    pool = _wrapped(TimeoutError("timed out"), PoolReadTimeout("read timed out"), "from")
+    refused = _wrapped(pool, _Refused("read timed out"), "context")
+    assert engine._classify_send_error(declared(rejected_on=(_Refused,)), refused) == "unknown"
+
+
+def test_a_refusal_from_a_received_response_or_an_unrelated_error_stays_rejected():
+    send = declared(rejected_on=(_Refused,))
+    request = httpx.Request("POST", "https://payments.example/charges")
+    status = httpx.HTTPStatusError(
+        "400 Bad Request", request=request, response=httpx.Response(400, request=request)
+    )
+    for style in ("from", "context"):
+        assert engine._classify_send_error(send, _wrapped(status, _Refused("bad"), style)) == (
+            "rejected"
+        )
+        assert engine._classify_send_error(send, _wrapped(KeyError("x"), _Refused(), style)) == (
+            "rejected"
+        )
+
+
+def test_a_cycle_in_the_error_chain_ends():
+    send = declared(rejected_on=(_Refused,))
+    refused, other = _Refused("declined"), ValueError("cached")
+    refused.__context__, other.__context__ = other, refused
+    assert engine._classify_send_error(send, refused) == "rejected"
+    lost = TimeoutError("lost")
+    other.__cause__, lost.__context__ = lost, refused
+    assert engine._classify_send_error(send, refused) == "unknown"
+
+
 @pytest.mark.parametrize("remaining,renewed", [(4.0, 0), (3.99, 1)])
 async def test_m7_margin_boundary_renews_at_most_once(remaining, renewed):
     class Lease:

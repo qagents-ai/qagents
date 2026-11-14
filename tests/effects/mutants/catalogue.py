@@ -211,6 +211,11 @@ def _local_attempts_only(original, effect, op):
     return "none_declared" if not op.attempts else original(effect, op)
 
 
+def _raised_error_only(original, error):
+    # AF-1 review: only the raised error's own class counts, not its cause or context.
+    return iter((error,))
+
+
 E = "tests/effects/test_"
 M = "tests/effects/mutants/test_scenarios.py::"
 
@@ -373,6 +378,13 @@ _ROWS = [
         E
         + "unsigned_approvals.py::test_build_warns_once_for_an_approval_gated_effects_tool_without_a_secret[requires_approval]",
         constant(False),
+    ),
+    # M52: without the chain walk, a client's refusal type raised from an httpx timeout
+    # counts as rejected, and D2 re-sends it under a new key (AF-1 review).
+    (
+        E
+        + "engine_no_answer.py::test_no_answer_after_application_is_held_not_resent_under_a_new_key[memory-wrapped_from]",
+        _raised_error_only,
     ),
 ]
 

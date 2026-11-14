@@ -2903,4 +2903,6 @@ SEAMS = [
     ("M50", "qagents.effects._engine._resend_verified", "O2"),
     # Added by AF-5 (interface-changes.md): the build warns when no secret signs approvals.
     ("M51", "qagents.permissions.Permissions._asks_by_rule", "O4b"),
+    # Added by the AF-1 re-fix (interface-changes.md): the no-answer guard reads the chain.
+    ("M52", "qagents.effects._declare._error_links", "O1"),
 ]

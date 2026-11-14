@@ -3,7 +3,9 @@
 Regression for the analysis probe s5 (findings fable-2): with ``rejected_on`` naming a
 base class of a timeout, the timeout counted as a definite refusal. Under
 ``replays_rejections=True`` (the Stripe preset) the model's retry took D2 with a new
-idempotency key, and the destination applied the charge twice.
+idempotency key, and the destination applied the charge twice. The ``wrapped_*`` cases
+are the AF-1 review's shape: the client wraps the httpx timeout in its own refusal type
+(``raise PaymentsError(...) from error``), as most clients and SDKs do.
 """
 
 import httpx
@@ -55,11 +57,15 @@ class Destination:
         return ChargeReceipt(order=attempt.request.order)
 
 
-# (raised error, rejected_on forced past the declaration check as in the probe)
+# (raised error, rejected_on forced past the declaration check as in the probe, how the
+# send wraps a transport error in PaymentsError: None, "from", "context" or "from_none")
 CASES = {
-    "timeout_subclass": (PaymentsTimeout, None),
-    "httpx_subclass": (PaymentsReadTimeout, None),
-    "undeclared_oserror": (TimeoutError, (OSError,)),
+    "timeout_subclass": (PaymentsTimeout, None, None),
+    "httpx_subclass": (PaymentsReadTimeout, None, None),
+    "undeclared_oserror": (TimeoutError, (OSError,), None),
+    "wrapped_from": (httpx.ReadTimeout, None, "from"),
+    "wrapped_context": (httpx.ReadTimeout, None, "context"),
+    "wrapped_from_none": (httpx.ReadTimeout, None, "from_none"),
 }
 
 
@@ -70,7 +76,7 @@ async def store(request, tmp_path):
         yield value
 
 
-def build(destination: Destination, forced: tuple | None, *, lookup: bool):
+def build(destination: Destination, forced: tuple | None, wrap: str | None, *, lookup: bool):
     looked: list[str] = []
 
     @effect(
@@ -82,7 +88,17 @@ def build(destination: Destination, forced: tuple | None, *, lookup: bool):
         dedupe=STRIPE_IDEMPOTENCY_V1,
     )
     async def charge(ctx: EffectContext, attempt: Attempt[Charge]) -> ChargeReceipt:
-        return destination.charge(attempt)
+        if wrap is None:
+            return destination.charge(attempt)
+        try:
+            return destination.charge(attempt)
+        except httpx.HTTPError as error:
+            # The usual client wrapper: its own error type, listed in rejected_on.
+            if wrap == "from":
+                raise PaymentsError(f"payments request failed: {error}") from error
+            if wrap == "context":
+                raise PaymentsError(f"payments request failed: {error}")  # noqa: B904
+            raise PaymentsError(f"payments request failed: {error}") from None
 
     if forced is not None:
         # The probe's declaration, which @effect refuses now. A worker leg rebuilds
@@ -116,9 +132,9 @@ def model() -> ScriptedModel:
 
 @pytest.mark.parametrize("case", CASES)
 async def test_no_answer_after_application_is_held_not_resent_under_a_new_key(store, case):
-    raised, forced = CASES[case]
+    raised, forced, wrap = CASES[case]
     destination = Destination(raised)
-    pay, _ = build(destination, forced, lookup=False)
+    pay, _ = build(destination, forced, wrap, lookup=False)
     result = await Agent(model(), tools=[pay]).run("pay", session=Session(store, id="s"))
     assert len(destination.applied) == 1, destination.keys
     assert len(set(destination.keys)) == 1, destination.keys
@@ -130,9 +146,9 @@ async def test_no_answer_after_application_is_held_not_resent_under_a_new_key(st
 
 @pytest.mark.parametrize("case", CASES)
 async def test_no_answer_after_application_is_looked_up_not_resent(store, case):
-    raised, forced = CASES[case]
+    raised, forced, wrap = CASES[case]
     destination = Destination(raised)
-    pay, looked = build(destination, forced, lookup=True)
+    pay, looked = build(destination, forced, wrap, lookup=True)
     scripted = model()
     result = await Agent(scripted, tools=[pay]).run("pay", session=Session(store, id="s"))
     assert result.status == "completed"

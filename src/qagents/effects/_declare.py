@@ -6,7 +6,7 @@ import asyncio
 import concurrent.futures
 import inspect
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, NoReturn, TypeVar, get_args, get_origin, get_type_hints
 
@@ -35,8 +35,8 @@ def _no_answer_types() -> tuple[type[BaseException], ...]:
     A timeout, a lost, reset or refused connection, a cancellation and an httpx
     transport error mean that no answer came back, so the destination may have
     applied the call. Such an error is never a definite refusal: ``rejected_on``
-    may not overlap these types, and a send that raises one has an unknown
-    outcome whatever ``rejected_on`` lists.
+    may not overlap these types, and a send that raises one, or raises any error
+    from or while handling one, has an unknown outcome whatever ``rejected_on`` lists.
     """
     # httpx is a core dependency, already loaded by `import qagents`. It is imported here
     # because this module's top level imports only the standard library, pydantic and
@@ -52,13 +52,36 @@ def _no_answer_types() -> tuple[type[BaseException], ...]:
     )
 
 
+def _error_links(error: BaseException) -> Iterator[BaseException]:
+    """The error and each error it was raised from or while handling.
+
+    Both ``__cause__`` and ``__context__`` are followed, even when ``raise ... from
+    None`` hid the context: an error raised while handling a timeout still follows a
+    request that got no answer. Each error is yielded once, so a cycle ends (SPEC 5.1;
+    mutant seam M52).
+    """
+    seen: set[int] = set()
+    pending = [error]
+    while pending:
+        link = pending.pop()
+        if id(link) in seen:
+            continue
+        seen.add(id(link))
+        yield link
+        for linked in (link.__context__, link.__cause__):
+            if linked is not None:
+                pending.append(linked)
+
+
 def _no_answer(error: BaseException) -> bool:
     """Whether a raised error is a transport-level no answer, so its outcome is unknown.
 
-    The engine and the crash harness's destination fakes call it before they read
-    ``EffectRejected`` or ``rejected_on`` (SPEC 5.1; mutant seam M48).
+    It is when the error, or an error in its cause or context chain, is one of the
+    set. The engine and the crash harness's destination fakes call it before they
+    read ``EffectRejected`` or ``rejected_on`` (SPEC 5.1; mutant seam M48).
     """
-    return isinstance(error, _no_answer_types())
+    members = _no_answer_types()
+    return any(isinstance(link, members) for link in _error_links(error))
 
 
 def _type_name(kind: type) -> str:
@@ -372,12 +395,15 @@ def effect(
     lookup decorator has had a chance to attach it.
 
     ``rejected_on`` lists definite refusals only: the exceptions your client
-    raises for a refusal it received from the destination. A type that is,
-    derives from or is a base class of a transport-level error (a timeout, a
-    lost or refused connection, a cancellation or an httpx transport error) is
-    refused here, because such an error means no answer came back. A send that
-    raises one has an unknown outcome, even when its class also derives from a
-    type in ``rejected_on``.
+    raises for a refusal it received from the destination, such as
+    ``httpx.HTTPStatusError`` or an SDK's status error, not the SDK's catch-all
+    base. A type that is, derives from or is a base class of a transport-level
+    error (a timeout, a lost or refused connection, a cancellation or an httpx
+    transport error) is refused here, because such an error means no answer
+    came back. A send that raises one has an unknown outcome, even when its
+    class also derives from a type in ``rejected_on``. So does a send that
+    raises any error from one or while handling one, as a client does when it
+    wraps a timeout in its own error (``raise PaymentsError(...) from error``).
     """
     if not isinstance(name, str) or not name.strip():
         raise ConfigurationError("effect name must be a nonempty string.")
