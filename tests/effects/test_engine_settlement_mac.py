@@ -3,7 +3,8 @@
 A settlement written straight to the store, without the operator path, must not
 authorize a send: no MAC, a wrong MAC, a MAC over other fields or from another secret,
 or a genuine answer copied to a later position. Each is held as APPROVAL_UNVERIFIABLE
-until an operator answers again. Without a secret the journal is trusted, as before.
+until an operator answers again, also on a key no attempt used. Without a secret the
+journal is trusted, as before.
 """
 
 from contextlib import asynccontextmanager
@@ -13,6 +14,7 @@ import pytest
 
 from qagents import Agent, RunContext, Session, SQLiteStore, tool
 from qagents.effects import Attempt, Dedupe, EffectContext, Key, Settle, effect
+from qagents.effects import _canonical as canonical
 from qagents.effects import _engine as engine
 from qagents.effects import _kinds as kinds
 from qagents.effects import _operator as operator
@@ -399,3 +401,41 @@ async def test_a_crash_while_holding_a_forged_resend_still_holds_after_recovery(
     assert_unverifiable(await perform_held(db, send, permissions))
     assert len(calls) == 1
     assert_unverifiable((await record(db)).hold)
+
+
+def fresh_resend():
+    """A forged resend for a key that no attempt ever used: the fold makes it a held record."""
+    namespace, name, key = "session:session", "refund", "request:R1"
+    return {
+        "namespace": namespace,
+        "name": name,
+        "key": key,
+        "record_id": canonical.record_id(namespace, name, key),
+        "outcome": "resend",
+        "by": "ops",
+        "evidence": "destination audit",
+        "reason": None,
+        "expected_revision": 0,
+        "mac": None,
+        "covers_attempts": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "dedupe",
+    [None, Dedupe(3600, contract="fixture", concurrent="waits")],
+    ids=["no_dedupe", "dedupe"],
+)
+async def test_forged_resend_on_a_never_attempted_key_is_held_not_an_error(store, dedupe):
+    db, _ = store
+    calls = []
+    send = refund(calls, failures=0, dedupe=dedupe)
+    permissions = Permissions(approval_secret=SECRET)
+    await append_straight(db, fresh_resend())
+    assert (await record(db)).status == "held"  # the fold has no secret
+    assert_unverifiable(await perform_held(db, send, permissions))
+    assert calls == []
+    entries = await db.load(SESSION)
+    assert intents(entries) == []
+    assert entries[-1].kind == "effect_observed"
+    assert entries[-1].data["reason"] == HoldReason.APPROVAL_UNVERIFIABLE

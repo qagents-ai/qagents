@@ -1168,7 +1168,14 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
         # A resend that does not verify authorizes nothing, and no row sends while it stands:
         # it may have reopened a record that was rejected or settled (SPEC 5.3, 7.5).
         resend_unverified = pending is not None and not _resend_verified(scope, op)
-        dedupe = op.state == "D" and not retry_blocked and _dedupe_allowed(effect, op, scope, now)
+        # Such a resend can also stand on a key that never had an attempt, so nothing that
+        # reads the attempts' first use runs first: the record is held, not an error.
+        dedupe = (
+            op.state == "D"
+            and not retry_blocked
+            and not resend_unverified
+            and _dedupe_allowed(effect, op, scope, now)
+        )
         if op.state == "D" and send_running(journal.store, scope.session_id, op.record_id):
             await _hold(effect, op, scope, HoldReason.SEND_STILL_RUNNING)
         auth_rule = (
@@ -1353,6 +1360,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
         if not row.sends:
             if (
                 reason is None
+                and not resend_unverified
                 and isinstance(effect.dedupe, Dedupe)
                 and not quiescence._dedupe_window_covers(
                     now,
