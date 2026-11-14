@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="390" viewBox="0 0 1200 390" role="img" aria-labelledby="title desc">
+<title id="title">One agent API, explicit model adapters</title>
+<desc id="desc">QCloudModel, OpenAIChatModel and AnthropicModel implement the model contract. Tools, permissions and sessions remain application-owned. Other endpoints need explicit compatibility validation.</desc>
+<defs>
+              <linearGradient id="night" x2="1" y2="1">
+                <stop stop-color="#122b38"/><stop offset="1" stop-color="#101722"/>
+              </linearGradient>
+              <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+                <circle cx="1" cy="1" r="1" fill="#476272" opacity=".22"/>
+              </pattern>
+              <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 1 1 L 8 5 L 1 9" fill="none" stroke="#6d9b9a" stroke-width="1.5"/>
+              </marker>
+            </defs>
+<g font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif">
+<rect x="0" y="0" width="1200" height="390" rx="26" fill="url(#night)" stroke="none"/>
+<rect x="0" y="0" width="1200" height="390" rx="26" fill="url(#dots)" stroke="none"/>
+<text x="48" y="48" fill="#8ce6c4" font-size="15" font-weight="700" text-anchor="start">04</text>
+<text x="90" y="48" fill="#a8becb" font-size="15" font-weight="600" text-anchor="start">MODEL ADAPTERS</text>
+<text x="48" y="103" fill="#f7fbfa" font-size="40" font-weight="650" text-anchor="start">Your agent. Your provider.</text>
+<text x="48" y="141" fill="#a8becb" font-size="20" font-weight="400" text-anchor="start">Keep the application contract stable while configuring each model explicitly.</text>
+<rect x="48" y="192" width="278" height="140" rx="18" fill="#203e46" stroke="#3b6b6b"/>
+<g transform="translate(70 213) scale(1)">
+<path d="M5 4v16 M5 12h13V4 M5 12h13v10" fill="none" stroke="#8ce6c4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="112" y="239" fill="#f7fbfa" font-size="25" font-weight="600" text-anchor="start">Agent + Model</text>
+<text x="72" y="278" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">Typed tools · Permissions</text>
+<text x="72" y="307" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">Sessions · Streaming</text>
+<path d="M326 262H366V174H1031" fill="none" stroke="#6d9b9a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M529 174V190" fill="none" stroke="#6d9b9a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M780 174V190" fill="none" stroke="#6d9b9a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1031 174V190" fill="none" stroke="#6d9b9a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="408" y="192" width="242" height="140" rx="16" fill="#1b303d" stroke="#35505c"/>
+<circle cx="432" cy="220" r="4" fill="#8ce6c4" stroke="none"/>
+<text x="432" y="266" fill="#8ce6c4" font-size="28" font-weight="600" text-anchor="start">QCloud</text>
+<text x="432" y="305" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">QCloudModel</text>
+<rect x="659" y="192" width="242" height="140" rx="16" fill="#1b303d" stroke="#35505c"/>
+<circle cx="683" cy="220" r="4" fill="#f7fbfa" stroke="none"/>
+<text x="683" y="266" fill="#f7fbfa" font-size="28" font-weight="600" text-anchor="start">OpenAI</text>
+<text x="683" y="305" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">OpenAIChatModel</text>
+<rect x="910" y="192" width="242" height="140" rx="16" fill="#1b303d" stroke="#35505c"/>
+<circle cx="934" cy="220" r="4" fill="#c4b7fa" stroke="none"/>
+<text x="934" y="266" fill="#c4b7fa" font-size="28" font-weight="600" text-anchor="start">Anthropic</text>
+<text x="934" y="305" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">AnthropicModel</text>
+<text x="48" y="369" fill="#a8becb" font-size="16" font-weight="400" text-anchor="start">Compatible HTTP endpoints use OpenAIChatModel with an explicit API root and supported request fields.</text>
+</g></svg>

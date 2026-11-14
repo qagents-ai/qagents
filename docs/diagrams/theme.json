@@ -1,0 +1,25 @@
+{
+  "theme": "base",
+  "look": "classic",
+  "securityLevel": "strict",
+  "htmlLabels": false,
+  "deterministicIds": true,
+  "deterministicIDSeed": "quentin-docs-v1",
+  "fontFamily": "Arial, sans-serif",
+  "fontSize": 17,
+  "flowchart": {"htmlLabels": false, "curve": "linear", "nodeSpacing": 38, "rankSpacing": 52, "padding": 20, "wrappingWidth": 240},
+  "themeVariables": {
+    "primaryColor": "#e7f3f1",
+    "primaryTextColor": "#173b3a",
+    "primaryBorderColor": "#307b75",
+    "secondaryColor": "#eef2f7",
+    "tertiaryColor": "#fff6e6",
+    "lineColor": "#596b79",
+    "textColor": "#1e293b",
+    "mainBkg": "#f7fafc",
+    "nodeBorder": "#617585",
+    "clusterBkg": "#f7fafc",
+    "clusterBorder": "#c9d4df",
+    "edgeLabelBackground": "#ffffff"
+  }
+}

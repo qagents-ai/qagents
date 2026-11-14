@@ -1,8 +1,7 @@
 # Principles and guarantees
 
-qagents was designed after a survey of the agent frameworks of late 2026
-([research report, in Greek](research.md)). This page records the decisions that follow from it,
-what the library guarantees, and what it deliberately leaves out.
+qagents is designed for agents whose work spans model requests, tool calls, human decisions,
+and process restarts. This page describes the design and the guarantees available to applications.
 
 ## Principles
 

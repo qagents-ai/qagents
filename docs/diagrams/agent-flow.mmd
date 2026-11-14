@@ -1,0 +1,17 @@
+flowchart TB
+  accTitle: The qagents execution architecture
+  accDescr: The host supplies identity and dependencies. Its agent exchanges requests with a model, validates and authorizes tools, and records messages, decisions and results in a session journal.
+  agent["YOUR APPLICATION + QAGENTS\nInstructions · dependencies · execution limits"]
+  model["MODEL ADAPTER\nQCloud · OpenAI · Anthropic"]
+  tools["PERMISSIONED TOOLS\nValidate · authorize · execute"]
+  journal[("DURABLE SESSION\nMessages · decisions · results")]
+  agent <-->|request / stream| model
+  agent -->|typed call| tools
+  agent <-->|record / resume| journal
+  tools -->|record result| journal
+  classDef dark fill:#133c36,color:#ffffff,stroke:#133c36;
+  classDef main fill:#ddf4e9,color:#133c36,stroke:#228063,stroke-width:2px;
+  classDef muted fill:#f2f5f8,color:#263746,stroke:#a2b1bf;
+  class agent dark;
+  class tools main;
+  class model,journal muted;

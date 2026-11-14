@@ -14,7 +14,7 @@ expected = ["getting-started.md", "examples/quickstart.py"]
 
 [[question]]
 query = "install with pip"
-expected = ["getting-started.md#install", "README.md#install"]
+expected = ["getting-started.md#install", "README.md#quickstart"]
 
 [[question]]
 query = "tool decorator"

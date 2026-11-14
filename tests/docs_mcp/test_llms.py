@@ -23,11 +23,11 @@ def test_writes_both_files(script, tmp_path, capsys, service):
 
     lines = index.splitlines()
     assert lines[0] == "# qagents" and lines[2].startswith("> ")
-    assert "## Concepts" in index and "## Optional" in index
+    assert "## Concepts" in index
     links = re.findall(r"^- \[([^\]]+)\]\(([^)]+)\): (.+)$", index, re.MULTILINE)
     assert len(links) >= 30
     assert ("Permissions and approvals", "concepts/permissions/") in [(t, u) for t, u, _ in links]
-    assert "[Research report (Greek)]" in index.split("## Optional", 1)[1]  # not English
+    assert "research/" not in index and "<!-- page: research.md " not in full
 
     order = [entry.path for entry in service.corpus.nav]
     pages = re.findall(r"^<!-- page: (\S+) \|", full, re.MULTILINE)

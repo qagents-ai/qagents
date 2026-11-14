@@ -35,7 +35,7 @@ This index describes qagents 0.2.0. Every page below, in this order, is also in 
 
 ## Design
 
-- [Principles and guarantees](design/): qagents was designed after a survey of the agent frameworks of late 2026 (research report, in Greek).
+- [Principles and guarantees](design/): qagents is designed for agents whose work spans model requests, tool calls, human decisions, and process restarts.
 
 ## API reference
 
@@ -54,6 +54,10 @@ This index describes qagents 0.2.0. Every page below, in this order, is also in 
 - [External agents](reference/external/): Guides: External agents, Devvi, Any ACP agent, Serving tools over MCP.
 - [Errors](reference/errors/): API reference: qagents.errors.
 - [Prompts](reference/prompts/): Every piece of text qagents itself puts in front of a model.
+
+## Other pages
+
+- [Diagrams](diagrams/README/): The README uses code-authored SVG illustrations with explicit layout, live text, accessible titles and descriptions.
 
 ## Examples
 
@@ -79,7 +83,3 @@ This index describes qagents 0.2.0. Every page below, in this order, is also in 
 - [stock_analysis](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/stock_analysis.py): Analyst sub-agents feed an advisor whose structured recommendation is validated.
 - [supervisor](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/supervisor.py): A supervisor delegates to a researcher and an analyst, then writes a short report.
 - [trip_planner](https://github.com/mpvasilis/qagents/blob/main/examples/patterns/trip_planner.py): City selector, then local expert and concierge in parallel, then a budgeted plan.
-
-## Optional
-
-- [Research report (Greek)](research/): Τον Νοέμβριο του 2026 τα agentic frameworks έχουν καταλήξει, από διαφορετικούς δρόμους, στην ίδια αρχιτεκτονική: έναν σταθερό loop μοντέλου και tools με λίγα σημεία επέκτασης, ένα «harness»...

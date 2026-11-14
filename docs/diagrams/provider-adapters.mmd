@@ -1,0 +1,19 @@
+flowchart LR
+  accTitle: One agent API with separate provider adapters
+  accDescr: A common qagents model request maps through the QCloud SDK, OpenAI Chat Completions over HTTPX or the Anthropic Messages SDK. Model capabilities remain provider specific.
+  agent["YOUR AGENT\nOne tool and session API"]
+  qcloud["QCloudModel\nOfficial qcloud_ai SDK"]
+  openai["OpenAIChatModel\nHTTPX · Chat Completions"]
+  anthropic["AnthropicModel\nOfficial Anthropic SDK"]
+  qapi["QCLOUD API\nCatalog · inference"]
+  oapi["OPENAI API\nor a compatible endpoint"]
+  aapi["ANTHROPIC API\nMessages"]
+  agent --> qcloud --> qapi
+  agent --> openai --> oapi
+  agent --> anthropic --> aapi
+  classDef dark fill:#133c36,color:#ffffff,stroke:#133c36;
+  classDef main fill:#ddf4e9,color:#133c36,stroke:#228063,stroke-width:2px;
+  classDef muted fill:#f2f5f8,color:#263746,stroke:#a2b1bf;
+  class agent dark;
+  class qcloud,openai,anthropic main;
+  class qapi,oapi,aapi muted;

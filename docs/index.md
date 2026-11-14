@@ -47,9 +47,8 @@ print(result.output)
 
 ## Why another framework
 
-The 2026 research behind this project ([report, in Greek](research.md)) found that agent
-frameworks converged on the same small kernel, and that their documented gaps repeat. qagents is
-built around the gaps that matter for a private, OpenAI-compatible model platform:
+Long-running agents need to preserve progress, wait for approval and recover after a process
+stops. qagents gives applications a journal for those decisions and a small, inspectable loop.
 
 - **Resume at the tool call, not at the node.** Graph frameworks checkpoint at step boundaries
   and re-run the whole step after a crash or an approval. qagents journals every message, tool

@@ -21,7 +21,7 @@ expected = ["getting-started.md"]
 topic = "getting started"
 style = "natural"
 query = "how do I install qagents"
-expected = ["getting-started.md#install", "README.md#install"]
+expected = ["getting-started.md#install", "README.md#quickstart"]
 
 [[question]]
 topic = "getting started"

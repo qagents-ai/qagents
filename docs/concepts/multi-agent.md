@@ -10,8 +10,8 @@ who should control the flow.
 | [Workflow](#workflows) | your code | each agent step has its own session |
 | [External agent](external-agents.md) | the calling agent's model | another agent program with its own context, tools and model; returns its final message and a footer |
 
-There are no role-play crews or group chats. The published evidence favours one orchestrator with
-isolated workers and a single writer; see the [research report](../research.md).
+Start with a single orchestrator. Give specialist workers separate context and let one owner
+write each shared resource.
 
 ## Sub-agents
 

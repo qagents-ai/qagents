@@ -92,7 +92,6 @@ nav:
       - Docs for coding agents: coding-agents.md
   - Design:
       - Principles and guarantees: design.md
-      - Research report (Greek): research.md
   - API reference:
       - Agent: reference/agent.md
       - Tools: reference/tools.md

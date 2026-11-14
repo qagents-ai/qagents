@@ -89,9 +89,7 @@ Each note is a Markdown file. The agent decides what is worth writing down and r
 later run. Memory stays inspectable: open the folder and you see exactly what the agent knows.
 Use one directory per user or tenant.
 
-There is no vector store. The published benchmarks for specialised memory layers are disputed,
-and an agent with plain file tools is competitive with them; see the
-[research report](research.md).
+For scoped retrieval with a memory service, see the [Gym integration guide](integrations/gym.md).
 
 ## Connect external tools
 

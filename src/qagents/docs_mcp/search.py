@@ -502,7 +502,16 @@ class BM25Index:
                 if parsed.phrase in doc.text.lower():
                     score *= 1.5
             hits.append(Hit(doc, score, matched[index] & set(typed)))
-        hits.sort(key=lambda hit: (-hit.score, hit.doc.cite))
+        qualified = {
+            name for name in parsed.full_names if "." in name and query.strip().lower() == name
+        }
+        hits.sort(
+            key=lambda hit: (
+                not (hit.doc.kind == "api" and qualified.intersection(hit.doc.names)),
+                -hit.score,
+                hit.doc.cite,
+            )
+        )
         return self._diverse(hits, limit, per_group, single_kind=allowed is not None), len(hits)
 
     def _heading_match(self, index: int, query: Query) -> float:
