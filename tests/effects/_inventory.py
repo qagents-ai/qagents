@@ -2307,6 +2307,19 @@ INTERFACES = [
         [("self", "POSITIONAL_OR_KEYWORD", None), ("fields", "POSITIONAL_OR_KEYWORD", None)],
         False,
     ),
+    # Added by AF-3 (interface-changes.md): the check rule D5 needs before an operator resend.
+    (
+        "qagents.permissions",
+        "Permissions.verify_settlement",
+        "O4b",
+        "call",
+        [
+            ("self", "POSITIONAL_OR_KEYWORD", None),
+            ("fields", "POSITIONAL_OR_KEYWORD", None),
+            ("mac", "POSITIONAL_OR_KEYWORD", None),
+        ],
+        False,
+    ),
     (
         "qagents.permissions",
         "arguments_digest",

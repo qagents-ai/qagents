@@ -340,6 +340,25 @@ class Permissions:
             return None
         return hmac.new(self._approval_key, jcs(dict(fields)), hashlib.sha256).hexdigest()
 
+    def verify_settlement(self, fields: Mapping[str, JSONValue], mac: str | None) -> bool:
+        """Whether ``mac`` signs these settlement fields under the ``approval_secret``.
+
+        Takes the fields that `sign_settlement` signs. Always false without an
+        ``approval_secret``, for a ``mac`` that is not an ASCII string, and for
+        fields that have no canonical JSON. The engine checks an operator
+        ``resend`` with it before rule D5 sends.
+        """
+        try:
+            expected = self.sign_settlement(fields)
+        except (TypeError, ValueError):
+            return False
+        return (
+            expected is not None
+            and isinstance(mac, str)
+            and mac.isascii()
+            and hmac.compare_digest(mac, expected)
+        )
+
     async def decide(self, ctx: RunContext[Any], tool: Tool, call: ToolCallPart) -> Decision:
         name = tool.name
         if _matches(name, self.deny):

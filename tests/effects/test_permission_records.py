@@ -226,6 +226,23 @@ def test_settlement_callback_and_signing_are_explicit():
         Permissions(authorize_settlement="not callable")
 
 
+def test_settlement_mac_verifies_only_its_own_fields_under_the_same_secret():
+    permissions = Permissions(approval_secret=SECRET)
+    fields = {"session_id": "s", "kind": "effect_settled", "data": {"outcome": "resend"}}
+    mac = permissions.sign_settlement(fields)
+    assert permissions.verify_settlement(fields, mac)
+    assert not permissions.verify_settlement({**fields, "session_id": "other"}, mac)
+    assert not permissions.verify_settlement({**fields, "data": {"outcome": "not_applied"}}, mac)
+    other = Permissions(approval_secret=b"another-public-fixture-key-32-bytes")
+    assert not permissions.verify_settlement(fields, other.sign_settlement(fields))
+    for wrong in (None, "", mac.upper(), mac[:-1], "é" + mac[1:], 42):
+        assert not permissions.verify_settlement(fields, wrong)
+    assert not permissions.verify_settlement({**fields, "data": {"amount": float("nan")}}, mac)
+    # Without a secret nothing verifies; callers decide what an unsigned session trusts.
+    assert not Permissions().verify_settlement(fields, mac)
+    assert not Permissions().verify_settlement(fields, None)
+
+
 def test_approval_carries_application_asserted_identity():
     pending = PendingApproval(tool_call_id="c", name="save_note", arguments={}, token="fixture")
     answer = Approval.for_call(pending, by="reviewer")
