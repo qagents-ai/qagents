@@ -2911,4 +2911,6 @@ SEAMS = [
     ("M54", "qagents.effects._declare._no_answer_types", "O1"),
     # Added by the AF-2 re-fix: a rejected claim moves only when the self-fence passes.
     ("M55", "qagents.effects._engine._may_move_claim", "O2"),
+    # Added by the AF-2 re-fix: a rejected record reads a claim another session took over.
+    ("M56", "qagents.effects._engine._claim_kind", "O2"),
 ]

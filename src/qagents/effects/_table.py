@@ -192,7 +192,7 @@ ROWS: tuple[Row, ...] = (
     ),
     _row(
         "C1",
-        "N",
+        "N R",
         P,
         "resolve_claim",
         "C_or_same",

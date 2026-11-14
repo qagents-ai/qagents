@@ -12,11 +12,20 @@ from dataclasses import replace
 import pytest
 
 from qagents import Agent, RunContext, tool
-from qagents.effects import Absent, Attempt, Dedupe, EffectContext, Found, Key, effect
+from qagents.effects import (
+    Absent,
+    Attempt,
+    Dedupe,
+    EffectContext,
+    Found,
+    HoldReason,
+    Key,
+    effect,
+)
 from qagents.effects import _engine as engine
 from qagents.effects._canonical import idempotency_key
 from qagents.effects._fold import EffectView, fold_effects
-from qagents.errors import EffectRejected, LeaseError
+from qagents.errors import EffectHeld, EffectRejected, LeaseError
 from qagents.models.testing import ScriptedModel, call
 from qagents.session import InMemoryStore, LeasedWriter, Session, SQLiteStore
 
@@ -65,6 +74,8 @@ def declare(destination, *, replays_rejections=False, lookup=True, timeout_s=Non
                 return receipt
         if destination.mode == "reject":
             raise EffectRejected("card declined")
+        if destination.mode == "error":
+            raise RuntimeError("connection reset")  # neither declared nor definite: held
         receipt = Receipt(id=f"refund-{len(destination.applied) + 1}")
         destination.applied.append((attempt.idempotency_key, attempt.operation_tag, receipt))
         if destination.mode == "apply_then_refuse":
@@ -391,6 +402,253 @@ async def test_agent_run_in_a_second_session_looks_up_before_retrying(backend, t
         ("send", "s1"),
         ("lookup", "s2"),
         ("send", "s2"),
+    ]
+    assert len(destination.applied) == 1
+    assert [(r.status, r.via) for r in records] == [("committed", "direct")]
+
+
+# A record already in R(n) reads the claim again before L2 or D2 (SPEC 7.1 C1, 7.10). Review
+# AF-2-old-owner-blocked and AF-2-old-owner-lockout: a taker that journaled the transfer and
+# died before sending left the claim's earlier owner with ClaimConflict on every retry.
+
+
+async def outcome_of(awaitable):
+    """The receipt, or the error raised, so that a test asserts which one it got."""
+    try:
+        return await awaitable
+    except Exception as error:
+        return error
+
+
+async def take_over_and_die(db, send, session="two"):
+    """The session journals the claim transfer, then dies before its lookup is journaled."""
+    restore = crash_at(db, session, 2, "before")
+    try:
+        with pytest.raises(Crash):
+            await perform(db, send, session, f"run-{session}:1:call")
+    finally:
+        restore()
+    assert kinds_of(await db.load(session)) == ["effect_claimed"]
+    claim = await db.get_claim(*KEY)
+    assert claim.session_id == session and claim.status == "rejected"
+    return claim
+
+
+@pytest.mark.parametrize("replays_rejections", [False, True])
+async def test_the_owner_takes_its_claim_back_from_a_taker_that_sent_nothing(
+    store, replays_rejections
+):
+    db, now = store
+    destination = Destination()
+    send = declare(destination, replays_rejections=replays_rejections)
+    await reject_in_session_one(db, destination, send)
+    [first_key] = destination.sends("one")
+    destination.mode = "apply"
+    taken = await take_over_and_die(db, send)
+    now[0] += 120
+
+    receipt = await outcome_of(perform(db, send, "one", "run-1:2:call"))
+
+    assert isinstance(receipt, Receipt), receipt
+    assert receipt.id == "refund-1" and len(destination.applied) == 1
+    assert [e[:2] for e in destination.events] == [
+        ("send", "one"),
+        ("lookup", "two"),
+        ("lookup", "one"),
+        ("send", "one"),
+    ]
+    # The owner's own earlier attempt is in the claim's history; the lookup asks once.
+    inquiry = destination.lookups("one")[0]
+    assert inquiry.idempotency_keys == (first_key,)
+    assert [(a.number, a.generation, a.outcome) for a in inquiry.attempts] == [(1, 0, "rejected")]
+    entries = await db.load("one")
+    assert kinds_of(entries) == [
+        "effect_intent",
+        "effect_failed",
+        "effect_claimed",
+        "effect_observed",
+        "effect_intent",
+        "effect_committed",
+    ]
+    [back] = [e for e in entries if e.kind == "effect_claimed"]
+    assert back.data["previous_owner"]["session_id"] == "two"
+    assert back.data["attempts"] == [a.model_dump(mode="json") for a in taken.attempts]
+    intent = [e for e in entries if e.kind == "effect_intent"][-1]
+    assert (intent.data["rule"], intent.data["attempt"]) == ("D2", 2)
+    assert intent.data["generation"] == int(replays_rejections)
+    assert intent.seq > back.seq  # record first, act second
+    claim = await db.get_claim(*KEY)
+    assert claim.session_id == "one" and claim.status == "committed"
+    # The taker, recovered later, replays that commit; it neither looks up nor sends.
+    assert (await perform(db, send, "two", "run-two:1:call")).id == "refund-1"
+    assert len(destination.events) == 4
+    assert [e.data.get("via") for e in await db.load("two")][-1] == "claim"
+
+
+@pytest.mark.parametrize("replays_rejections", [False, True])
+async def test_the_owner_takes_back_a_claim_refused_again_elsewhere_with_every_key(
+    store, replays_rejections
+):
+    """The lookup asks about the newer owner's key too, and D2 numbers after it."""
+    db, _ = store
+    destination = Destination()
+    send = declare(destination, replays_rejections=replays_rejections)
+    await reject_in_session_one(db, destination, send)
+    with pytest.raises(EffectRejected):
+        await perform(db, send, "two", "run-2:1:call")  # looks up, then D2 is refused too
+    claim = await db.get_claim(*KEY)
+    assert claim.session_id == "two" and claim.status == "rejected"
+    destination.mode = "apply"
+
+    receipt = await outcome_of(perform(db, send, "one", "run-1:2:call"))
+
+    assert isinstance(receipt, Receipt), receipt
+    assert receipt.id == "refund-1" and len(destination.applied) == 1
+    generation = int(replays_rejections)
+    [inquiry] = destination.lookups("one")
+    keys = tuple(dict.fromkeys(a.idempotency_key for a in claim.attempts))
+    assert inquiry.idempotency_keys == keys
+    assert [(a.number, a.generation, a.outcome) for a in inquiry.attempts] == [
+        (1, 0, "rejected"),
+        (2, generation, "rejected"),
+    ]
+    intent = [e for e in await db.load("one") if e.kind == "effect_intent"][-1]
+    assert (intent.data["rule"], intent.data["attempt"]) == ("D2", 3)
+    salt = await db.salt()
+    assert intent.data["idempotency_key"] == idempotency_key(salt, *KEY, 2 * generation, 64)
+    claim = await db.get_claim(*KEY)
+    assert [(a.session_id, a.number, a.outcome) for a in claim.attempts] == [
+        ("one", 1, "rejected"),
+        ("two", 2, "rejected"),
+        ("one", 3, "committed"),
+    ]
+
+
+async def test_a_rejected_record_holds_while_another_session_may_still_apply(store):
+    db, _ = store
+    destination = Destination()
+    send = declare(destination)
+    await reject_in_session_one(db, destination, send)
+    destination.mode = "error"
+    with pytest.raises(EffectHeld):
+        await perform(db, send, "two", "run-2:1:call")
+    claim = await db.get_claim(*KEY)
+    assert claim.session_id == "two" and claim.status == "held"
+    before = kinds_of(await db.load("one"))
+    seen = len(destination.events)
+
+    held = await outcome_of(perform(db, send, "one", "run-1:2:call"))
+
+    assert isinstance(held, EffectHeld), held
+    assert held.held.reason == HoldReason.CLAIMED_ELSEWHERE and "two" in held.held.detail
+    assert kinds_of(await db.load("one")) == before  # nothing journaled
+    assert len(destination.events) == seen  # neither a lookup nor a send
+
+
+async def test_a_rejected_record_replays_a_commit_another_session_made(store):
+    db, _ = store
+    destination = Destination()
+    send = declare(destination)
+    await reject_in_session_one(db, destination, send)
+    destination.mode = "apply"
+    assert (await perform(db, send, "two", "run-2:1:call")).id == "refund-1"
+    seen = len(destination.events)
+    # The call whose own attempt was refused still gets its recorded rejection (P3r).
+    with pytest.raises(EffectRejected):
+        await perform(db, send, "one", "run-1:1:call")
+
+    receipt = await outcome_of(perform(db, send, "one", "run-1:2:call"))
+
+    assert isinstance(receipt, Receipt), receipt
+    assert receipt.id == "refund-1" and len(destination.applied) == 1
+    assert len(destination.events) == seen
+    entries = await db.load("one")
+    assert entries[-1].kind == "effect_committed" and entries[-1].data["via"] == "claim"
+    assert entries[-1].data["claim_owner"]["session_id"] == "two"
+    final = fold_effects(entries).get(*KEY)
+    assert final.state == "C" and not final.findings
+
+
+@pytest.mark.parametrize("found", [True, False], ids=["found", "absent"])
+@pytest.mark.parametrize("step", STEPS, ids=[f"{phase}-{n}" for n, phase in STEPS])
+async def test_a_crash_at_every_step_of_taking_a_claim_back_recovers_from_the_journal(
+    store, found, step
+):
+    """Session one's batches: claimed, observed, committed (found) or claimed, observed,
+    intent, committed (absent). A kill before or after each, then a recovery of the call."""
+    db, now = store
+    destination = Destination("apply_then_refuse" if found else "reject")
+    send = declare(destination, replays_rejections=True)
+    await reject_in_session_one(db, destination, send)
+    destination.mode = "apply"
+    await take_over_and_die(db, send)
+    now[0] += 120
+
+    restore = crash_at(db, "one", *step)
+    try:
+        receipt = await perform(db, send, "one", "run-1:2:call")
+    except Crash:
+        receipt = None
+    finally:
+        restore()
+    entries = await db.load("one")
+    view = EffectView()
+    for index, item in enumerate(entries):
+        view.apply(item)
+        assert view.records("one") == fold_effects(entries[: index + 1]).records("one")
+    assert (receipt is None) is (step[0] <= (3 if found else 4))  # the worker died there
+    if receipt is None:
+        now[0] += 120
+        receipt = await perform(db, send, "one", "run-1:2:call")
+
+    assert receipt.id == "refund-1"
+    assert len(destination.applied) == 1
+    retry = destination.events[2:]  # after one's first send and two's lookup
+    assert retry and retry[0][0] == "lookup" and {e[1] for e in retry} == {"one"}
+    if found:
+        assert [e for e in retry if e[0] == "send"] == []
+    final = fold_effects(await db.load("one")).get(*KEY)
+    assert final.state == "C" and not final.findings
+    claim = await db.get_claim(*KEY)
+    assert claim.session_id == "one" and claim.status == "committed"
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_agent_owner_session_retries_after_a_taker_died_before_sending(backend, tmp_path):
+    """Review probe p8: the customer's own session s1 retries after a run in s2 died."""
+    destination = Destination()
+    send = declare(destination)
+
+    @tool(effects=[send])
+    async def refund(ctx: RunContext, id: str) -> str:
+        """Refund the order."""
+        try:
+            return (await ctx.perform(send, Request(id=id))).id
+        except EffectRejected:
+            return "rejected"
+
+    def agent():
+        return Agent(ScriptedModel([call("refund", id="R1"), "Done."]), tools=[refund])
+
+    db = InMemoryStore() if backend == "memory" else SQLiteStore(tmp_path / "agent.sqlite")
+    async with db:
+        await agent().run("Refund", session=Session(db, id="s1"))
+        destination.mode = "apply"
+        restore = crash_at(db, "s2", 2, "before")
+        try:
+            with pytest.raises(Crash):
+                await agent().run("Refund", session=Session(db, id="s2"))
+        finally:
+            restore()
+        assert (await db.get_claim(*KEY)).session_id == "s2"
+        again = await agent().run("Refund again", session=Session(db, id="s1"))
+        records = await Session(db, id="s1").effects()
+    assert again.status == "completed"
+    assert [(kind, session) for kind, session, _ in destination.events] == [
+        ("send", "s1"),
+        ("lookup", "s2"),
+        ("lookup", "s1"),
+        ("send", "s1"),
     ]
     assert len(destination.applied) == 1
     assert [(r.status, r.via) for r in records] == [("committed", "direct")]

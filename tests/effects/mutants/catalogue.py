@@ -233,6 +233,11 @@ def _lease_kept_only(original, journal, effect):
     return not journal.lease.lost()
 
 
+def _rejected_reads_no_claim(original, op, claim, prepared, session_id):
+    # AF-2 review: a rejected record never read the claim again, so a moved claim locked it out.
+    return "own" if op.state == "R" else original(op, claim, prepared, session_id)
+
+
 E = "tests/effects/test_"
 M = "tests/effects/mutants/test_scenarios.py::"
 
@@ -423,6 +428,13 @@ _ROWS = [
         E
         + "engine_claim_transfer.py::test_a_takeover_whose_self_fence_fails_journals_nothing_and_keeps_the_claim[memory]",
         _lease_kept_only,
+    ),
+    # M56: a rejected record never reads the claim again, so after another session took
+    # the claim over and died before sending, the owner's retry fails with ClaimConflict.
+    (
+        E
+        + "engine_claim_transfer.py::test_the_owner_takes_its_claim_back_from_a_taker_that_sent_nothing[memory-False]",
+        _rejected_reads_no_claim,
     ),
 ]
 

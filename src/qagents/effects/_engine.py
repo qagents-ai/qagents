@@ -844,6 +844,31 @@ def _lookup_state(effect: Effect, op: Operation) -> Literal["not_run", "none_dec
     return "not_run"
 
 
+def _claim_kind(
+    op: Operation, claim: Any, prepared: _Prepared, session_id: str
+) -> Literal[
+    "none", "own", "committed_same", "held_elsewhere", "other_descriptor", "rejected", "not_sent"
+]:
+    """How rule C1 reads the claim before deciding (SPEC 7.1 C1, 7.10; M56).
+
+    A record in N reads any claim. A record in R(n) reads only a claim that another
+    session took over after this record was rejected: its own claim leaves the R(n) rows
+    to decide. There a claim the other owner has not sent counts as held, because only a
+    rejected claim can be transferred, so this record could not journal its lookup.
+    """
+    if claim is None:
+        return "none"
+    if op.state == "R" and claim.session_id == session_id:
+        return "own"
+    if claim.descriptor_digest != prepared.descriptor.digest():
+        return "other_descriptor"
+    if claim.status == "committed":
+        return "committed_same"
+    if claim.status == "rejected" or (claim.status == "not_sent" and op.state == "N"):
+        return claim.status
+    return "held_elsewhere"
+
+
 async def _may_move_claim(journal: EffectJournal, effect: Effect) -> bool:
     """A rejected claim moves to this record only if this worker could send next: the
     self-fence must pass, else nothing is journaled (SPEC 7.1 C1, F1; M55). A worker
@@ -1104,7 +1129,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
     claim = None
     claim_kind = "none"
     if (
-        (op.state == "N" or op.via == "claim")
+        (op.state in ("N", "R") or op.via == "claim")
         and not effect.key.is_per_call
         and ("claims" in journal.store.features)
     ):
@@ -1113,15 +1138,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
             claim is None or claim.descriptor_digest != prepared.descriptor.digest()
         ):
             _conflict(op)
-        if claim is not None:
-            if claim.descriptor_digest != prepared.descriptor.digest():
-                claim_kind = "other_descriptor"
-            elif claim.status == "committed":
-                claim_kind = "committed_same"
-            elif claim.status in ("rejected", "not_sent"):
-                claim_kind = claim.status
-            else:
-                claim_kind = "held_elsewhere"
+        claim_kind = _claim_kind(op, claim, prepared, journal.session_id)
 
     lookup = _lookup_state(effect, op)
     reason = None
@@ -1402,13 +1419,20 @@ async def lookup_and_record(
     ):
         raise ConfigurationError("Lookup requires a journaled effect intent or claim transfer.")
     request = json.loads(jcs(original.request))
-    # Earlier owners' attempts come first: the lookup asks about every key ever sent.
+    # Earlier owners' attempts come first: the lookup asks about every key ever sent. A
+    # record that took its claim back finds its own earlier attempts in that history too.
+    claimed = _claimed_attempts(original)
+    carried = {
+        (a.number, a.idempotency_key, a.epoch, a.store_ts)
+        for a in claimed
+        if a.session_id == journal.session_id
+    }
     attempts = (
         *(
             types.AttemptInfo(
                 a.number, a.generation, a.idempotency_key, a.epoch, a.store_ts, a.outcome
             )
-            for a in _claimed_attempts(original)
+            for a in claimed
         ),
         *(
             types.AttemptInfo(
@@ -1420,6 +1444,8 @@ async def lookup_and_record(
                 a.terminal,
             )
             for a in original.attempts
+            if (a.number, a.intent.idempotency_key, a.intent.epoch, a.intent.store_ts)
+            not in carried
         ),
     )
     inquiry = types.Inquiry(
