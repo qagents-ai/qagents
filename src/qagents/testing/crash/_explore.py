@@ -72,6 +72,9 @@ _OBSERVABLE = frozenset(
     }
 )
 _OUTCOME = frozenset({"effect_committed", "effect_failed", "effect_send_ended"})
+# Writes that open an operation's effect window until an outcome: an intent, or the move
+# of a rejected claim, which precedes the lookup and the D2 send (SPEC 7.10).
+_OPENS = frozenset({"effect_intent", "effect_claimed"})
 _LEASES = frozenset({"acquire_lease_grant", "acquire_lease", "renew_lease", "release_lease"})
 
 
@@ -209,7 +212,7 @@ def _inside_windows(boundaries: Sequence[Boundary]) -> dict[tuple[int, int], boo
         current = active.setdefault(b.leg, set())
         parts = _entry_parts(b)
         result[b.leg, b.index] = bool(current) or any(
-            kind == "effect_intent" or kind in _OUTCOME for kind, *_ in parts
+            kind in _OPENS or kind in _OUTCOME for kind, *_ in parts
         )
         identities = [
             str(Entry.model_validate_json(raw).data.get("record_id", "")) for raw in b.entries_json
@@ -217,7 +220,7 @@ def _inside_windows(boundaries: Sequence[Boundary]) -> dict[tuple[int, int], boo
         for position, (kind, name, _, _) in enumerate(parts):
             identity = identities[position] if position < len(identities) else ""
             identity = identity or name
-            if kind == "effect_intent":
+            if kind in _OPENS:
                 current.add(identity)
             elif kind in _OUTCOME:
                 current.discard(identity)
@@ -288,7 +291,7 @@ def reference_points(
                 made.append(_plan_point(b, kind, phase="after", inside=True))
         for kind in sorted(faults.kinds & {"ack_lost_committed", "ack_lost_uncommitted"}):
             made.append(_plan_point(b, kind, inside=window))
-        if any(kind == "effect_intent" or kind in _OUTCOME for kind, *_ in parts):
+        if any(kind in _OPENS or kind in _OUTCOME for kind, *_ in parts):
             for kind in sorted(faults.kinds & {"stall", "cancel_during"}):
                 made.append(_plan_point(b, kind, inside=True))
         if (

@@ -2785,6 +2785,24 @@ def test_effect_window_tracks_distinct_operations_of_same_effect():
     assert [p.plans[0].index for p in points if p.plans] == [1, 2, 3, 4, 5]
 
 
+def test_effect_window_opens_at_a_claim_transfer_before_the_lookup_and_d2():
+    """A crash between the claim's move and the D2 send is an effect point (SPEC 7.10)."""
+    trace = [
+        _boundary(1),
+        _boundary(2, "effect_claimed", name="test.refund", record_id="one"),
+        _boundary(3, "effect_observed", name="test.refund", record_id="one"),
+        _boundary(4, "effect_intent", name="test.refund", record_id="one"),
+        _boundary(5, "effect_committed", name="test.refund", record_id="one"),
+        _boundary(6, "custom"),
+    ]
+    faults = Faults.parse("kill_before,stall")
+    points = reference_points(trace, [_refund_effect()], faults, points="effects")
+    kills = [p.plans[0].index for p in points if p.plans and p.plans[0].kind == "kill_before"]
+    assert kills == [2, 3, 4, 5]
+    stalls = [p.plans[0].index for p in points if p.plans and p.plans[0].kind == "stall"]
+    assert stalls == [2, 4, 5]
+
+
 def test_zero_sigma_and_unknown_concurrency_keep_distinct_stable_points():
     points = reference_points([_boundary(1)], [], Faults.parse("store_step"), sigma_s=0)
     assert len(points) == 2 and points[1].plans[0].value == 0
