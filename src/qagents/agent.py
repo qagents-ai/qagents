@@ -3132,6 +3132,7 @@ class _Run:
                     tool.name,
                     extra={"qagents_finding": "swallowed_hold"},
                 )
+                _ports.report_finding("swallowed_hold", f"{tool.name}: returned with a held effect")
                 await self._enforce_holds(hooked, tool, unresolved)
                 return
         unknown_outcome = call.id in self._unknown_results

@@ -199,6 +199,21 @@ def reached(event: ReachEvent) -> None:
             pass
 
 
+FINDING_OBSERVER: ContextVar[Callable[[str, str], None] | None] = ContextVar(
+    "qagents_effect_finding_observer", default=None
+)
+
+
+def report_finding(kind: str, detail: str) -> None:
+    """Expose a diagnostic to a test observer without changing run behavior."""
+    observer = FINDING_OBSERVER.get()
+    if observer is not None:
+        try:
+            observer(kind, detail)
+        except Exception:
+            pass
+
+
 @dataclass(frozen=True)
 class ModelTurn:
     session_id: str

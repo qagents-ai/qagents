@@ -142,3 +142,34 @@ async def test_freeze_inside_send_is_reported_outside_the_clock_assumptions(tmp_
     assert point.execution.outside_a3 == point.execution.triggered
     assert point.execution.triggered
     assert not report.strict_ok
+
+
+async def test_swallowed_pause_remains_held_and_appears_in_harness_report(tmp_path):
+    def swallowing(env):
+        @effect("refund", key=Key("request", "id"))
+        async def destination(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+            raise AssertionError("Only the fixture transport runs.")
+
+        @tool(effects=[destination])
+        async def refund(ctx: RunContext, id: str) -> str:
+            """Return a value even when the refund incurs a hold."""
+            try:
+                return (await ctx.perform(destination, Request(id=id))).id
+            except Exception:
+                return "swallowed"
+
+        return Agent(env.model, tools=[refund])
+
+    report = await crash_test(
+        swallowing,
+        "Refund",
+        directory=tmp_path,
+        store="sqlite",
+        model=[call("refund", id="R1"), "Complete."],
+        points="effects",
+        faults=Faults.parse("commit_then_lose_response"),
+        transport="fake",
+    )
+    (point,) = report.points[1:]
+    assert point.execution.held
+    assert any(item.code == "swallowed_hold" for item in report.failures), report.explain()

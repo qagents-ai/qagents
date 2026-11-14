@@ -517,6 +517,11 @@ def _execute_loop(
             ):
                 token = _ports.TRANSPORT.set(destination.for_leg(number))
                 observer = _ports.REACH_OBSERVER.set(reached.append)
+                diagnostics = _ports.FINDING_OBSERVER.set(
+                    lambda kind, detail: world.findings.append(
+                        {"kind": kind, "detail": detail, "leg": number}
+                    )
+                )
                 try:
                     agent, deps = await identity.build(number, build, env)
                     if agent.model is not env.model:
@@ -563,6 +568,7 @@ def _execute_loop(
                         return await agent.resume(session, deps=deps, approvals=answers)
                     return await agent.run(prompt, session=session, deps=deps, state=state)
                 finally:
+                    _ports.FINDING_OBSERVER.reset(diagnostics)
                     _ports.REACH_OBSERVER.reset(observer)
                     _ports.TRANSPORT.reset(token)
 
