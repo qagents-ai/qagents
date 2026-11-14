@@ -286,6 +286,17 @@ def _count_from_zero(original, runtime, handle):
     return original(runtime, handle)
 
 
+def _only_a_cancel_is_the_leases(original, owner, mark):
+    # AF-4 recheck: the cancel was taken back, but only a CancelledError became
+    # session_busy; an error that authorize_settlement raised for the lease's cancel
+    # reached the caller as that error.
+    import asyncio
+    import sys
+
+    took_back = original(owner, mark)
+    return took_back and isinstance(sys.exc_info()[1], asyncio.CancelledError)
+
+
 E = "tests/effects/test_"
 M = "tests/effects/mutants/test_scenarios.py::"
 
@@ -561,6 +572,13 @@ _ROWS = [
         E
         + "engine_settlement_mac.py::test_forged_resend_cannot_reopen_a_record_for_an_operator_resend[memory-not_applied-2_forged]",
         _pending_resend_only,
+    ),
+    # M68: an error that authorize_settlement raises for the lost lease's cancel reaches
+    # the caller as that error, not as session_busy (AF-4 recheck).
+    (
+        E
+        + "settlement.py::test_an_error_the_authorization_raises_for_the_lease_cancel_is_session_busy[memory-False]",
+        _only_a_cancel_is_the_leases,
     ),
 ]
 

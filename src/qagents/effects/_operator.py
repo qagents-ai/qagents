@@ -78,6 +78,15 @@ async def _take_lease(
         raise  # a cancel from outside, with or without the lease's own
     except LeaseError as error:
         raise SettlementConflict(reason="session_busy") from error
+    except SettlementConflict:
+        raise  # the operator's own answer, also one decided after the lease's cancel was caught
+    except Exception as error:
+        # What the interrupted code (an authorize_settlement callback) raised for the
+        # lease's own cancel: the lost lease is still why nothing was written, and that
+        # error is the cause, as the runtime's LeaseError. Else it propagates as is.
+        if take_back():
+            raise SettlementConflict(reason="session_busy") from error
+        raise
     finally:
         keeper.cancel()
         try:
@@ -93,8 +102,9 @@ def _take_back_cancel(owner: asyncio.Task[Any], mark: int) -> bool:
     """Take back the one cancel `_take_lease` gave ``owner`` for a lost lease.
 
     True when no other cancel request remains (``owner.cancelling()`` is back at
-    ``mark``, its count when the lease was taken): the CancelledError is then the
-    lease's own and becomes ``SettlementConflict(reason="session_busy")``.
+    ``mark``, its count when the lease was taken): the CancelledError, or an error the
+    operator's code raised for it, is then the lease's own and becomes
+    ``SettlementConflict(reason="session_busy")``.
     """
     return owner.uncancel() <= mark
 

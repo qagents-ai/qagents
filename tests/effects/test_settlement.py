@@ -777,6 +777,112 @@ async def test_a_lease_cancel_the_authorization_catches_is_still_taken_back(stor
     await db.release_lease(session.id, "new-owner")
 
 
+class AuthorizationDown(Exception):
+    """An authorization service's own error, raised for the cancel its call received."""
+
+
+@pytest.mark.parametrize("older_cancel", [False, True])
+async def test_an_error_the_authorization_raises_for_the_lease_cancel_is_session_busy(
+    store, keeper, older_cancel
+):
+    """authorize_settlement turns the lost lease's cancel into its own error: the caller
+    still gets session_busy, with that error as the cause (AF-4 recheck; the runtime's
+    LeaseError does the same)."""
+    db, _ = store
+    session, held = await seed(db)
+
+    async def authorize(answer, record):
+        keeper.lose.set()  # another worker takes the session over while the callback waits
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancel:
+            raise AuthorizationDown("authorization service closed") from cancel
+        return True
+
+    async def operate():
+        answer = Settle.not_applied(held, by="ops", evidence="checked")
+        return await settle(
+            session, answer, permissions=Permissions(authorize_settlement=authorize)
+        )
+
+    outcome, left = await outcome_in_own_task(operate, older_cancel=older_cancel)
+    assert isinstance(outcome, SettlementConflict), repr(outcome)
+    assert outcome.reason == "session_busy"
+    assert isinstance(outcome.__cause__, AuthorizationDown)
+    assert left == 0
+    assert (await db.status(session.id)).lease_owner is None
+    assert not any(entry.kind == "effect_settled" for entry in await session.entries())
+    assert (await session.effects())[0].status == "held"
+
+
+async def test_an_error_the_authorization_raises_for_an_outside_cancel_is_not_session_busy(
+    store, keeper
+):
+    """With an outside cancel as well, the callback's error is not the lease's alone, so it
+    propagates as is and the outside cancel stays counted."""
+    db, _ = store
+    session, held = await seed(db)
+    entered = asyncio.Event()
+
+    async def authorize(answer, record):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:  # the outside cancel; the lease is lost as well
+            keeper.lose.set()
+            try:
+                await asyncio.Event().wait()  # the lease's own cancel ends this wait
+            except asyncio.CancelledError as cancel:
+                raise AuthorizationDown("authorization service closed") from cancel
+        return True
+
+    settling = asyncio.create_task(
+        settle(
+            session,
+            Settle.not_applied(held, by="ops", evidence="checked"),
+            permissions=Permissions(authorize_settlement=authorize),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    settling.cancel()
+    done, _ = await asyncio.wait([settling], timeout=5)
+    assert settling in done
+    assert isinstance(settling.exception(), AuthorizationDown), repr(settling.exception())
+    assert settling.cancelling() == 1  # the outside cancel stays; the lease's own is gone
+    assert (await db.status(session.id)).lease_owner is None
+    assert (await session.effects())[0].status == "held"
+
+
+async def test_a_refusal_after_the_lease_cancel_was_caught_stays_the_operators_answer(
+    store, keeper
+):
+    """A SettlementConflict is the operator's own answer: an authorization that caught the
+    lease's cancel and declined is reported as refused, not as session_busy."""
+    db, _ = store
+    session, held = await seed(db)
+
+    async def authorize(answer, record):
+        keeper.lose.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass  # caught: the callback goes on and declines
+        return False
+
+    async def operate():
+        answer = Settle.not_applied(held, by="ops", evidence="checked")
+        return await settle(
+            session, answer, permissions=Permissions(authorize_settlement=authorize)
+        )
+
+    outcome, left = await outcome_in_own_task(operate)
+    assert isinstance(outcome, SettlementConflict), repr(outcome)
+    assert outcome.reason == "refused"
+    assert left == 0
+    assert (await db.status(session.id)).lease_owner is None
+    assert (await session.effects())[0].status == "held"
+
+
 async def test_an_outside_cancel_while_the_operator_stops_its_keeper_propagates(store, keeper):
     db, _ = store
     session, held = await seed(db)

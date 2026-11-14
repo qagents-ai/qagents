@@ -2936,4 +2936,7 @@ SEAMS = [
     # Added by the AF-3 re-fix, round 2: the operator sets aside every unverified resend
     # (seam as M58).
     ("M67", "qagents.effects._operator._answer_state", "O5"),
+    # Added by the AF-4 re-fix, round 2: an error raised for the lease's own cancel is
+    # session_busy too (seam as M63).
+    ("M68", "qagents.effects._operator._take_back_cancel", "O5"),
 ]
