@@ -276,6 +276,13 @@ class Settle:
     def __post_init__(self) -> None:
         if self.outcome not in ("committed", "not_applied", "resend", "close_unknown"):
             raise ValueError("Unknown settlement outcome.")
+        # The operator resolves a record id by prefix (SPEC 5.3). An empty id is a prefix of
+        # every id and would settle a session's only record, so refuse it here as well as in
+        # the constructors, for an answer built directly.
+        if not isinstance(self.record_id, str):
+            raise TypeError("A settlement record id must be a string.")
+        if not self.record_id.strip():
+            raise ValueError("A settlement record id must not be empty.")
         if not isinstance(self.by, str) or not self.by.strip():
             raise ValueError("A settlement needs the asserted operator identity in by=.")
         proof = self.reason if self.outcome == "close_unknown" else self.evidence

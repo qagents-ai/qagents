@@ -68,3 +68,23 @@ def test_close_unknown_needs_reason_and_record_reference():
         Settle.resend("", by="operator", evidence="checked")
     with pytest.raises(TypeError, match="HeldEffect"):
         Settle.resend(42, by="operator", evidence="checked")
+
+
+@pytest.mark.parametrize(
+    "record_id, error",
+    [
+        ("", ValueError),
+        ("   ", ValueError),
+        (None, TypeError),
+        (42, TypeError),
+        (b"ef_", TypeError),
+    ],
+)
+def test_directly_built_answer_refuses_an_empty_or_non_string_record_id(record_id, error):
+    with pytest.raises(error, match="record id"):
+        Settle("resend", record_id, None, None, "operator", "checked", None)
+
+
+def test_directly_built_answer_keeps_a_short_record_id_and_no_revision():
+    answer = Settle("close_unknown", "ef_a", None, None, "operator", None, "review")
+    assert (answer.record_id, answer.expected_revision) == ("ef_a", None)

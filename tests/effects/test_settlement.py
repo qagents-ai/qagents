@@ -327,6 +327,16 @@ async def test_prefix_answer_resolves_fresh_record_and_ambiguous_prefix_refused(
     assert record.id == held.id and record.status == "closed_unknown"
 
 
+async def test_directly_built_empty_record_id_never_settles_a_lone_record(store):
+    db, _ = store
+    session, held = await seed(db)
+    before = await db.load(session.id)
+    with pytest.raises(ValueError, match="record id"):
+        await settle(session, Settle("close_unknown", "", None, None, "ops", None, "review"))
+    assert await db.load(session.id) == before
+    assert [record.status for record in await session.effects()] == ["held"]
+
+
 async def test_operator_commit_runs_patch_on_durable_state_and_updates_claim(store):
     db, _ = store
     await db.append("session", [Entry(kind="state_updated", data={"values": {"total": 7}})])
