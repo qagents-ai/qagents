@@ -64,6 +64,9 @@ class Operation:
     tool_call_ids: list[str]
     revision: int
     resolved_by_rejected_resend: bool
+    # [additive] the journaled move of a rejected claim to this record, with the earlier
+    # attempts of other owners (SPEC 7.10); its seq is in model_extra["seq"].
+    claimed: kinds.EffectClaimedData | None = None
     _resolved_conflicts: set[tuple[str, tuple[int, ...]]] = field(default_factory=set, repr=False)
     _resolution_seq: int = field(default=0, repr=False)
     _operator_settlement: SettlementSummary | None = field(default=None, repr=False)
@@ -132,9 +135,14 @@ def _status_of(op: Operation) -> State:
         return "R"
     if any(attempt.terminal not in ("committed", "rejected", "not_sent") for attempt in attempts):
         return "D"
-    if any(attempt.terminal == "rejected" for attempt in attempts):
+    if any(attempt.terminal == "rejected" for attempt in attempts) or _claimed_rejection(op):
         return "R"
     return "N"
+
+
+def _claimed_rejection(op: Operation) -> bool:
+    """A claim taken over as rejected is the rejection of its generation (SPEC 7.10)."""
+    return op.claimed is not None and op.claimed.generation == op.generation
 
 
 def _conflict_key(finding: kinds.EffectConflictData) -> tuple[str, tuple[int, ...]]:
@@ -166,6 +174,14 @@ def _finding(op: Operation, what: str, seqs: Iterable[int], detail: str | None =
     known = {_conflict_key(item) for item in [*op.findings, *op.conflicts]}
     if _conflict_key(finding) not in known:
         op.findings.append(finding)
+
+
+def _first_identity_seq(op: Operation, default: int) -> int:
+    """The entry that first fixed the record's descriptor: an intent or a claim transfer."""
+    seqs = [op.attempts[0].intent_seq] if op.attempts else []
+    if op.claimed is not None:
+        seqs.append((op.claimed.model_extra or {}).get("seq", default))
+    return min(seqs, default=default)
 
 
 def _terminal_attempt(
@@ -284,6 +300,8 @@ class EffectView:
         previous_revision = op.revision
         if entry.kind == kinds.KIND_EFFECT_INTENT:
             self._intent(op, entry)
+        elif entry.kind == kinds.KIND_EFFECT_CLAIMED:
+            self._claimed(op, entry)
         elif entry.kind == kinds.KIND_EFFECT_COMMITTED:
             self._commit(op, entry)
         elif entry.kind == kinds.KIND_EFFECT_FAILED:
@@ -333,7 +351,7 @@ class EffectView:
         if op.descriptor is None:
             op.descriptor, op.version, op.request = value, data.version, data.request
         elif op.descriptor != value:
-            first_seq = op.attempts[0].intent_seq if op.attempts else entry.seq
+            first_seq = _first_identity_seq(op, entry.seq)
             _finding(op, "descriptor", [first_seq, entry.seq])
         op.generation = max(op.generation, data.generation)
         op.first_use_at = (
@@ -362,6 +380,23 @@ class EffectView:
                 settlement.__pydantic_extra__["voided"] = True
         op.pending_resend = None
 
+    def _claimed(self, op: Operation, entry: Entry) -> None:
+        data = kinds.EffectClaimedData.model_validate(entry.data)
+        value = Descriptor(data.name, data.version, data.destination_digest, data.request_digest)
+        if op.descriptor is None:
+            op.descriptor, op.version, op.request = value, data.version, data.request
+        elif op.descriptor != value:
+            first_seq = _first_identity_seq(op, entry.seq)
+            _finding(op, "descriptor", [first_seq, entry.seq])
+        op.generation = max(op.generation, data.generation)
+        op.first_use_at = (
+            data.first_use_at
+            if op.first_use_at is None
+            else min(op.first_use_at, data.first_use_at)
+        )
+        # A later transfer carries the longer history (claims only append attempts).
+        op.claimed = data.model_copy(update={"seq": entry.seq})
+
     def _commit(self, op: Operation, entry: Entry) -> None:
         data = kinds.EffectCommittedData.model_validate(entry.data)
         resolved = (
@@ -372,7 +407,10 @@ class EffectView:
         target = None
         if data.attempt is not None or data.intent_seq is not None:
             target = _terminal_attempt(op, data.attempt, data.intent_seq, entry.seq)
-        elif data.via not in ("claim", "operator"):
+        elif data.via not in ("claim", "operator") and not (
+            # A lookup after a claim transfer may find an earlier owner's attempt.
+            data.via == "lookup" and op.claimed is not None
+        ):
             _finding(op, "orphan_terminal", [entry.seq])
         if target is not None:
             target.terminal, target.terminal_seq = "committed", entry.seq

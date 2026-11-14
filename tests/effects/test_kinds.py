@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from qagents.effects import _kinds as kinds
 from qagents.effects._canonical import digest
 
-from ._samples import committed, failed, intent
+from ._samples import claimed, committed, failed, intent
 
 
 def test_all_journal_models_preserve_unknown_fields():
@@ -17,7 +17,7 @@ def test_all_journal_models_preserve_unknown_fields():
         and cls.__module__ == kinds.__name__
         and not name.startswith("_")
     ]
-    assert len(models) == 23
+    assert len(models) == 25
     assert all(cls.model_config["extra"] == "allow" for cls in models)
     data = kinds.EffectIntentData.model_validate({**intent(), "future_field": {"revision": 2}})
     assert data.model_dump(mode="json", exclude_none=False)["future_field"] == {"revision": 2}
@@ -29,6 +29,7 @@ def test_journal_payloads_round_trip_and_preserve_semantics():
         (kinds.EffectIntentData, intent()),
         (kinds.EffectCommittedData, committed()),
         (kinds.EffectFailedData, failed()),
+        (kinds.EffectClaimedData, claimed()),
     ):
         parsed = cls.model_validate(data)
         assert cls.model_validate_json(parsed.model_dump_json()) == parsed
@@ -51,7 +52,8 @@ def test_legacy_additions_default_without_shared_mutable_values():
 
 
 def test_kind_sets_and_capability_markers():
-    assert len(kinds.EFFECT_KINDS) == 7
+    assert len(kinds.EFFECT_KINDS) == 8
+    assert kinds.KIND_EFFECT_CLAIMED in kinds.STATUS_CHANGING_KINDS
     assert kinds.STATUS_CHANGING_KINDS < kinds.EFFECT_KINDS
     assert kinds.KIND_EFFECT_OBSERVED not in kinds.STATUS_CHANGING_KINDS
     assert kinds.KIND_EFFECT_SEND_ENDED not in kinds.STATUS_CHANGING_KINDS

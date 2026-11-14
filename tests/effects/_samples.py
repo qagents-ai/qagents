@@ -79,3 +79,44 @@ def failed(*, attempt=1, intent_seq=1, key="R1", why="unknown", **changes):
         "ended_at": 103.0,
         **changes,
     }
+
+
+def claim_attempt(*, session_id="a", number=1, generation=0, outcome="rejected", **changes):
+    return {
+        "session_id": session_id,
+        "number": number,
+        "generation": generation,
+        "idempotency_key": f"q1_{generation}",
+        "epoch": 1,
+        "store_ts": 100.0 + number,
+        "outcome": outcome,
+        **changes,
+    }
+
+
+def claimed(*, generation=0, attempts=None, key="R1", previous_owner=None, **changes):
+    """A claim transfer (effect_claimed) of the rejected claim written by intent()+failed()."""
+    request = {"request_id": key, "amount": 500}
+    return {
+        **reference(key=key),
+        "version": "1",
+        "request_digest": digest(request),
+        "destination_digest": digest({"account": "one"}),
+        "request": request,
+        "operation_tag": "op1_refund",
+        "receipt_identity": ["id"],
+        "operation_id": "run:2:call",
+        "tool_call_id": "call",
+        "previous_owner": previous_owner
+        or {
+            "session_id": "a",
+            "incarnation": "inc-a",
+            "record_id": record_id("shop", "refund", key),
+        },
+        "status": "rejected",
+        "generation": generation,
+        "first_use_at": 101.0,
+        "attempts": attempts if attempts is not None else [claim_attempt(generation=generation)],
+        "store_ts": 200.0,
+        **changes,
+    }

@@ -24,6 +24,7 @@ KIND_EFFECT_SEND_ENDED = "effect_send_ended"
 KIND_EFFECT_OBSERVED = "effect_observed"
 KIND_EFFECT_SETTLED = "effect_settled"
 KIND_EFFECT_CONFLICT = "effect_conflict"
+KIND_EFFECT_CLAIMED = "effect_claimed"  # [additive] a rejected claim moved to this session
 KIND_MEMO_RECORDED = "memo_recorded"
 KIND_RUN_RESUMED = "run_resumed"
 KIND_WORKFLOW_STEP_STARTED = "workflow_step_started"
@@ -37,6 +38,7 @@ EFFECT_KINDS = frozenset(
         KIND_EFFECT_OBSERVED,
         KIND_EFFECT_SETTLED,
         KIND_EFFECT_CONFLICT,
+        KIND_EFFECT_CLAIMED,
     }
 )
 STATUS_CHANGING_KINDS = frozenset(
@@ -46,6 +48,7 @@ STATUS_CHANGING_KINDS = frozenset(
         KIND_EFFECT_FAILED,
         KIND_EFFECT_SETTLED,
         KIND_EFFECT_CONFLICT,
+        KIND_EFFECT_CLAIMED,
     }
 )
 LIFECYCLE_KINDS = frozenset(
@@ -217,6 +220,41 @@ class EffectConflictData(EffectRefData):
     ]
     seqs: list[int]
     detail: str | None = None
+
+
+class ClaimAttemptData(_Data):  # [additive] one attempt of a claim's history, by any owner
+    session_id: str
+    number: int
+    generation: int
+    idempotency_key: str
+    epoch: int | None
+    store_ts: float
+    outcome: Literal["committed", "rejected", "unknown", "not_sent"] | None = None
+
+
+class EffectClaimedData(EffectRefData):
+    """[additive] A rejected claim moves to this record before any lookup or send (SPEC 7.10).
+
+    It carries what the lookup must ask the destination about: the frozen request and its
+    operation tag, and every earlier attempt with its idempotency key. The claim index
+    accepts it only while the claim still matches ``previous_owner``, ``generation`` and
+    ``attempts`` exactly.
+    """
+
+    version: str
+    request_digest: str
+    destination_digest: str
+    request: dict[str, JSONValue]
+    operation_tag: str
+    receipt_identity: list[str] | None
+    operation_id: str  # the call that took the claim; it is not one of the record's own attempts
+    tool_call_id: str | None
+    previous_owner: dict[str, str]  # {session_id, incarnation, record_id}
+    status: Literal["rejected"]
+    generation: int
+    first_use_at: float
+    attempts: list[ClaimAttemptData]
+    store_ts: float
 
 
 class MemoRecordedData(_Data):
