@@ -463,6 +463,13 @@ _ROWS = [
         + "unsigned_approvals.py::test_an_effect_no_row_would_resend_holds_for_its_own_reason_without_a_secret[opaque]",
         constant(True),
     ),
+    # M60: the warning names an effects tool whose effects no row ever re-sends, and tells
+    # the developer that approval_secret would let them be re-sent (AF-5 review).
+    (
+        E
+        + "unsigned_approvals.py::test_an_approval_gated_effects_tool_with_no_automatic_resend_does_not_warn[opaque]",
+        constant(True),
+    ),
 ]
 
 CASES = tuple(

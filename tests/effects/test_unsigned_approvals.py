@@ -1,9 +1,11 @@
 """An approval-gated effects tool without an approval_secret warns at build (SPEC 5.1, 5.4).
 
 D3 and D4 re-send only under a verifiable decision, and without a secret no decision
-verifies, so such an effect is never re-sent automatically: one whose outcome is in doubt
-is held as APPROVAL_UNVERIFIABLE until an operator settles it. The hold is right (fail
-closed); the warning tells the developer before the first crash does.
+verifies, so such an effect is never re-sent automatically: where D3 or D4 would re-send it,
+one whose outcome is in doubt is held as APPROVAL_UNVERIFIABLE until an operator settles
+it. The hold is right (fail closed); the warning tells the developer before the first crash
+does. An effect that no row would re-send keeps its own hold reason (SPEC 7.1 H1), so a tool
+with only such effects is not named.
 """
 
 import asyncio
@@ -13,7 +15,7 @@ import pytest
 from pydantic import BaseModel
 
 from qagents import Agent, Permissions, RunContext, Session, SQLiteStore, Toolkit, tool
-from qagents.effects import Absent, Attempt, Dedupe, EffectContext, Key, effect
+from qagents.effects import Absent, Attempt, Dedupe, EffectContext, Key, Unique, effect
 from qagents.effects._types import HoldReason
 from qagents.models.testing import FunctionModel, call
 
@@ -139,20 +141,66 @@ def test_an_approval_gated_tool_without_effects_does_not_warn(caplog):
     assert warnings_about_secret(caplog) == []
 
 
-def test_one_warning_names_every_approval_gated_effects_tool(caplog):
-    caplog.set_level(logging.WARNING, logger=LOGGER)
-    refund = refund_tool(send=refund_effect())
+class Duplicate(Exception):
+    pass
 
-    @effect("notice", key=Key("notice", "id"))
+
+def shaped_effect(shape):
+    """One effect per destination contract; D3 or D4 can re-send only the first three."""
+    contracts = {
+        "dedupe": {"dedupe": Dedupe(window_s=3600, contract="test", concurrent="rejects")},
+        "unique": {"dedupe": Unique(contract="test unique key", on_duplicate=(Duplicate,))},
+        "authoritative": {"applies_within_s": 1.0},
+    }
+
+    @effect(f"{shape}_notice", key=Key("notice", "id"), **contracts.get(shape, {}))
     async def notice(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
         return Receipt(id="sent")
 
-    @tool(effects=[notice], requires_approval=True)
-    async def notify_customer(ctx: RunContext, id: str) -> str:
-        """Tell the customer."""
-        return (await ctx.perform(notice, Request(id=id))).id
+    if shape in ("unique", "authoritative", "reconcilable"):  # Unique needs a lookup too
 
-    Agent(model(), tools=[refund, notify_customer, refund_tool("plain", requires_approval=False)])
+        @notice.lookup(authoritative=shape == "authoritative")
+        async def find(ctx, inquiry):
+            return Absent()
+
+    assert notice.klass == {"dedupe": "deduplicated"}.get(shape, shape)
+    return notice
+
+
+def notice_tool(name, *effects):
+    @tool(name=name, effects=list(effects), requires_approval=True)
+    async def notify(ctx: RunContext, id: str) -> str:
+        """Tell the customer."""
+        return "sent"
+
+    return notify
+
+
+@pytest.mark.parametrize("shape", ["dedupe", "unique", "authoritative"])
+def test_build_warns_for_each_effect_contract_with_an_automatic_resend(caplog, shape):
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    Agent(model(), tools=[notice_tool("notify_customer", shaped_effect(shape))])
+    assert [record.getMessage().split(":")[0] for record in warnings_about_secret(caplog)] == [
+        "notify_customer"
+    ]
+
+
+@pytest.mark.parametrize("shape", ["opaque", "reconcilable"])
+def test_an_approval_gated_effects_tool_with_no_automatic_resend_does_not_warn(caplog, shape):
+    """No D3 or D4 can ever re-send these effects, so the secret changes nothing for them:
+    an effect in doubt is held for its own reason, with or without it (SPEC 7.1 H1)."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    Agent(model(), tools=[notice_tool("notify_customer", shaped_effect(shape))])
+    assert warnings_about_secret(caplog) == []
+
+
+def test_one_warning_names_every_approval_gated_effects_tool(caplog):
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    refund = refund_tool(send=refund_effect())
+    # One effect with an automatic re-send is enough to list the tool.
+    notify = notice_tool("notify_customer", shaped_effect("opaque"), shaped_effect("unique"))
+    tools = [refund, notify, notice_tool("post_letter", shaped_effect("opaque"))]
+    Agent(model(), tools=[*tools, refund_tool("plain", requires_approval=False)])
     records = warnings_about_secret(caplog)
     assert len(records) == 1  # one warning, not one per check
     record = records[0]

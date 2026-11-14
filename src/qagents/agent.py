@@ -130,6 +130,15 @@ def _effects_child_refusal(agent: Agent, *, durable_session: bool) -> str | None
     return None
 
 
+def _resends_automatically(tool: Tool) -> bool:
+    """Whether rule D3 or D4 can ever re-send one of the tool's effects (SPEC 7.1): D3 needs a
+    ``Dedupe`` or ``Unique`` contract, D4 an authoritative lookup. Opaque and reconcilable
+    effects are never re-sent automatically, with or without a verifiable decision."""
+    return any(
+        effect.klass in ("deduplicated", "unique", "authoritative") for effect in tool.effects
+    )
+
+
 def _store_root(store: SessionStore) -> SessionStore:
     """Follow only library-owned writer wrappers, preserving the root store identity."""
     from .runtime import _LeasedStore
@@ -492,8 +501,10 @@ class Agent:
     def _warn_unsigned_approvals(self, effects_tools: list[Tool]) -> None:
         """Warn, once per tool, about effects tools that ask for approval while no
         ``approval_secret`` signs the decisions (SPEC 5.1). D3 and D4 re-send only under a
-        verifiable decision (5.4), so these effects are never re-sent automatically: one whose
-        outcome is in doubt holds as APPROVAL_UNVERIFIABLE. The hold is right; the warning
+        verifiable decision (5.4), so these effects are never re-sent automatically: where
+        one of them would, an effect whose outcome is in doubt holds as
+        APPROVAL_UNVERIFIABLE. Only tools with an effect that D3 or D4 can re-send are named:
+        for the others the secret changes no hold (7.1 H1). The hold is right; the warning
         tells the developer before the first crash does."""
         if self.permissions.signs_pauses:
             return
@@ -501,6 +512,7 @@ class Agent:
             tool.name
             for tool in effects_tools
             if tool.name not in self._unsigned_approvals_warned
+            and _resends_automatically(tool)
             and self.permissions._asks_by_rule(tool)
         ]
         if not names:
@@ -509,10 +521,10 @@ class Agent:
         logger.warning(
             "%s: %s for approval, but Permissions has no approval_secret, so no decision is "
             "signed. Without a verifiable decision, rules D3 and D4 never re-send an effect "
-            "automatically, in the run or after a crash: an effect whose outcome is in doubt, "
-            "and that no lookup finds, is held as APPROVAL_UNVERIFIABLE until an operator "
-            "settles it (agent.settle). Set Permissions(approval_secret=...) to sign approval "
-            "decisions.",
+            "automatically, in the run or after a crash: where one of them would, an effect "
+            "whose outcome is in doubt, and that no lookup finds, is held as "
+            "APPROVAL_UNVERIFIABLE until an operator settles it (agent.settle). Set "
+            "Permissions(approval_secret=...) to sign approval decisions.",
             ", ".join(names),
             "this effects tool asks" if len(names) == 1 else "these effects tools ask",
         )

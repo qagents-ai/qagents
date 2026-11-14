@@ -5178,7 +5178,7 @@ changes to them will be listed in release notes.
 
 ## qagents.agent.Agent (class)
 
-Source: `src/qagents/agent.py:274` | qagents 0.2.0
+Source: `src/qagents/agent.py:283` | qagents 0.2.0
 Import: `from qagents.agent import Agent`
 
 ```python
@@ -5257,7 +5257,7 @@ Details of one member: get_api("qagents.agent.Agent.<member>").
 
 ## qagents.agent.Limits (class)
 
-Source: `src/qagents/agent.py:205` | qagents 0.2.0
+Source: `src/qagents/agent.py:214` | qagents 0.2.0
 Import: `from qagents.agent import Limits`
 
 ```python
@@ -5300,7 +5300,7 @@ Details of one member: get_api("qagents.agent.Limits.<member>").
 
 ## qagents.agent.RunStream (class)
 
-Source: `src/qagents/agent.py:918` | qagents 0.2.0
+Source: `src/qagents/agent.py:930` | qagents 0.2.0
 Import: `from qagents.agent import RunStream`
 
 ```python

@@ -2919,4 +2919,6 @@ SEAMS = [
     ("M58", "qagents.effects._operator._answer_state", "O5"),
     # Added by the AF-5 re-fix: an invalid decision is the hold reason only where a row sends.
     ("M59", "qagents.effects._engine._authorization_decides", "O2"),
+    # Added by the AF-5 re-fix: the warning names only tools with an automatic re-send.
+    ("M60", "qagents.agent._resends_automatically", "O4a"),
 ]
