@@ -120,6 +120,10 @@ class BuildIsolation:
         self.max_nodes = max_nodes
         self.findings: list[dict[str, Any]] = []
 
+    def retain_infrastructure(self, *values: Any) -> None:
+        """Exclude exact parent-owned services from the leg identity check."""
+        self._infrastructure.update((id(value), value) for value in values)
+
     def record(self, leg: int, agent: Agent, deps: Any) -> list[dict[str, Any]]:
         if not isinstance(agent, Agent):
             raise ConfigurationError("build(env) must return an Agent or (Agent, deps)")
@@ -210,6 +214,8 @@ class BuildIsolation:
             agent, deps = result
         else:
             raise ConfigurationError("build(env) must return an Agent or (Agent, deps)")
+        if isinstance(env, CrashEnv):
+            self.retain_infrastructure(*env._transport.world._services.values())
         self.record(leg, agent, deps)
         return agent, deps
 

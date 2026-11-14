@@ -4,7 +4,7 @@ from qagents import Agent, RunContext, tool
 from qagents.effects import Attempt, Dedupe, EffectContext, Key, effect
 from qagents.models.recording import RecordingModel
 from qagents.models.testing import ScriptedModel, call
-from qagents.testing.crash import Cassette, Faults, assert_recovers, crash_test
+from qagents.testing.crash import Cassette, FakeStripeRefunds, Faults, assert_recovers, crash_test
 
 from .test_engine_dispatch import Receipt, Request
 
@@ -173,3 +173,46 @@ async def test_swallowed_pause_remains_held_and_appears_in_harness_report(tmp_pa
     (point,) = report.points[1:]
     assert point.execution.held
     assert any(item.code == "swallowed_hold" for item in report.failures), report.explain()
+
+
+async def test_client_transport_runs_send_body_and_preserves_destination_key(tmp_path):
+    def configured(env):
+        @effect(
+            "stripe.refund",
+            key=Key("request", "id"),
+            dedupe=Dedupe(86400, contract="offline Stripe refund semantics", concurrent="rejects"),
+        )
+        async def destination(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+            created = await ctx.deps.create_refund(
+                charge="ch_A",
+                amount=100,
+                idempotency_key=attempt.idempotency_key,
+                metadata={"refund_intent": attempt.request.id},
+            )
+            return Receipt(id=created.id)
+
+        @tool(effects=[destination])
+        async def refund(ctx: RunContext, id: str) -> str:
+            """Issue a refund to the fixture Stripe destination."""
+            return (await ctx.perform(destination, Request(id=id))).id
+
+        return Agent(env.model, tools=[refund]), env.service(destination, FakeStripeRefunds)
+
+    report = await crash_test(
+        configured,
+        "Refund",
+        directory=tmp_path,
+        store="sqlite",
+        model=[call("refund", id="R1"), "Complete."],
+        points="effects",
+        transport="client",
+        faults=Faults.parse("kill_after,commit_then_lose_response,advance_boundaries"),
+    )
+    assert report.ok, report.explain()
+    assert not report.strict_ok
+    assert not any("NOT exercised" in line for line in report.fault_model)
+    assert any(
+        application.key_passed
+        for point in report.points
+        for application in point.execution.applications
+    )
