@@ -1678,6 +1678,33 @@ def test_declared_rejection_fault_uses_the_actual_exception_class(virtual_loop):
     virtual_loop.run_until_complete(workload())
 
 
+def test_no_answer_error_after_application_is_kept_as_an_error_not_a_rejection(virtual_loop):
+    class Refused(Exception):
+        pass
+
+    class LostResponse(Refused, ConnectionResetError):
+        """A transport error whose class also derives from the declared refusal."""
+
+    world = World(virtual_loop)
+    contract = Dedupe(3600, contract="unit", replays_errors=True, replays_rejections=False)
+    fake = ContractFake(world, _refund_effect(contract, rejected_on=(Refused,)))
+
+    async def reset(receipt):
+        raise LostResponse("connection reset after the destination applied")
+
+    async def workload():
+        with pytest.raises(LostResponse):
+            await fake.send(_attempt(), leg=0, key="delivery-1", after_apply=reset)
+        assert world.count_applied(fake.effect) == 1
+        # Kept as an error response under replays_errors, never re-executed as an
+        # unsaved rejection: the same key does not apply a second time.
+        with pytest.raises(LostResponse):
+            await fake.send(_attempt(number=2), leg=1, key="delivery-1")
+        assert world.count_applied(fake.effect) == 1
+
+    virtual_loop.run_until_complete(workload())
+
+
 def test_unique_duplicate_response_keeps_the_one_application(virtual_loop):
     class Duplicate(Exception):
         pass
