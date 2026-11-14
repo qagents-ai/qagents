@@ -134,7 +134,8 @@ def _record_outcome(claim: Claim, session_id: str, number: object, outcome: str)
 def _transfer(
     existing: Claim | None, entry: Entry, *, session_id: str, incarnation: str, now: float
 ) -> Claim:
-    """Move a rejected claim, unchanged since the new owner read it, to the new owner."""
+    """Move a rejected or never-sent claim, unchanged since the new owner read it, to the
+    new owner. The status is part of what must still match (SPEC 7.10)."""
     data = EffectClaimedData.model_validate(entry.data)
     if existing is None:
         raise ClaimConflict(
@@ -153,7 +154,8 @@ def _transfer(
     )
     if (
         descriptor != existing.descriptor_digest
-        or existing.status != "rejected"
+        or existing.status not in ("rejected", "not_sent")
+        or data.status != existing.status
         or named != previous
         or previous == (session_id, incarnation, data.record_id)
         or data.generation != existing.generation

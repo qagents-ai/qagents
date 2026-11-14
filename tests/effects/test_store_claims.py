@@ -193,8 +193,8 @@ async def test_a_claim_moves_only_while_it_matches_what_the_new_owner_read(db, c
     assert await db.get_claim("shop", "refund", "R1") == before
 
 
-@pytest.mark.parametrize("why", [None, "unknown", "not_sent", "committed"])
-async def test_only_a_rejected_claim_can_be_taken_over(db, why):
+@pytest.mark.parametrize("why", [None, "unknown", "committed"])
+async def test_only_a_rejected_or_never_sent_claim_can_be_taken_over(db, why):
     if why is not None:
         await write(db, "a", "effect_intent", intent())
         if why == "committed":
@@ -207,3 +207,28 @@ async def test_only_a_rejected_claim_can_be_taken_over(db, why):
     with pytest.raises(ClaimConflict):
         await write(db, "b", "effect_claimed", payload)
     assert await db.load("b") == []
+
+
+@pytest.mark.parametrize("why", ["rejected", "not_sent"])
+async def test_a_transfer_moves_a_claim_only_under_the_status_it_read(db, why):
+    """AF-2 recheck: a claim whose last attempt was never sent moves too, so a record in
+    R(n) can take it back; the status it names is compared like the rest of the claim."""
+    await write(db, "a", "effect_intent", intent(first_use_at=77))
+    await write(db, "a", "effect_failed", failed(why=why))
+    before = await db.get_claim("shop", "refund", "R1")
+    assert before.status == why
+    other = "not_sent" if why == "rejected" else "rejected"
+    with pytest.raises(ClaimConflict):
+        await write(db, "b", "effect_claimed", await transfer_of(db, status=other))
+    assert await db.load("b") == []
+    assert await db.get_claim("shop", "refund", "R1") == before
+
+    await write(db, "b", "effect_claimed", await transfer_of(db, status=why))
+    moved = await db.get_claim("shop", "refund", "R1")
+    assert (moved.session_id, moved.generation, moved.first_use_at) == ("b", 0, 77)
+    assert moved.attempts == before.attempts
+    assert moved.status == "rejected"  # reconciled from b's fold, R(n): a lookup runs first
+    observed = {**reference(), "attempts": [], "verdict": "absent", "reason": "LOOKUP_INCONCLUSIVE"}
+    with pytest.raises(ClaimConflict):  # only the new owner journals its lookup now
+        await write(db, "a", "effect_observed", observed)
+    await write(db, "b", "effect_observed", observed)
