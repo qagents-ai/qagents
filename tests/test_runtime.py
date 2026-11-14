@@ -921,9 +921,10 @@ async def test_shutdown_during_recover_launches_nothing_and_frees_the_lease():
     log: list[str] = []
     await crash_worker(store, log)
     await asyncio.sleep(FAST["lease_ttl_s"] + 0.1)
-    release = asyncio.Event()
+    release, preparing = asyncio.Event(), asyncio.Event()
 
     async def slow_deps(session_id: str) -> str:
+        preparing.set()
         await release.wait()
         return "B"
 
@@ -932,12 +933,16 @@ async def test_shutdown_during_recover_launches_nothing_and_frees_the_lease():
         store, [receipt_agent(log, gate, started)], worker_id="b", deps_factory=slow_deps, **FAST
     )
     recovering = asyncio.create_task(worker.recover())
-    await asyncio.sleep(0.05)
-    stopping = asyncio.create_task(worker.shutdown(timeout_s=5))
-    await asyncio.sleep(0.05)
-    release.set()
-    assert await recovering == []
-    await stopping
+    try:
+        async with asyncio.timeout(10):
+            await preparing.wait()
+            stopping = asyncio.create_task(worker.shutdown(timeout_s=5))
+            await worker._closing.wait()
+            release.set()
+            assert await recovering == []
+            await stopping
+    finally:
+        release.set()
     status = await store.status("order-7")
     assert (status.status, status.lease_owner) == ("running", None)
     assert RECOVERED_KIND not in [e.kind for e in await store.load("order-7")]

@@ -1301,10 +1301,8 @@ class AgentRuntime:
                 return
             began = loop.time()
             try:
-                held = await asyncio.wait_for(
-                    lease.renew(),
-                    timeout=min(self.heartbeat_s, deadline - began),
-                )
+                async with asyncio.timeout(min(self.heartbeat_s, deadline - began)):
+                    held = await lease.renew()
             except Exception as failure:
                 logger.warning(
                     "Worker %s could not renew its lease on session %r (%s); retrying",
