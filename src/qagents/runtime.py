@@ -525,7 +525,8 @@ class AgentRuntime:
         Raises:
             LeaseError: Another worker is driving this session, this runtime
                 already runs it, or this worker lost the lease while it
-                prepared the run. The run is then not started here; if it was
+                prepared the run (an error the preparation raised for it is
+                the cause). The run is then not started here; if it was
                 already journaled, it stays open and `recover` resumes it.
             ConfigurationError: No agent has that name.
             RuntimeError: The runtime is shut down.
@@ -649,7 +650,8 @@ class AgentRuntime:
         Raises:
             SessionError: The session has no unfinished run.
             LeaseError: Another worker is driving this session, or this worker
-                lost the lease while it prepared the run (which stays open).
+                lost the lease while it prepared the run (which stays open; an
+                error the preparation raised for it is the cause).
             ConfigurationError: The run's agent is not registered here.
             RuntimeError: The runtime is shut down.
         """
@@ -1049,6 +1051,10 @@ class AgentRuntime:
                 await self._back_out(handle)
                 if lost and isinstance(raised, asyncio.CancelledError):
                     raise self._lost_while_preparing(session_id) from None
+                if lost and isinstance(raised, Exception) and not isinstance(raised, LeaseError):
+                    # What the interrupted code raised for the runtime's cancel: the lost
+                    # lease is still why the run did not start; that error is the cause.
+                    raise self._lost_while_preparing(session_id) from raised
                 raise
             self._launch(handle, open_stream, deps, limits=limits, journal=journal)
             if prepared is not None:

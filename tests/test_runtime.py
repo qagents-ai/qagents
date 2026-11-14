@@ -1586,6 +1586,49 @@ async def test_an_older_cancel_request_on_the_caller_does_not_hide_a_lost_lease(
     await runtime.shutdown()
 
 
+@pytest.mark.parametrize("phase", ["start", "resume"])
+async def test_an_error_raised_for_the_runtimes_cancel_still_reports_the_lost_lease(phase):
+    """Preparation code that turns the runtime's cancel into its own error does not hide
+    why the run did not start: the caller gets LeaseError, caused by that error (AF-4)."""
+    store = LosesLeaseOnCue()
+
+    class DepsUnavailable(Exception):
+        pass
+
+    async def deps(session_id: str) -> None:
+        store.refused = True  # another worker takes the session over meanwhile
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancel:
+            raise DepsUnavailable("pool closed") from cancel
+
+    if phase == "resume":
+        await store.append("s", open_run())
+    before = [entry.kind for entry in await store.load("s")]
+    runtime = AgentRuntime(store, [echo_agent()], deps_factory=deps, **CUE)
+    caller = asyncio.current_task()
+    assert caller is not None
+    outcome: BaseException | None = None
+    try:
+        async with asyncio.timeout(5):
+            if phase == "resume":
+                await runtime.resume("s")
+            else:
+                await runtime.start("worker", "go", session_id="s")
+    except BaseException as raised:
+        outcome = raised
+    assert isinstance(outcome, LeaseError), repr(outcome)
+    assert "while it prepared the run" in str(outcome)
+    assert isinstance(outcome.__cause__, DepsUnavailable)
+    assert caller.cancelling() == 0
+    assert runtime.handles == {}
+    status = await store.status("s")
+    assert status.lease_owner is None
+    assert [entry.kind for entry in await store.load("s")] == before
+    assert status.status == ("running" if phase == "resume" else "idle")
+    await runtime.shutdown()
+
+
 async def test_a_lease_lost_while_a_recovery_is_prepared_leaves_run_forever_polling():
     store = LosesLeaseOnCue()
     await store.append("s", open_run())
