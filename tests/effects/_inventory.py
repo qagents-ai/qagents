@@ -1294,6 +1294,7 @@ INTERFACES = [
             ("receipt", "None"),
             ("committed_at", "None"),
             ("updated_at", None),
+            ("attempts", "[]"),
         ],
         False,
     ),
