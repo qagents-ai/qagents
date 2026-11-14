@@ -32,6 +32,8 @@ BACKENDS = [
     ),
 ]
 FAST = {"lease_ttl_s": 0.3, "heartbeat_s": 0.05}
+STEADY = {"lease_ttl_s": 30.0}
+"""A lease no loaded machine outlives by accident: a test ends it with `Backend.expire_lease`."""
 CUE = {"lease_ttl_s": 30.0, "heartbeat_s": 0.01}
 """A lease that is lost only when its store refuses a renewal, noticed at the next heartbeat."""
 
@@ -288,14 +290,19 @@ class Backend:
         self.schema = f"qagents_test_{uuid.uuid4().hex[:12]}"
         self._memory: InMemoryStore | None = None
         self._opened: list[SessionStore] = []
+        self.ahead = 0.0
+        """Seconds the memory and SQLite store clocks run ahead of wall time."""
+
+    def clock(self) -> float:
+        return time.time() + self.ahead
 
     def store(self) -> SessionStore:
         if self.kind == "memory":
             # SPEC 7.7.6: legacy recovery tests deliberately use sub-second takeover.
-            self._memory = self._memory or InMemoryStore(takeover_grace_s=0.0)
+            self._memory = self._memory or InMemoryStore(clock=self.clock, takeover_grace_s=0.0)
             return self._memory
         if self.kind == "sqlite":
-            store: SessionStore = SQLiteStore(self.path, takeover_grace_s=0.0)
+            store: SessionStore = SQLiteStore(self.path, clock=self.clock, takeover_grace_s=0.0)
         else:
             from qagents.stores.postgres import PostgresStore
 
@@ -312,6 +319,27 @@ class Backend:
                     await store.aclose()
 
         run(main())
+
+    async def expire_lease(self, store: SessionStore, session_id: str) -> None:
+        """End the lease a dead worker left on ``session_id`` now, instead of waiting for it.
+
+        The memory and SQLite store clocks move past it. Postgres leases run on the
+        database's clock, so there the lease's expiry moves into the past instead.
+        """
+        if self.kind != "postgres":
+            expires = (await store.status(session_id)).lease_expires_at
+            assert expires is not None
+            self.ahead += max(expires - self.clock(), 0.0) + 1.0
+            return
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect(DSN, autocommit=True) as connection:
+            await connection.execute(
+                f'UPDATE "{self.schema}".sessions'
+                " SET lease_expires_at = clock_timestamp() - interval '1 hour'"
+                " WHERE session_id = %s",
+                (session_id,),
+            )
 
     def drop(self) -> None:
         if self.kind != "postgres":
@@ -333,7 +361,9 @@ def backend(request: pytest.FixtureRequest, tmp_path) -> Backend:
     made.drop()
 
 
-async def crash_worker(store: SessionStore, log: list[str]) -> AgentRuntime:
+async def crash_worker(
+    store: SessionStore, log: list[str], timing: dict[str, float] = FAST
+) -> AgentRuntime:
     """Worker A starts a run and dies while the receipt is being sent."""
     gate, started = asyncio.Event(), asyncio.Event()
     connection = CrashableStore(store)
@@ -342,7 +372,7 @@ async def crash_worker(store: SessionStore, log: list[str]) -> AgentRuntime:
         [receipt_agent(log, gate, started)],
         worker_id="worker-a",
         deps_factory=lambda session_id: "A",
-        **FAST,
+        **timing,
     )
     handle = await worker.start("billing", "charge and send the receipt", session_id="order-7")
     await asyncio.wait_for(started.wait(), 5)
@@ -354,7 +384,9 @@ async def crash_worker(store: SessionStore, log: list[str]) -> AgentRuntime:
     return worker
 
 
-def recovering_worker(store: SessionStore, log: list[str], name: str) -> AgentRuntime:
+def recovering_worker(
+    store: SessionStore, log: list[str], name: str, timing: dict[str, float] = FAST
+) -> AgentRuntime:
     gate, started = asyncio.Event(), asyncio.Event()
     gate.set()
     return AgentRuntime(
@@ -362,23 +394,21 @@ def recovering_worker(store: SessionStore, log: list[str], name: str) -> AgentRu
         [receipt_agent(log, gate, started, replies=["The card was charged and the receipt sent."])],
         worker_id=name,
         deps_factory=lambda session_id: name,
-        **FAST,
+        **timing,
     )
 
 
 def test_a_dead_workers_run_is_recovered_without_repeating_finished_tools(backend):
     async def check() -> None:
         log: list[str] = []
-        await crash_worker(backend.store(), log)
+        await crash_worker(backend.store(), log, STEADY)
         store = backend.store()
         status = await store.status("order-7")
         assert status.status == "running" and status.lease_owner.startswith("worker-a#")
 
-        worker = recovering_worker(store, log, "worker-b")
-        assert status.lease_expires_at is not None
-        if status.lease_expires_at - time.time() > 0.15:  # store clock; Postgres may differ
-            assert await worker.recover() == []  # the lease has not expired yet
-        await asyncio.sleep(FAST["lease_ttl_s"] + 0.1)
+        worker = recovering_worker(store, log, "worker-b", STEADY)
+        assert await worker.recover() == []  # the lease has not expired yet
+        await backend.expire_lease(store, "order-7")  # no wall-clock wait for it to run out
         (handle,) = await worker.recover()
         assert handle.resumed and handle.agent == "billing"
         result = await handle.wait()
@@ -399,9 +429,11 @@ def test_a_dead_workers_run_is_recovered_without_repeating_finished_tools(backen
 def test_two_workers_racing_to_recover_a_run_have_one_winner(backend):
     async def check() -> None:
         log: list[str] = []
-        await crash_worker(backend.store(), log)
-        await asyncio.sleep(FAST["lease_ttl_s"] + 0.1)
-        workers = [recovering_worker(backend.store(), log, f"worker-{n}") for n in "bcd"]
+        # STEADY leases: under load a sub-second lease ran out while worker A started its run
+        # (T4). The dead worker's lease is ended on purpose, so nothing races the wall clock.
+        await crash_worker(backend.store(), log, STEADY)
+        await backend.expire_lease(backend.store(), "order-7")
+        workers = [recovering_worker(backend.store(), log, f"worker-{n}", STEADY) for n in "bcd"]
         found = await asyncio.gather(*[worker.recover() for worker in workers])
         handles = [handle for handles in found for handle in handles]
         assert len(handles) == 1
