@@ -53,6 +53,7 @@ from ._transport import HarnessTransport
 from ._world import LegCrashed, World
 
 _EXPLORATION_LOCK = threading.Lock()
+_SUBPROCESS_UNSUPPORTED = {"freeze_after_intent", "freeze_before_fence2", "freeze_in_send"}
 
 
 async def crash_test(
@@ -89,19 +90,39 @@ async def crash_test(
     _mask_features: frozenset[str] = frozenset(),
 ) -> CrashReport:
     """Run an offline scenario and check observed recovery at durable boundaries."""
-    if store not in {"memory", "sqlite"} or isolation != "inprocess":
+    if store not in {"memory", "sqlite"} or isolation not in {"inprocess", "subprocess"}:
         raise ConfigurationError(
-            "This crash driver currently supports in-process memory and SQLite."
+            "Crash testing supports memory or SQLite and a known isolation mode."
+        )
+    if isolation == "subprocess" and (store != "sqlite" or mode != "freeze"):
+        raise ConfigurationError(
+            "Subprocess crash testing requires store='sqlite' and mode='freeze'."
         )
     if model is None:
         raise ConfigurationError("Supply an offline model script or cassette to crash_test.")
     if not callable(build) or type(max_legs) is not int or max_legs < 1 or type(seed) is not int:
         raise ConfigurationError("crash_test needs build, an integer seed, and positive max_legs.")
+    if isolation == "subprocess":
+        from ._subprocess import import_reference
+
+        import_reference(build)
+        import_reference(scenario)
     if not isinstance(session_id, str) or not session_id:
         raise ConfigurationError("crash_test requires a nonempty session_id.")
     if points not in {"all", "all-raw", "effects", "recovery"}:
         raise ConfigurationError("Unknown crash point selection.")
     chosen = faults or Faults.default()
+    if isolation == "subprocess":
+        unsupported = chosen.kinds & _SUBPROCESS_UNSUPPORTED
+        if unsupported and chosen.kinds != Faults.DEFAULT_KINDS:
+            raise ConfigurationError(
+                "Subprocess crash testing cannot thaw a terminated worker. Unsupported faults: "
+                + ", ".join(sorted(unsupported))
+            )
+        if unsupported:
+            chosen = Faults(
+                kinds=chosen.kinds - unsupported, adapters=chosen.adapters, stall_s=chosen.stall_s
+            )
     if isinstance(probes, (str, os.PathLike)):
         probes = json.loads(await asyncio.to_thread(Path(probes).read_text, encoding="utf-8"))
     if probes is not None and (
@@ -136,6 +157,7 @@ async def crash_test(
             answer=answer,
             invariants=invariants,
             mask_features=_mask_features,
+            isolation=isolation,
         )
 
     if directory is not None:
@@ -167,7 +189,11 @@ async def crash_test(
                 for variant in _held_delivery_points(point, result, chosen, answer):
                     deeper[variant.id] = variant
             if "advance_boundaries" in chosen.kinds and result.crash_snapshots:
-                for boundary in boundary_points(point, _recorded_boundaries(result), leg=1):
+                crashed_legs = {plan.leg for plan in point.plans if plan.id in result.triggered}
+                recovery_leg = max(crashed_legs, default=0) + 1
+                for boundary in boundary_points(
+                    point, _recorded_boundaries(result), leg=recovery_leg
+                ):
                     deeper[boundary.id] = boundary
             if _stop_on_violation and any(
                 check.status == "violated"
@@ -207,6 +233,7 @@ async def crash_test(
         rerun=rerun,
         mode=mode,
         store=store,
+        isolation=isolation,
         reproduction=await asyncio.to_thread(
             _reproduction,
             model,
@@ -219,6 +246,7 @@ async def crash_test(
             transport,
             seed,
             max_legs,
+            isolation=isolation,
             supported=not (scenario or fakes or approve or answer or invariants or _mask_features),
         ),
     )
@@ -262,6 +290,12 @@ def _model_points(prefix, result, faults):
         return
     leg = min(item.leg for item in calls)
     for kind in sorted(faults.kinds & PERTURBATIONS):
+        if kind in {"retry_effect", "retry_changed"} and not any(
+            item.request.messages and any(message.tool_calls for message in item.request.messages)
+            for item in calls
+            if item.leg == leg
+        ):
+            continue
         identity = f"{prefix.id}+leg{leg}:model/{kind}"
         yield Point(
             identity,
@@ -295,15 +329,14 @@ def _held_delivery_points(prefix, result, faults, answer):
         )
 
 
-async def _deliver_while_held(agent, session, deps, answer, held, plan, controller):
+async def _deliver_while_held(agent, session, deps, answer, held, plan, hit, finding):
     """Try a competing action, then return control to the normal recovery legs."""
-    world = controller.world
 
     def unexpected(detail):
-        world.findings.append({"kind": "unsafe_held_delivery", "detail": detail, "leg": plan.leg})
+        finding("unsafe_held_delivery", detail)
 
     if plan.kind == "new_run_on_held":
-        controller.hit(plan)
+        hit(plan)
         try:
             await agent.run("Competing run during recovery", session=session, deps=deps)
         except HeldEffectsError:
@@ -317,7 +350,7 @@ async def _deliver_while_held(agent, session, deps, answer, held, plan, controll
         raise LeaseError("The harness could not obtain the competing recovery lease.")
     try:
         if plan.kind == "double_resume":
-            controller.hit(plan)
+            hit(plan)
             try:
                 await agent.resume(session, deps=deps)
             except SessionError as error:
@@ -326,7 +359,7 @@ async def _deliver_while_held(agent, session, deps, answer, held, plan, controll
                 raise
             unexpected("A competing resume ran while another worker held the lease.")
         elif (decision := answer(held[0])) is not None:
-            controller.hit(plan)
+            hit(plan)
             try:
                 await agent.settle(session, decision, deps=deps)
             except SettlementConflict as error:
@@ -336,6 +369,65 @@ async def _deliver_while_held(agent, session, deps, answer, held, plan, controll
             unexpected("An operator settlement ran while another worker held the lease.")
     finally:
         await session.store.release_lease(session.id, owner)
+
+
+async def _drive_agent(
+    agent,
+    session,
+    deps,
+    *,
+    env,
+    prompt,
+    state,
+    scenario,
+    answers,
+    needs_recheck,
+    stale,
+    operator_answer,
+    has_answer,
+    delivery,
+    observe,
+    hit,
+    finding,
+    clock,
+):
+    """Use identical Agent entry points inside either kind of leg."""
+    if needs_recheck:
+        durable_holds = (await session.state()).effects.held(session.id)
+        if durable_holds:
+            observe()
+            if delivery is not None:
+                await _deliver_while_held(
+                    agent, session, deps, operator_answer, durable_holds, delivery, hit, finding
+                )
+        pending = await agent.recheck(session, deps=deps)
+        if pending and has_answer:
+            for item in pending:
+                if (decision := operator_answer(item)) is not None:
+                    await agent.settle(session, decision, deps=deps)
+            pending = [item.hold for item in await session.effects() if item.hold]
+        if pending and not any(item.retry_after for item in pending):
+            return pending
+        if pending:
+            later = min(item.retry_after.timestamp() for item in pending if item.retry_after)
+            clock.advance(max(0, later - clock.store_time()) + 0.001)
+    if scenario is not None:
+        return await scenario(env, agent, deps)
+    if (await session.state()).open_run_id is None:
+        return await agent.run(prompt, session=session, deps=deps, state=state)
+    if stale is not None and answers:
+        changed = {
+            key: value.model_copy(update={"approved": not value.approved})
+            for key, value in answers.items()
+        }
+        try:
+            result = await agent.resume(session, deps=deps, approvals=changed)
+        except ApprovalConflictError:
+            pass
+        else:
+            finding("stale_approval_accepted", "A conflicting approval answer was accepted.")
+            return result
+    return await agent.resume(session, deps=deps, approvals=answers)
 
 
 def _reproduction(
@@ -351,6 +443,7 @@ def _reproduction(
     max_legs,
     *,
     supported,
+    isolation,
 ):
     if not supported:
         return None
@@ -378,6 +471,7 @@ def _reproduction(
         "state": state,
         "session_id": session_id,
         "mode": mode,
+        "isolation": isolation,
         "transport": transport,
         "seed": seed,
         "max_legs": max_legs,
@@ -423,6 +517,7 @@ async def assert_recovers(build: Callable[[CrashEnv], Any], path: str | os.PathL
             "model": model,
             "faults": faults,
             "mode": config["mode"],
+            "isolation": config.get("isolation", "inprocess"),
             "transport": config["transport"],
             "session_id": config["session_id"],
             "seed": config["seed"],
@@ -469,14 +564,23 @@ def _execute_point(
     answer=None,
     invariants=(),
     mask_features=frozenset(),
+    isolation="inprocess",
 ):
     with TemporaryDirectory(dir=directory, prefix="qagents-crash-") as temp:
-        loop = VirtualLoop(ManualClock(store_time=1_000_000))
+        loop = VirtualLoop(
+            ManualClock(store_time=1_000_000),
+            thread_timeout_s=45 if isolation == "subprocess" else 10,
+        )
         world = World(loop, mode=mode, session_id=session_id)
-        controller = FaultController(world, point.plans, faults=faults)
+        fault_world = world
+        if isolation == "subprocess":
+            from ._subprocess import ProcessWorld
+
+            fault_world = ProcessWorld(world)
+        controller = FaultController(fault_world, point.plans, faults=faults)
         controller.install()
         destination = HarnessTransport(
-            world,
+            fault_world,
             fakes=fakes,
             mode=transport,
             controller=controller,
@@ -505,6 +609,7 @@ def _execute_point(
             max_legs=max_legs,
             invariants=invariants,
             mask_features=mask_features,
+            isolation=isolation,
         )
 
 
@@ -530,6 +635,7 @@ def _execute_loop(
     max_legs,
     invariants,
     mask_features,
+    isolation,
 ):
     effects, undeclared, reached, snapshots, checks = {}, set(), [], [], []
     replayable = set()
@@ -592,7 +698,6 @@ def _execute_loop(
                 model=model,
                 needs_recheck=needs_recheck,
                 answers=answers,
-                previous_holds=held,
             ):
                 token = _ports.TRANSPORT.set(destination.for_leg(number))
                 observer = _ports.REACH_OBSERVER.set(reached.append)
@@ -627,71 +732,104 @@ def _execute_loop(
                         for name, tool in tools.items()
                         if not tool.read_only and not tool.effects
                     )
-                    if needs_recheck:
-                        world.observe(number, "held_delivery")
-                        delivery = next(
-                            (
-                                plan
-                                for plan in point.plans
-                                if plan.leg == number
-                                and plan.kind
-                                in {"new_run_on_held", "double_resume", "operator_race"}
-                            ),
-                            None,
-                        )
-                        if delivery is not None:
-                            await _deliver_while_held(
-                                agent, session, deps, answer, previous_holds, delivery, controller
-                            )
-                        pending = await agent.recheck(session, deps=deps)
-                        if pending and answer is not None:
-                            for item in pending:
-                                if (decision := answer(item)) is not None:
-                                    await agent.settle(session, decision, deps=deps)
-                            pending = [item.hold for item in await session.effects() if item.hold]
-                        if pending and not any(item.retry_after for item in pending):
-                            return pending
-                        if pending:
-                            later = min(
-                                item.retry_after.timestamp() for item in pending if item.retry_after
-                            )
-                            world.clock.advance(max(0, later - world.clock.store_time()) + 0.001)
-                    if scenario is not None:
-                        return await scenario(env, agent, deps)
-                    if (await session.state()).open_run_id is not None:
-                        if (
-                            stale is not None
-                            and number == stale.leg + 1
-                            and stale.id in controller.triggered
-                            and answers
-                        ):
-                            changed = {
-                                key: value.model_copy(update={"approved": not value.approved})
-                                for key, value in answers.items()
-                            }
-                            try:
-                                result = await agent.resume(session, deps=deps, approvals=changed)
-                            except ApprovalConflictError:
-                                pass
-                            else:
-                                world.findings.append(
-                                    {"kind": "stale_approval_accepted", "leg": number}
-                                )
-                                return result
-                        return await agent.resume(session, deps=deps, approvals=answers)
-                    return await agent.run(prompt, session=session, deps=deps, state=state)
+                    delivery = next(
+                        (
+                            plan
+                            for plan in point.plans
+                            if plan.leg == number
+                            and plan.kind in {"new_run_on_held", "double_resume", "operator_race"}
+                        ),
+                        None,
+                    )
+                    return await _drive_agent(
+                        agent,
+                        session,
+                        deps,
+                        env=env,
+                        prompt=prompt,
+                        state=state,
+                        scenario=scenario,
+                        answers=answers,
+                        needs_recheck=needs_recheck,
+                        stale=stale
+                        if stale and number == stale.leg + 1 and stale.id in controller.triggered
+                        else None,
+                        operator_answer=answer,
+                        has_answer=answer is not None,
+                        delivery=delivery,
+                        observe=lambda: world.observe(number, "held_delivery"),
+                        hit=controller.hit,
+                        finding=lambda kind, detail: world.findings.append(
+                            {"kind": kind, "detail": detail, "leg": number}
+                        ),
+                        clock=world.clock,
+                    )
                 finally:
                     _ports.FINDING_OBSERVER.reset(diagnostics)
                     _ports.REACH_OBSERVER.reset(observer)
                     _ports.TRANSPORT.reset(token)
 
-            task = world.create_task(number, drive())
-            crashed = asyncio.create_task(world.crashed.wait())
-            try:
-                await asyncio.wait({task, crashed}, return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                crashed.cancel()
-                await asyncio.gather(crashed, return_exceptions=True)
+            process = None
+            if isolation == "subprocess":
+                from ._subprocess import ProcessLeg, import_reference
+
+                delivery = next(
+                    (
+                        plan
+                        for plan in point.plans
+                        if plan.leg == number
+                        and plan.kind in {"new_run_on_held", "double_resume", "operator_race"}
+                    ),
+                    None,
+                )
+                process = ProcessLeg(
+                    world, controller, destination, env.model, number, reached, answer
+                )
+                task = world.create_task(
+                    number,
+                    process.run(
+                        {
+                            "number": number,
+                            "directory": directory,
+                            "mask_features": mask_features,
+                            "build": import_reference(build),
+                            "scenario": import_reference(scenario),
+                            "prompt": prompt,
+                            "state": state,
+                            "session_id": world.session_id,
+                            "seed": seed,
+                            "transport": destination.mode,
+                            "answers": answers,
+                            "needs_recheck": needs_recheck,
+                            "stale": stale
+                            if stale
+                            and number == stale.leg + 1
+                            and stale.id in controller.triggered
+                            else None,
+                            "delivery": delivery,
+                            "has_answer": answer is not None,
+                        }
+                    ),
+                )
+                await asyncio.wait({task})
+                if process.declarations is not None:
+                    declared, tools, key, limits = process.declarations
+                    effects.update(declared)
+                    approval_keys[number], usage_limits[number] = key, limits
+                    replayable.update(
+                        name for name, effectful, read, safe in tools if effectful or read or safe
+                    )
+                    undeclared.update(
+                        name for name, effectful, read, _ in tools if not effectful and not read
+                    )
+            else:
+                task = world.create_task(number, drive())
+                crashed = asyncio.create_task(world.crashed.wait())
+                try:
+                    await asyncio.wait({task, crashed}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    crashed.cancel()
+                    await asyncio.gather(crashed, return_exceptions=True)
             if leg.dead:
                 snapshot = await world.snapshot()
                 if snapshot is not None:
@@ -704,7 +842,9 @@ def _execute_loop(
                     world.thaw(number)
                     await asyncio.sleep(0)
                 if task.done() and not task.cancelled():
-                    task.exception()
+                    failure = task.exception()
+                    if process is not None and failure is not None:
+                        raise failure
                 continue
             world.loop.deactivate_leg(number)
             if (
@@ -718,9 +858,23 @@ def _execute_loop(
                 controller.hit(perturbation)
             try:
                 result = task.result()
-            except (LeaseError, JournalOutcomeUnknown, asyncio.CancelledError):
-                if not controller.triggered:
+            except (LeaseError, JournalOutcomeUnknown, asyncio.CancelledError, OSError) as error:
+                targeted = [
+                    plan
+                    for plan in point.plans
+                    if plan.leg == number and plan.id in controller.triggered
+                ]
+                if not targeted:
                     raise
+                leases = {"acquire_lease", "acquire_lease_grant"}
+                lost_acquisition = any(plan.method in leases for plan in targeted)
+                if isinstance(error, OSError) and not lost_acquisition:
+                    raise
+                if lost_acquisition:
+                    status = await backend._backend.status(world.session_id)
+                    if status.lease_expires_at is not None:
+                        cutoff = status.lease_expires_at + backend.takeover_grace_s
+                        world.clock.advance(max(0, cutoff - world.clock.store_time()) + 0.001)
                 continue
             except HeldEffectsError as error:
                 held = list(error.held)
@@ -766,6 +920,14 @@ def _execute_loop(
     with loop.observe_tool_threads():
         try:
             loop.run_until_complete(run())
+            if isolation == "subprocess":
+                pending = {
+                    task
+                    for fake in destination.contracts.values()
+                    for task in fake.pending_destinations
+                }
+                if pending:
+                    loop.run_until_complete(asyncio.wait(pending))
         except UnscriptedRequest as error:
             errors.append(str(error))
         except NoTerminalState as error:

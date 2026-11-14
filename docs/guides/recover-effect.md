@@ -15,8 +15,7 @@ the agent. The example checks that the destination contains one credit.
 python -m examples.recover_credit --directory work/credit-recovery-demo
 ```
 
-Use a fresh directory for each run. The example runs on the Effects
-development branch. In an application, verify the destination record against
+Use a fresh directory for each run. The example uses the Effects runtime. In an application, verify the destination record against
 the business identity and amount, then supply the authenticated operator's
 identity to `Settle.committed()`.
 
@@ -48,6 +47,45 @@ coverage or provider evidence is incomplete. A strict run requires
 exercise through the client transport and evidence for destination
 assumptions. The in-process harness uses a virtual clock. The Gym
 benchmark measures real worker termination on the local machine.
+
+## Run with a fresh worker process
+
+An importable factory can also run in a new interpreter on each leg.
+Use SQLite for the journal and pass an offline script or cassette. The
+parent owns the destination and terminates the worker before replying at
+the selected boundary.
+
+```console
+qagents crashtest my_fixture:build "Credit DEMO-1" --cassette fixture.json \
+  --store sqlite --isolation subprocess --transport client \
+  --faults kill_before,kill_after,recovery_kill,commit_then_crash,commit_then_lose_response,advance_boundaries \
+  --points all-raw --json subprocess-results.json
+```
+
+Subprocess factories and custom scenarios must be importable by module
+name. Define request and receipt types and simulated client classes at
+module scope so both processes can resolve them. `env.service(...)`
+provides the worker with a proxy to the parent-owned fake. The worker
+uses the supplied offline model and receives a minimal environment.
+Use trusted fixture code, as worker processes still have the application's
+filesystem and network access. Freeze-and-thaw faults use in-process
+isolation because they require a surviving worker.
+
+Run a worker against a simulated Stripe refund with no credentials.
+The destination commits the refund and the harness terminates the
+worker before it receives the receipt. A fresh worker replays the
+same key and the destination records one application.
+
+```console
+python -m examples.subprocess_refund
+```
+
+The command writes `refund-recovery.json` and prints the selected point's
+verdict. The report also shows any gaps in the broader coverage.
+
+```python
+--8<-- "examples/subprocess_refund.py"
+```
 
 ## Test the recovery boundaries
 

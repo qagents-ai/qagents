@@ -221,6 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
     crash.add_argument("--strict", action="store_true")
     crash.add_argument("--allow-held", action="append", default=[])
     crash.add_argument("--allow-undeclared", action="append", default=[])
+    crash.add_argument(
+        "--isolation",
+        choices=("inprocess", "subprocess"),
+        default="inprocess",
+        help="use a new interpreter per recovery leg (subprocess needs SQLite and freeze mode)",
+    )
     crash.set_defaults(handler=_crashtest)
 
     docs = commands.add_parser(
@@ -324,6 +330,8 @@ async def _crashtest(args: argparse.Namespace, console: _Console) -> int:
         raise UsageError("Provide a callable build function and a readable offline cassette.")
     if args.budget is not None and args.budget < 1:
         raise UsageError("--budget must be a positive integer.")
+    if args.isolation == "subprocess" and (args.store != "sqlite" or args.mode != "freeze"):
+        raise UsageError("Subprocess crash testing requires --store sqlite and --mode freeze.")
     report = await crash_test(
         build,
         args.prompt,
@@ -335,6 +343,7 @@ async def _crashtest(args: argparse.Namespace, console: _Console) -> int:
         seed=args.seed,
         mode=args.mode,
         transport=args.transport,
+        isolation=args.isolation,
         strict=args.strict,
         allow_held=args.allow_held,
         allow_undeclared=args.allow_undeclared,

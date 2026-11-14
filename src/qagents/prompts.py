@@ -237,6 +237,24 @@ SUBAGENT_TOO_DEEP = (
 SUBAGENT_TASK_DESCRIPTION = "The complete task, self-contained."
 """Description of the ``task`` parameter of an agent exposed with ``agent.as_tool()``."""
 
+TEAM_SEND_DESCRIPTION = "Send text to a named teammate or the coordinator."
+"""Description of a team endpoint's message-sending tool."""
+
+TEAM_RECEIVE_DESCRIPTION = "Read your inbox. Set wait_s to wait for a message."
+"""Description of a team endpoint's inbox tool."""
+
+TEAM_UNKNOWN_MEMBER = "Unknown teammate {member!r}."
+"""Sent back when a tool names an unregistered message recipient."""
+
+TEAM_TEXT_LIMIT = "Team message must contain 1 to {limit} characters."
+"""Sent back when a message body is empty or exceeds the team's configured limit."""
+
+TEAM_INBOX_FULL = "Inbox for {member!r} is full."
+"""Sent back when a recipient must drain their inbox before accepting more messages."""
+
+TEAM_RECEIVE_LIMIT = "Use wait_s between 0 and 30 and a limit between 1 and 64."
+"""Sent back when an inbox request exceeds the supported wait or batch size."""
+
 FAN_OUT_DESCRIPTION = (
     "{description}\n\n"
     "Give {name} several independent tasks at once; they are worked on in parallel. Each task "

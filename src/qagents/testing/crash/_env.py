@@ -45,7 +45,7 @@ class CrashEnv:
     def __init__(
         self,
         *,
-        world: World,
+        world: World | None,
         transport: HarnessTransport,
         leg: int,
         worker_id: str,
@@ -55,9 +55,10 @@ class CrashEnv:
         session_id: str,
         seed: int,
         directory: Path,
+        clock: ManualClock | None = None,
     ) -> None:
         self.leg, self.worker_id, self.recovering = leg, worker_id, recovering
-        self.clock, self.store, self.model = world.clock, store, model
+        self.clock, self.store, self.model = clock if world is None else world.clock, store, model
         self.session_id, self.seed, self.directory = session_id, seed, Path(directory)
         self._transport = transport
 
@@ -214,7 +215,7 @@ class BuildIsolation:
             agent, deps = result
         else:
             raise ConfigurationError("build(env) must return an Agent or (Agent, deps)")
-        if isinstance(env, CrashEnv):
+        if isinstance(env, CrashEnv) and hasattr(env._transport, "world"):
             self.retain_infrastructure(*env._transport.world._services.values())
         self.record(leg, agent, deps)
         return agent, deps

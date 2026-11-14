@@ -1054,6 +1054,96 @@ if result.status == "paused":
 What is guaranteed: a step that finished never runs again. A plain `step` that was in progress
 when the process died runs again from its start, so make side-effecting steps idempotent.
 
+
+## Send messages between teammates
+
+Use a `TeamMailbox` for a team that needs to exchange information while
+its child runs are active. Register a unique name for each participant.
+Give each agent the tools from its own endpoint. The trusted host binds
+the sender identity, and each endpoint reads its own inbox.
+
+```console
+python -m examples.team_messages
+```
+
+```python
+"""Send evidence from a researcher to a reviewer and back to the coordinator."""
+
+import asyncio
+
+from qagents import Agent, RunContext, TeamMailbox, tool
+from qagents.models.testing import ScriptedModel, call
+
+
+async def main() -> str:
+    mailbox = TeamMailbox(["coordinator", "researcher", "reviewer"])
+    coordinator = mailbox.endpoint("coordinator")
+    researcher = Agent(
+        ScriptedModel(
+            [
+                call("receive_messages", wait_s=3),
+                call("send_message", recipient="reviewer", text="Journal shows one refund."),
+                "Evidence sent.",
+            ]
+        ),
+        name="researcher",
+        tools=mailbox.endpoint("researcher").tools(),
+    )
+    reviewer = Agent(
+        ScriptedModel(
+            [
+                call("receive_messages", wait_s=3),
+                call("send_message", recipient="coordinator", text="Verified one refund."),
+                "Review complete.",
+            ]
+        ),
+        name="reviewer",
+        tools=mailbox.endpoint("reviewer").tools(),
+    )
+
+    @tool
+    async def coordinate(ctx: RunContext) -> str:
+        """Ask both specialists to review a test payment."""
+        async with asyncio.TaskGroup() as group:
+            group.create_task(researcher.run("Collect the evidence.", parent=ctx))
+            group.create_task(reviewer.run("Review the evidence.", parent=ctx))
+        return "Both specialists finished."
+
+    lead = Agent(
+        ScriptedModel(
+            [
+                call("send_message", recipient="researcher", text="Check the destination ledger."),
+                call("coordinate"),
+                call("receive_messages"),
+                "The specialist review is complete.",
+            ]
+        ),
+        name="coordinator",
+        tools=[coordinate, *coordinator.tools()],
+    )
+    result = await lead.run("Check the refund.")
+    (answer,) = [
+        part.content
+        for message in result.messages
+        for part in message.tool_results
+        if part.name == "receive_messages"
+    ]
+    return answer
+
+
+if __name__ == "__main__":
+    print(asyncio.run(main()))
+```
+
+The researcher receives a request from the coordinator, sends evidence
+to the reviewer, and the reviewer replies to the coordinator. The child
+runs use `parent=ctx` to share the coordinator's run limits.
+
+Each inbox holds up to 64 messages by default. A full inbox returns a
+tool error. A receive takes messages in arrival order and can wait for up
+to 30 seconds. Use one mailbox per team execution. Messages live in
+process memory and expire when the application discards that mailbox.
+
 ---
 
 <!-- page: concepts/external-agents.md | concepts/external-agents/ -->
@@ -2043,8 +2133,7 @@ the agent. The example checks that the destination contains one credit.
 python -m examples.recover_credit --directory work/credit-recovery-demo
 ```
 
-Use a fresh directory for each run. The example runs on the Effects
-development branch. In an application, verify the destination record against
+Use a fresh directory for each run. The example uses the Effects runtime. In an application, verify the destination record against
 the business identity and amount, then supply the authenticated operator's
 identity to `Settle.committed()`.
 
@@ -2195,6 +2284,115 @@ coverage or provider evidence is incomplete. A strict run requires
 exercise through the client transport and evidence for destination
 assumptions. The in-process harness uses a virtual clock. The Gym
 benchmark measures real worker termination on the local machine.
+
+## Run with a fresh worker process
+
+An importable factory can also run in a new interpreter on each leg.
+Use SQLite for the journal and pass an offline script or cassette. The
+parent owns the destination and terminates the worker before replying at
+the selected boundary.
+
+```console
+qagents crashtest my_fixture:build "Credit DEMO-1" --cassette fixture.json \
+  --store sqlite --isolation subprocess --transport client \
+  --faults kill_before,kill_after,recovery_kill,commit_then_crash,commit_then_lose_response,advance_boundaries \
+  --points all-raw --json subprocess-results.json
+```
+
+Subprocess factories and custom scenarios must be importable by module
+name. Define request and receipt types and simulated client classes at
+module scope so both processes can resolve them. `env.service(...)`
+provides the worker with a proxy to the parent-owned fake. The worker
+uses the supplied offline model and receives a minimal environment.
+Use trusted fixture code, as worker processes still have the application's
+filesystem and network access. Freeze-and-thaw faults use in-process
+isolation because they require a surviving worker.
+
+Run a worker against a simulated Stripe refund with no credentials.
+The destination commits the refund and the harness terminates the
+worker before it receives the receipt. A fresh worker replays the
+same key and the destination records one application.
+
+```console
+python -m examples.subprocess_refund
+```
+
+The command writes `refund-recovery.json` and prints the selected point's
+verdict. The report also shows any gaps in the broader coverage.
+
+```python
+"""Recover a simulated refund after terminating the worker that submitted it."""
+
+import asyncio
+from pathlib import Path
+
+from pydantic import BaseModel
+
+from qagents import Agent, RunContext, tool
+from qagents.effects import Attempt, Dedupe, EffectContext, Key, effect
+from qagents.models.testing import call
+from qagents.testing.crash import CrashEnv, FakeStripeRefunds, Faults, crash_test
+
+
+class RefundRequest(BaseModel):
+    payment: str
+
+
+class RefundReceipt(BaseModel):
+    id: str
+
+
+@effect(
+    "stripe.refund",
+    key=Key("payment", "payment"),
+    dedupe=Dedupe(120, contract="simulated refund key", concurrent="rejects", margin_s=0.1),
+    timeout_s=1,
+)
+async def send(ctx: EffectContext, attempt: Attempt[RefundRequest]) -> RefundReceipt:
+    refund = await ctx.deps.create_refund(
+        charge=attempt.request.payment,
+        amount=100,
+        idempotency_key=attempt.idempotency_key,
+    )
+    return RefundReceipt(id=refund.id)
+
+
+@tool(effects=[send])
+async def refund_payment(ctx: RunContext, payment: str) -> str:
+    """Refund one euro from the simulated payment."""
+    receipt = await ctx.perform(send, RefundRequest(payment=payment))
+    return receipt.id
+
+
+def build(env: CrashEnv):
+    return Agent(env.model, tools=[refund_payment]), env.service(send, FakeStripeRefunds)
+
+
+async def main() -> None:
+    # Import the same named module the new interpreters will load.
+    from examples.subprocess_refund import build
+
+    report = await crash_test(
+        build,
+        "Refund one euro on ch_A.",
+        model=[call("refund_payment", payment="ch_A"), "Refund complete."],
+        faults=Faults.parse("commit_then_crash"),
+        points="effects",
+        isolation="subprocess",
+        transport="client",
+    )
+    await asyncio.to_thread(
+        Path("refund-recovery.json").write_text, report.to_json(), encoding="utf-8"
+    )
+    point = next(item for item in report.points if item.execution.triggered)
+    print(report.explain(point.id))
+    if point.verdict != "safe":
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
 
 ## Test the recovery boundaries
 
@@ -6975,6 +7173,24 @@ SUBAGENT_TOO_DEEP = (
 
 SUBAGENT_TASK_DESCRIPTION = "The complete task, self-contained."
 """Description of the ``task`` parameter of an agent exposed with ``agent.as_tool()``."""
+
+TEAM_SEND_DESCRIPTION = "Send text to a named teammate or the coordinator."
+"""Description of a team endpoint's message-sending tool."""
+
+TEAM_RECEIVE_DESCRIPTION = "Read your inbox. Set wait_s to wait for a message."
+"""Description of a team endpoint's inbox tool."""
+
+TEAM_UNKNOWN_MEMBER = "Unknown teammate {member!r}."
+"""Sent back when a tool names an unregistered message recipient."""
+
+TEAM_TEXT_LIMIT = "Team message must contain 1 to {limit} characters."
+"""Sent back when a message body is empty or exceeds the team's configured limit."""
+
+TEAM_INBOX_FULL = "Inbox for {member!r} is full."
+"""Sent back when a recipient must drain their inbox before accepting more messages."""
+
+TEAM_RECEIVE_LIMIT = "Use wait_s between 0 and 30 and a limit between 1 and 64."
+"""Sent back when an inbox request exceeds the supported wait or batch size."""
 
 FAN_OUT_DESCRIPTION = (
     "{description}\n\n"

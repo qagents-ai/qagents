@@ -101,6 +101,10 @@ def _point_checks(raw, reference, user, max_legs, expect):
                     (Finding("I5", kind, "A conflicting approval answer was accepted."),),
                 )
             )
+        if kind == "unexpected_failure":
+            values.append(
+                Check("harness", "violated", (Finding("harness", kind, diagnostic["detail"]),))
+            )
         if kind == "unsafe_held_delivery":
             values.append(Check("I12", "violated", (Finding("I12", kind, diagnostic["detail"]),)))
         if kind in {"a2_violation", "post_seal_mutation", "shared_between_legs", "swallowed_hold"}:
@@ -168,6 +172,7 @@ class CrashReport:
         mode,
         store,
         reproduction=None,
+        isolation="inprocess",
     ):
         self._reproduction = reproduction
         self._reference = executions[0]
@@ -228,6 +233,7 @@ class CrashReport:
         self.fault_model = [
             *not_exercised,
             f"checked against {len(self.points)} points; {mode} mode, virtual clock, {store} store",
+            f"worker isolation: {isolation}",
             f"triggered faults: {', '.join(sorted(observed_faults)) or 'none'}",
         ]
         if missing := requested_faults - observed_faults:

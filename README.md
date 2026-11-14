@@ -191,7 +191,7 @@ Provider marks remain the property of their owners and do not imply endorsement.
 | Persistent conversations | `Session`, `SQLiteStore`, `PostgresStore` | [Sessions](docs/concepts/sessions.md) |
 | Scoped application memory | `RunContext.state`, application-selected session identity | [Memory example](examples/scoped_memory.py) |
 | Background recovery | `AgentRuntime`, leases, `recover()` | [Serving](docs/serving.md) |
-| Specialist teams | Sub-agents, handoffs, `fan_out`, `route` | [Multi-agent patterns](docs/concepts/multi-agent.md) |
+| Specialist teams | Sub-agents, team messaging, handoffs, `fan_out`, `route` | [Multi-agent patterns](docs/concepts/multi-agent.md) |
 | Resumable workflows | `Workflow.step`, `Workflow.run_agent` | [Workflow API](docs/reference/workflow.md) |
 | Streaming applications | `agent.stream()`, typed events, AG-UI | [Streaming](docs/concepts/streaming.md) |
 | External coding agents | ACP, Devvi, MCP tool serving | [External agents](docs/concepts/external-agents.md) |

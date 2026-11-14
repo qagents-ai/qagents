@@ -270,6 +270,12 @@ class World:
         if self.mode == "exception":
             raise LegCrashed(f"leg-{leg}")
 
+    def cancel_driver(self, leg: int) -> None:
+        task = self.legs[leg].task
+        if task is None:
+            raise RuntimeError("cancel_during requires a leg run task")
+        task.cancel()
+
     def thaw(self, leg: int) -> None:
         state = self.legs[leg]
         if not state.frozen:

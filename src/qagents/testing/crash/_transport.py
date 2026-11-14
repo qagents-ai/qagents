@@ -90,7 +90,10 @@ class HarnessTransport:
         return (
             effect.key_spec_digest,
             effect.request_schema_digest,
-            digest(effect.receipt_type.model_json_schema()),
+            digest(
+                getattr(effect, "_worker_receipt_schema", None)
+                or effect.receipt_type.model_json_schema()
+            ),
             effect.dedupe,
             effect.version,
             effect.applies_within_s,

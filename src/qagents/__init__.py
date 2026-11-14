@@ -94,6 +94,7 @@ from .session import (
     SessionStore,
     SQLiteStore,
 )
+from .team import TeamEndpoint, TeamMailbox, TeamMessage
 from .tools import RunContext, Tool, Toolkit, ToolTimeout, tool
 from .workflow import Workflow, WorkflowStatus
 
@@ -205,6 +206,9 @@ __all__ = [
     "ToolResultClearing",
     "ToolResultPart",
     "ToolTimeout",
+    "TeamMailbox",
+    "TeamEndpoint",
+    "TeamMessage",
     "Toolkit",
     "TrippedGuardrail",
     "Usage",

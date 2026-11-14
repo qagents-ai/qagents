@@ -134,3 +134,28 @@ if result.status == "paused":
 
 What is guaranteed: a step that finished never runs again. A plain `step` that was in progress
 when the process died runs again from its start, so make side-effecting steps idempotent.
+
+
+## Send messages between teammates
+
+Use a `TeamMailbox` for a team that needs to exchange information while
+its child runs are active. Register a unique name for each participant.
+Give each agent the tools from its own endpoint. The trusted host binds
+the sender identity, and each endpoint reads its own inbox.
+
+```console
+python -m examples.team_messages
+```
+
+```python
+--8<-- "examples/team_messages.py"
+```
+
+The researcher receives a request from the coordinator, sends evidence
+to the reviewer, and the reviewer replies to the coordinator. The child
+runs use `parent=ctx` to share the coordinator's run limits.
+
+Each inbox holds up to 64 messages by default. A full inbox returns a
+tool error. A receive takes messages in arrival order and can wait for up
+to 30 seconds. Use one mailbox per team execution. Messages live in
+process memory and expire when the application discards that mailbox.

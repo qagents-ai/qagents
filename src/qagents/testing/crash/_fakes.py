@@ -445,11 +445,8 @@ class ContractFake:
             controller.hit(fault)
             await asyncio.sleep(delay_to_arrival)
         elif kind == "cancel_during":
-            task = self.world.legs[leg].task
-            if task is None:
-                raise RuntimeError("cancel_during requires a leg run task")
             controller.hit(fault)
-            task.cancel()
+            self.world.cancel_driver(leg)
 
         async def before() -> Any:
             if kind in {"reject", "rejected_on", "fail_before_commit"}:
