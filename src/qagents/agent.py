@@ -37,6 +37,7 @@ import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar
+from dataclasses import replace
 from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, create_model
@@ -45,13 +46,17 @@ from pydantic_core import PydanticSerializationError, to_jsonable_python
 from . import prompts
 from . import session as _session
 from .context import Compactor
+from .effects import _canonical, _engine, _kinds, _operator, _ports
 from .effects._declare import Effect
-from .effects._types import EffectRecord, HeldEffect, Settle
+from .effects._types import HOLD_DETAIL, MISSING, EffectRecord, HeldEffect, HoldReason, Settle
 from .errors import (
     ApprovalTokenError,
     ConfigurationError,
     DeferToolCall,
+    EffectHeld,
     GuardrailTripped,
+    HeldEffectsError,
+    JournalOutcomeUnknown,
     LeaseError,
     MaxDepthExceeded,
     ModelError,
@@ -91,7 +96,7 @@ from .models.base import (
     ToolSpec,
     resolve_model,
 )
-from .permissions import Approval, InputResult, Permissions
+from .permissions import Approval, InputResult, Permissions, arguments_digest, tool_spec_digest
 from .results import GuardrailStage, RunResult, RunStatus, TrippedGuardrail
 from .session import (
     Entry,
@@ -118,7 +123,9 @@ logger = logging.getLogger("qagents")
 
 
 def _effects_child_refusal(agent: Agent, *, durable_session: bool) -> str | None:
-    """Frozen composition-check entry point; the guard is added by the loop owner."""
+    """Effects children need their own durable session and writer."""
+    if not durable_session and agent.effects_by_name():
+        return f"Effects agent {agent.name!r} needs a separate durable session."
     return None
 
 
@@ -132,6 +139,14 @@ def _store_root(store: SessionStore) -> SessionStore:
         seen.add(id(store))
         store = store.wrapped
     return store
+
+
+def _forget_store(store: SessionStore) -> None:
+    """Remove the process-local run entries for the harness's disposed store."""
+    root = _store_root(store)
+    for key, (candidate, _) in list(_LIVE_RUNS.items()):
+        if candidate is root:
+            _LIVE_RUNS.pop(key, None)
 
 
 T = TypeVar("T")
@@ -383,6 +398,10 @@ class Agent:
         """Agents this one may hand the conversation to; change it to connect agents
         both ways. Names must stay unique among the agents reachable through handoffs."""
         self.compactor = compactor
+        self._check_effect_tools(item for item in self.tools if isinstance(item, Tool))
+        for target in self.handoffs:
+            if refusal := _effects_child_refusal(target, durable_session=False):
+                raise ConfigurationError(refusal)
         self._output_adapter: TypeAdapter[Any] | None = None
         self._output_schema: dict[str, Any] | None = None
         self._native_schema: dict[str, Any] | None = None
@@ -410,13 +429,56 @@ class Agent:
     # -- running ---------------------------------------------------------------
 
     async def settle(self, session: Session, answer: Settle, *, deps: Any = None) -> EffectRecord:
-        raise NotImplementedError("Effect settlement is pending operator integration.")
+        """Settle a held operation using an attributed decision under the session lease."""
+        return await _operator.settle(
+            session,
+            answer,
+            effects=self._effect_map((await self._collect_tools()).values()),
+            permissions=self.permissions,
+            deps=MISSING if deps is None else deps,
+            lease_ttl_s=self.lease_ttl_s,
+            worker="qagents-settle",
+        )
 
     async def recheck(self, session: Session, *, deps: Any = None) -> list[HeldEffect]:
-        raise NotImplementedError("Effect recheck is pending operator integration.")
+        """Look up held effects under the session lease without sending them."""
+        return await _operator.recheck(
+            session,
+            effects=self._effect_map((await self._collect_tools()).values()),
+            permissions=self.permissions,
+            deps=MISSING if deps is None else deps,
+            lease_ttl_s=self.lease_ttl_s,
+            worker="qagents-recheck",
+        )
 
     def effects_by_name(self) -> dict[str, Effect]:
-        raise NotImplementedError("Effect enumeration is pending runtime integration.")
+        """Return the declarations on statically known tools."""
+        return self._effect_map(item for item in self.tools if isinstance(item, Tool))
+
+    @staticmethod
+    def _effect_map(tools: Iterable[Tool]) -> dict[str, Effect]:
+        declarations = {}
+        for tool in tools:
+            for effect in tool.effects:
+                if declarations.setdefault(effect.name, effect) is not effect:
+                    raise ConfigurationError(
+                        f"Two declarations use the effect name {effect.name!r}."
+                    )
+        return declarations
+
+    def _check_effect_tools(self, tools: Iterable[Tool], *, limits: Limits | None = None) -> None:
+        limits = limits or self.limits
+        for tool in tools:
+            if not tool.effects:
+                continue
+            timing = _ports.Timing.for_lease(self.lease_ttl_s, 1.0, effects=True)
+            timeout = tool.timeout if tool.timeout is not None else limits.tool_timeout_s
+            for warning in _engine.check_declarations(
+                tool.effects,
+                timing=timing,
+                tool_timeout_s=timeout,
+            ):
+                logger.warning("%s: %s", tool.name, warning)
 
     def stream(
         self,
@@ -476,7 +538,7 @@ class Agent:
             _Run(
                 self, prompt=prompt, deps=deps, session=session, history=history,
                 limits=limits, settings=settings, approvals=None, results=None,
-                state=state, parent=parent, resume=False,
+                state=state, parent=parent, resume=False, if_held_effects=if_held_effects,
             )
         )  # fmt: skip
 
@@ -501,7 +563,7 @@ class Agent:
         """
         stream = self.stream(
             prompt, deps=deps, session=session, history=history, limits=limits,
-            settings=settings, state=state, parent=parent,
+            settings=settings, state=state, parent=parent, if_held_effects=if_held_effects,
         )  # fmt: skip
         return await stream.wait()
 
@@ -654,6 +716,8 @@ class Agent:
                 is often too short for an agent.
         """
         agent = self
+        if refusal := _effects_child_refusal(agent, durable_session=False):
+            raise ConfigurationError(refusal)
 
         async def delegate(ctx: RunContext[Any], task: str) -> str:
             try:
@@ -727,6 +791,8 @@ class Agent:
             "hooks": list(self.hooks),
             "handoffs": list(self.handoffs),
             "compactor": self.compactor,
+            "lease_ttl_s": self.lease_ttl_s,
+            "build_id": self.build_id,
         }
         unknown = sorted(set(changes) - set(current))
         if unknown:
@@ -932,11 +998,16 @@ class _Run:
         state: Mapping[str, Any] | None,
         parent: RunContext[Any] | None,
         resume: bool,
+        if_held_effects: Literal["raise", "continue"] = "raise",
     ) -> None:
         self.root = agent
         self.agent = agent
         self.run_id = uuid.uuid4().hex
         self.session = session or Session()
+        self._session_given = session is not None
+        if if_held_effects not in {"raise", "continue"}:
+            raise ConfigurationError("if_held_effects must be 'raise' or 'continue'.")
+        self.if_held_effects = if_held_effects
         self.deps = deps
         self.prompt = prompt
         self.seed = list(history) if history is not None else []
@@ -1072,7 +1143,17 @@ class _Run:
         self._start_events: list[Event] = []
         """Events of journal entries written while the run was prepared."""
         self._claimed: tuple[int, str] | None = None
-        self._lease_owner: str | None = None
+        self._writer: _session.LeasedWriter | None = None
+        self._owns_writer = False
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._effects: dict[str, Effect] = {}
+        self._replay_state = SessionState()
+        self._held_calls: dict[str, HeldEffect] = {}
+        self._scopes: dict[str, _ports.CallScope] = {}
+        self._authorizations: dict[str, _ports.Authorization] = {}
+        self._unknown_results: set[str] = set()
+        self._committed_state: dict[str, Any] = {}
+        self._legacy_pause_tokens = False
         self._lease_task: asyncio.Task[None] | None = None
         self._cancel = asyncio.Event()
         self._cancel_reason: str | None = None
@@ -1152,6 +1233,7 @@ class _Run:
         timer: asyncio.TimerHandle | None = None
         result: RunResult | None = None
         try:
+            self._loop = asyncio.get_running_loop()
             self._inherit_limits()
             if self.parent_run is not None:  # its spend counts against the parent's budget, live
                 self.parent_run._children.append(self)
@@ -1262,7 +1344,10 @@ class _Run:
         """Journal ``run_failed`` for an open run that raised, then report it to the hooks."""
         if self._journal_open and not self._closed:
             with contextlib.suppress(Exception):
-                await self._journal("run_failed", _failure_data(error))
+                data = _failure_data(error)
+                if isinstance(error, HeldEffectsError) and error.retry_after is not None:
+                    data["retry_after"] = error.retry_after.timestamp()
+                await self._journal("run_failed", data)
         await self._report_end(error)
 
     async def _report_end(self, error: BaseException) -> None:
@@ -1288,7 +1373,8 @@ class _Run:
         """
         await self.session._resolve()
         store, session_id = self.session.store, self.session.id
-        key = (id(store), session_id)
+        root = _store_root(store)
+        key = (id(root), session_id)
         live = _LIVE_RUNS.get(key)
         if live is not None:
             raise SessionError(
@@ -1297,54 +1383,52 @@ class _Run:
                 "cancel it. A stream you stopped reading early must be closed first "
                 "(`async with stream:` or `await stream.aclose()`)."
             )
-        _LIVE_RUNS[key] = (store, self)
+        _LIVE_RUNS[key] = (root, self)
         self._claimed = key
-        if _fenced_by_runtime(store) or _append_overridden_alone(store):
+        if _fenced_by_runtime(store):
+            self._writer = getattr(store, "writer", None)
             return
-        owner = _session._owner_token("qagents-run")
-        try:
-            held = await store.acquire_lease(session_id, owner, RUN_LEASE_TTL_S)
-        except NotImplementedError:
-            return  # a store without leases: only this process is guarded
-        if not held:
+        if _append_overridden_alone(store):
+            return
+        ttl = self.root.lease_ttl_s
+        if not self.root.effects_by_name() and ttl == 30:
+            ttl = RUN_LEASE_TTL_S
+        writer = _session.LeasedWriter(
+            store,
+            session_id,
+            worker="qagents-run",
+            ttl_s=ttl,
+            purpose="recovery" if self.resume else "run",
+            journal_acquisition=True if self.root.effects_by_name() else None,
+        )
+        if not await writer.open():
             raise SessionError(
                 f"Session {session_id!r} has a run in progress elsewhere: another process or "
                 "worker holds its lease. Wait for that run to stop. If its process died, the "
-                f"lease expires within {RUN_LEASE_TTL_S:g} seconds (AgentRuntime.recover then "
+                f"lease expires within {ttl:g} seconds (AgentRuntime.recover then "
                 "takes the run over)."
             )
-        self._lease_owner = owner
-        self._lease_task = asyncio.create_task(self._keep_lease())
-
-    async def _keep_lease(self) -> None:
-        assert self._lease_owner is not None
-        while True:
-            await asyncio.sleep(RUN_LEASE_TTL_S / 3)
-            try:
-                held = await self.session.store.renew_lease(
-                    self.session.id, self._lease_owner, RUN_LEASE_TTL_S
-                )
-            except Exception:
-                logger.warning("Could not renew the lease of run %s; retrying", self.run_id)
-                continue
-            if not held:
-                logger.error("Run %s lost the lease on session %r", self.run_id, self.session.id)
-                self.cancel("lease_lost")  # interrupt active work, not just its next write
-                return
+        self._writer = writer
+        self._owns_writer = True
+        if writer.leased:
+            self._lease_task = asyncio.create_task(
+                writer.keep(on_lost=lambda _: self.cancel("lease_lost"))
+            )
 
     async def _unclaim(self) -> None:
-        if self._lease_task is not None:
-            self._lease_task.cancel()
-            self._lease_task = None
-        if self._lease_owner is not None:
-            owner, self._lease_owner = self._lease_owner, None
-            try:
-                await self.session.store.release_lease(self.session.id, owner)
-            except Exception:
-                logger.warning("Could not release the lease of run %s; it expires", self.run_id)
-        if self._claimed is not None and _LIVE_RUNS.get(self._claimed, (None, None))[1] is self:
-            del _LIVE_RUNS[self._claimed]
-        self._claimed = None
+        try:
+            if self._lease_task is not None:
+                self._lease_task.cancel()
+                self._lease_task = None
+            if self._owns_writer and self._writer is not None:
+                try:
+                    await self._writer.close()
+                except Exception:
+                    logger.warning("Could not release the lease of run %s; it expires", self.run_id)
+        finally:
+            if self._claimed is not None and _LIVE_RUNS.get(self._claimed, (None, None))[1] is self:
+                del _LIVE_RUNS[self._claimed]
+            self._claimed = None
 
     async def _steps(self) -> AsyncIterator[Event]:
         """Advance the conversation until the run answers, pauses or stops.
@@ -1362,6 +1446,10 @@ class _Run:
                 # repeating them is not safe, of unknown outcome.
                 for event in await self._settle_open_calls(prompts.TOOL_NOT_EXECUTED):
                     yield event
+                if self._held_calls:
+                    self.status, self.stop_reason = "paused", "effect_held"
+                    self.inputs = list(self.waiting.values())
+                    return
                 if self._cancel_reason == "timeout":
                     self.status, self.stop_reason = "limit_reached", "timeout"
                 else:
@@ -1383,6 +1471,8 @@ class _Run:
                     continue  # the top of the loop settles the calls and reports the stop
                 if self.pending or self.inputs:
                     self.status = "paused"
+                    if any(item.held_record_id for item in self.inputs):
+                        self.stop_reason = "effect_held"
                     return
                 if self._tool_limit_hit:
                     self.status, self.stop_reason = "limit_reached", "max_tool_calls"
@@ -1463,7 +1553,7 @@ class _Run:
             cost = limits.max_cost_usd if unknown else spent.cost_usd or 0.0
             remaining["max_cost_usd"] = limits.max_cost_usd - cost
         remaining["timeout_s"] = (
-            None if self._deadline is None else self._deadline - time.monotonic()
+            None if self._deadline is None else self._deadline - self._loop.time()
         )
         if self.parent_run is not None:
             for key, value in self.parent_run._remaining().items():
@@ -1475,14 +1565,24 @@ class _Run:
         timeout = self.limits.timeout_s
         if timeout is None:
             return None
-        self._deadline = time.monotonic() + timeout
+        self._deadline = self._loop.time() + timeout
         if timeout <= 0:  # a child whose parent has no time left
             self.cancel("timeout")
             return None
-        return asyncio.get_running_loop().call_later(timeout, self.cancel, "timeout")
+        return self._loop.call_later(timeout, self.cancel, "timeout")
 
     async def _prepare(self) -> None:
-        state = await self.session.state()
+        if self._writer is None:
+            state = await self.session.state()
+        else:
+            state = _session.derive_state(await self._writer.load(), session_id=self.session.id)
+        self._replay_state = state
+        self._committed_state = copying.deepcopy(state.values)
+        self._held_calls = {
+            item.tool_call_id: item
+            for item in state.effects.held(self.session.id)
+            if item.tool_call_id is not None
+        }
         self.history = list(state.messages)
         self.results = dict(state.tool_results)
         self.started = set(state.started_tools)
@@ -1495,6 +1595,9 @@ class _Run:
         if self.resume:
             await self._prepare_resume(state)
             return
+        held = state.effects.held(self.session.id)
+        if held and self.if_held_effects == "raise":
+            raise HeldEffectsError(held)
         self.checkpoints = {}  # a new run repeats no call of the run it closes
         self.journaled_usage = {}
 
@@ -1508,6 +1611,10 @@ class _Run:
         self._check_agent_names()
         await self._load_agent()
         started: dict[str, Any] = {"agent": self.root.name}
+        if self._effects:
+            started.update(self._effects_run_fields())
+        if held:
+            started["kept_held"] = [item.id for item in held]
         if self.parent is not None:
             started.update(
                 parent_run_id=self.parent.run_id,
@@ -1529,7 +1636,8 @@ class _Run:
             # A previous run may have stopped with tool calls still open (crashed,
             # or paused for approvals and inputs). Close them so the conversation
             # stays valid for the provider.
-            await self._settle_open_calls(prompts.TOOL_NOT_EXECUTED)
+            await self._settle_open_calls(prompts.TOOL_NOT_EXECUTED, replacing=True)
+            self._held_calls.clear()
             if self.prompt is not None:
                 message = _as_message(self.prompt)
                 # A blocked prompt never joins the conversation; the run ends as "blocked".
@@ -1545,6 +1653,16 @@ class _Run:
                 "Start a new one with agent.run()."
             )
         self.run_id = state.open_run_id
+        requires = set(state.run_requires.get(self.run_id, ()))
+        self._legacy_pause_tokens = _kinds.REQUIRES_APPROVALS not in requires and not any(
+            "approval_id" in data for data in state.decisions.values()
+        )
+        if unsupported := requires - _kinds.SUPPORTED_REQUIRES:
+            raise ConfigurationError(
+                f"This run requires unsupported features: {sorted(unsupported)}."
+            )
+        if _kinds.REQUIRES_EFFECTS in requires and self._writer is None:
+            raise ConfigurationError("Resuming Effects requires a fenced journal writer.")
         self._ordinal = state.run_messages
         paused = bool(state.pending_approvals or state.pending_inputs)
         try:
@@ -1569,6 +1687,14 @@ class _Run:
         self.approvals = {key: value for key, value in self.approvals.items() if key in open_calls}
         self._check_tokens(state)
         self._journal_open = True
+        if self._effects:
+            # A run can be paused with a legacy token. Verify that token before
+            # upgrading the journal and use v3 for every subsequent ask.
+            await self._journal(
+                _kinds.KIND_RUN_RESUMED,
+                {**self._effects_run_fields(), "worker": self._writer.worker},
+            )
+            self._legacy_pause_tokens = False
         self.usage, self.turn = state.run_usage, state.run_turns
         # A call that waited for approval has not been allowed to run yet: it is counted
         # when an approval lets it run (journals list paused calls among the counted ones).
@@ -1620,6 +1746,26 @@ class _Run:
 
     async def _load_agent(self) -> None:
         self.tools = await self.agent._collect_tools()
+        self._effects = self.agent._effect_map(self.tools.values())
+        if self._effects:
+            if not self._session_given or self.agent is not self.root:
+                raise ConfigurationError("Effects tools require an explicit, separate session.")
+            if self._writer is None or not self._writer.leased:
+                raise ConfigurationError("Effects tools require a fenced session writer.")
+            self.agent._check_effect_tools(self.tools.values(), limits=self.limits)
+            self._writer._journal_acquisition = True
+            timing = _ports.Timing.for_lease(
+                self._writer.lease.ttl_s,
+                self._writer.store.takeover_grace_s,
+                effects=True,
+            )
+            self._writer.timing = self._writer.lease.timing = timing
+            await _engine.check_run_start(
+                list(self._effects.values()),
+                store=self._writer.store,
+                deps=MISSING if self.deps is None else self.deps,
+                session_id=self.session.id,
+            )
         self.handoffs = {target._handoff_tool_name: target for target in self.agent.handoffs}
         clash = set(self.tools) & set(self.handoffs)
         if clash:
@@ -1632,6 +1778,19 @@ class _Run:
                 f"Agent {self.agent.name!r}: the final-answer tool {answer!r} has the name of "
                 "another tool. Choose a different output_tool_name."
             )
+
+    def _effects_run_fields(self) -> dict[str, Any]:
+        return {
+            "requires": [_kinds.REQUIRES_EFFECTS, _kinds.REQUIRES_APPROVALS],
+            "agent_config_digest": _canonical.digest(
+                {
+                    "agent": self.agent.name,
+                    "tools": sorted(tool_spec_digest(tool) for tool in self.tools.values()),
+                }
+            ),
+            "build_id": self.agent.build_id,
+            "epoch": self._writer.lease.epoch,
+        }
 
     async def _check_guardrails(self, stage: GuardrailStage, value: Any) -> TrippedGuardrail | None:
         """Run the guardrails of ``stage`` in order; journal and return the first trip.
@@ -1731,7 +1890,9 @@ class _Run:
         """Fail before anything runs when ``results`` names a call that waits for no result."""
         last = self.history[-1]
         approvals = {item.tool_call_id for item in state.pending_approvals}
-        accepted = set(self.waiting)
+        accepted = {
+            call_id for call_id, item in self.waiting.items() if item.held_record_id is None
+        }
         for call in last.tool_calls if last.role == "assistant" else []:
             tool = self.tools.get(call.name)
             if call.id in self.results or call.id in approvals:
@@ -1803,7 +1964,7 @@ class _Run:
     ) -> dict[str, Any]:
         """What the token of a pause of this run signs (see `approval_token`)."""
         is_input = isinstance(pause, PendingInput)
-        return {
+        fields = {
             "session_id": self.session.id,
             "run_id": self.run_id,
             "position": self._ordinal,  # the call's assistant message is the run's last one
@@ -1814,6 +1975,14 @@ class _Run:
             "reason": pause.reason if is_input else None,
             "metadata": pause.metadata if is_input else None,
         }
+        if self._effects:
+            call_id = fields["tool_call_id"]
+            operation_id = self._operation_id(call_id)
+            fields["operation_id"] = operation_id
+            fields["ask"] = 1 + self._replay_state.decision_counts.get(operation_id, 0)
+            if self._legacy_pause_tokens:
+                fields["v"] = 2
+        return fields
 
     def _verify_token(
         self,
@@ -1896,9 +2065,7 @@ class _Run:
             text: list[str] = []
             emitted = False
             try:
-                async with contextlib.aclosing(
-                    self._until_cancelled(model.stream(request))
-                ) as events:
+                async with contextlib.aclosing(self._model_events(model, request)) as events:
                     async for event in events:
                         if isinstance(event, ResponseDone):
                             response = event.response
@@ -1980,6 +2147,23 @@ class _Run:
         yield ModelResponded(response=response, agent=self.agent.name)
         for event in settled:
             yield event
+
+    async def _model_events(self, model: Model, request: ModelRequest) -> AsyncIterator[Any]:
+        # Reset before yielding to the caller; an async iterator can be resumed by
+        # another task, and tool/compaction calls must not inherit this logical turn.
+        stream = self._until_cancelled(model.stream(request))
+        async with contextlib.aclosing(stream):
+            while True:
+                token = _ports.MODEL_TURN.set(
+                    _ports.ModelTurn(self.session.id, self.run_id, self.turn - 1)
+                )
+                try:
+                    event = await anext(stream)
+                except StopAsyncIteration:
+                    return
+                finally:
+                    _ports.MODEL_TURN.reset(token)
+                yield event
 
     async def _build_request(self, ctx: RunContext[Any]) -> ModelRequest:
         agent = self.agent
@@ -2182,6 +2366,8 @@ class _Run:
         runs. The run pauses when any call waits.
         """
         calls = assistant.tool_calls
+        if len({call.id for call in calls}) != len(calls):
+            raise ConfigurationError("The model returned duplicate tool call ids in one turn.")
         prior = next(
             (
                 c
@@ -2237,7 +2423,7 @@ class _Run:
                     yield updated
                 yield ToolCallFinished(call=call, result=result, agent=self.agent.name)
                 continue
-            if call.id in self.waiting:
+            if call.id in self.waiting and self.waiting[call.id].held_record_id is None:
                 continue  # authorised earlier; only results= can answer it
             refusal: str | None = None
             if call.parse_error is not None:
@@ -2269,12 +2455,32 @@ class _Run:
                 continue  # stopped: ask no one, run nothing; the loop settles the call
             else:
                 tool = self.tools[call.name]
-                if call.id in self.started and not (tool.read_only or tool.idempotent):
+                if call.id in self.started and not (
+                    tool.read_only or tool.idempotent or tool.effects
+                ):
                     refusal = prompts.TOOL_INTERRUPTED.format(name=call.name)
                 elif (invalid := _invalid_arguments(tool, call)) is not None:
                     refusal = invalid  # before anyone is asked to approve the call
                 else:
-                    verdict, payload = await self._authorize(tool, call)
+                    if tool.effects and self._has_intent(call.id):
+                        held = self._held_calls.get(call.id)
+                        if held is not None and _engine.send_running(
+                            self._writer.store, self.session.id, held.id
+                        ):
+                            if call.id not in self.waiting:
+                                await self._defer_hold(call, held)
+                            continue
+                        prior = self._approval_record(call.id)
+                        if prior is not None and prior.arguments_changed:
+                            call = call.model_copy(
+                                update={
+                                    "arguments": prior.arguments,
+                                    "raw_arguments": None,
+                                }
+                            )
+                        verdict, payload = "run", call
+                    else:
+                        verdict, payload = await self._authorize(tool, call)
                     if self._cancel.is_set() and verdict in ("run", "pending"):
                         continue  # stopped while it was decided: the loop settles the call
                     if verdict == "run" and call.id in self._edited:
@@ -2379,7 +2585,23 @@ class _Run:
             return "deny", decision.reason or prompts.PERMISSION_REASON_DEFAULT
         if approval is None:
             if decision.behavior == "allow":
+                if tool.effects:
+                    self._authorizations[call.id] = _ports.Authorization("allow")
                 return "run", call
+            if tool.effects and (prior := self._approval_record(call.id)) is not None:
+                args = prior.arguments if prior.arguments_changed else call.arguments
+                if (
+                    prior.approved
+                    and args is not None
+                    and self.permissions.verify_decision(prior)
+                    and prior.tool_spec_digest == tool_spec_digest(tool)
+                    and prior.arguments_digest == arguments_digest(args)
+                    and await self._writer.store_now() <= prior.expires_at
+                ):
+                    reused = call.model_copy(update={"arguments": args, "raw_arguments": None})
+                    if (await self.permissions.decide(ctx, tool, reused)).behavior != "deny":
+                        self._authorizations[call.id] = self._approval_auth(prior)
+                        return "run", reused
             if self.permissions.on_ask is None:
                 if not can_pause:
                     return "deny", prompts.TOOL_SERVER_NO_APPROVER
@@ -2414,7 +2636,33 @@ class _Run:
         }
         if edited:
             record["arguments"] = approval.arguments
+        if tool.effects:
+            approved_call = (
+                call.model_copy(update={"arguments": approval.arguments}) if edited else call
+            )
+            operation_id = self._operation_id(call.id)
+            try:
+                signed = self.permissions.decision_record(
+                    session_id=self.session.id,
+                    run_id=self.run_id,
+                    operation_id=operation_id,
+                    ask=1 + self._replay_state.decision_counts.get(operation_id, 0),
+                    tool=tool,
+                    call=approved_call,
+                    approved=approval.approved,
+                    reason=approval.reason,
+                    by=approval.by,
+                    decided_at=await self._writer.store_now(),
+                    arguments_changed=edited,
+                )
+            except (ValueError, TypeError):
+                return "deny", prompts.UNSIGNABLE_CALL
+            record = signed.model_dump(mode="json")
+            self._authorizations[call.id] = self._approval_auth(signed)
         await self._journal("approval_decided", {**record, **(tags or {})})  # before the call runs
+        if tool.effects:
+            self._replay_state.decisions[signed.operation_id] = record
+            self._replay_state.decision_counts[signed.operation_id] = signed.ask
         if not approval.approved:
             return "deny", approval.reason or prompts.APPROVAL_DECLINED
         if edited:
@@ -2430,13 +2678,10 @@ class _Run:
         self, runnable: list[tuple[ToolCallPart, Tool]]
     ) -> list[list[tuple[ToolCallPart, Tool]]]:
         """Split calls into groups; a group runs concurrently, groups run in order."""
-        mode = self.limits.parallel_tools
-        if mode == "all":
-            return [runnable] if runnable else []
         groups: list[list[tuple[ToolCallPart, Tool]]] = []
         batch: list[tuple[ToolCallPart, Tool]] = []
         for item in runnable:
-            if mode == "read_only" and item[1].read_only:
+            if not self._runs_alone(item[1]):
                 batch.append(item)
                 continue
             if batch:
@@ -2506,6 +2751,9 @@ class _Run:
     async def _execute_call(
         self, call: ToolCallPart, tool: Tool, queue: asyncio.Queue[Any]
     ) -> None:
+        if tool.effects:
+            await self._execute_effect_call(call, tool, queue)
+            return
         agent = self.agent.name
         if self._cancel.is_set():
             return  # stopped while it waited for its turn: it never starts
@@ -2572,10 +2820,289 @@ class _Run:
             )
         )
 
+    def _operation_id(self, call_id: str) -> str:
+        starts = self._replay_state.open_turn_starts.get(call_id, ())
+        if starts and isinstance(starts[-1].get("operation_id"), str):
+            return starts[-1]["operation_id"]
+        return f"{self.run_id}:{self._ordinal}:{call_id}"
+
+    def _has_intent(self, call_id: str) -> bool:
+        return self._writer is not None and (
+            self._operation_id(call_id) in self._writer.view().operations_with_intent
+        )
+
+    def _approval_record(self, call_id: str) -> _kinds.ApprovalRecord | None:
+        data = self._replay_state.decisions.get(self._operation_id(call_id))
+        if data is None:
+            return None
+        record = _kinds.ApprovalRecord.model_validate(data)
+        if (record.session_id, record.run_id, record.operation_id, record.tool_call_id) != (
+            self.session.id,
+            self.run_id,
+            self._operation_id(call_id),
+            call_id,
+        ):
+            raise SessionError("The approval record belongs to a different tool call.")
+        return record
+
+    def _approval_auth(self, record: _kinds.ApprovalRecord) -> _ports.Authorization:
+        return _ports.Authorization(
+            "ask",
+            approval_id=record.approval_id,
+            expires_at=record.expires_at,
+            verifiable=self.permissions.verify_decision(record),
+            arguments_digest=record.arguments_digest,
+        )
+
+    def _scope_for(
+        self,
+        call: ToolCallPart,
+        tool: Tool,
+        ctx: RunContext[Any],
+        digest: str,
+    ) -> _ports.CallScope:
+        operation_id = ctx.operation_id
+        starts = self._replay_state.open_turn_starts.get(call.id, ())
+        original = None
+        if starts and starts[0].get("authorization") is not None:
+            data = _kinds.AuthorizationData.model_validate(starts[0]["authorization"])
+            original = _ports.Authorization(
+                **{
+                    key: value
+                    for key, value in data.model_dump().items()
+                    if key in _ports.Authorization.__dataclass_fields__
+                }
+            )
+            if original.decision == "ask":
+                record = self._approval_record(call.id)
+                valid = record is not None and (
+                    record.approved
+                    and record.approval_id == original.approval_id
+                    and record.tool_spec_digest == tool_spec_digest(tool)
+                    and record.arguments_digest == starts[0].get("arguments_digest")
+                )
+                original = (
+                    self._approval_auth(record)
+                    if valid
+                    else _ports.Authorization(
+                        "ask",
+                        verifiable=False,
+                    )
+                )
+        auth = self._authorizations.get(call.id) or original
+        if auth is None:
+            auth = _ports.Authorization("none", verifiable=False)
+        original_digest = starts[0].get("arguments_digest") if starts else digest
+        memos = self._replay_state.memos.setdefault(operation_id, {})
+
+        async def record_memo(name: str, value: Any) -> None:
+            await self._journal(
+                _kinds.KIND_MEMO_RECORDED,
+                {
+                    "operation_id": operation_id,
+                    "name": name,
+                    "value": value,
+                },
+            )
+
+        def apply_patch(patch: _kinds.StatePatchData) -> None:
+            for values in (self.state, self._committed_state):
+                values.update(copying.deepcopy(patch.set))
+                for key in patch.unset:
+                    values.pop(key, None)
+
+        return _ports.CallScope(
+            self.session.id,
+            self.run_id,
+            tool.name,
+            call.id,
+            operation_id,
+            1 + self._replay_state.tool_attempts.get(operation_id, 0),
+            frozenset(effect.name for effect in tool.effects),
+            auth,
+            original or auth,
+            digest,
+            original_digest,
+            None,
+            MISSING if self.deps is None else self.deps,
+            ctx._emit or (lambda _: None),
+            self._writer,
+            self.permissions,
+            memos,
+            record_memo,
+            lambda: self._committed_state,
+            apply_patch,
+        )
+
+    def _unresolved_for(self, operation_id: str) -> list[HeldEffect]:
+        if self._writer is None:
+            return []
+        view = self._writer.view()
+        owned = {
+            op.record_id for op in view.operations.values() if operation_id in op.operation_ids
+        }
+        return [item for item in view.held(self.session.id) if item.id in owned]
+
+    async def _defer_hold(self, call: ToolCallPart, held: HeldEffect) -> None:
+        waiting = PendingInput(
+            tool_call_id=call.id,
+            name=call.name,
+            arguments=call.arguments,
+            reason=held.detail,
+            held_record_id=held.id,
+            held=held,
+        )
+        try:
+            waiting.token = self.permissions.sign(**self._pause_fields(waiting, "input"))
+        except ValueError as error:
+            raise SessionError("The held tool call cannot be signed.") from error
+        await self._journal(
+            "tool_deferred",
+            {
+                "input": waiting.model_dump(mode="json", exclude={"held"}),
+                "held_record_id": held.id,
+            },
+        )
+        self._held_calls[call.id] = held
+        self.waiting[call.id] = waiting
+        self._running.discard(call.id)
+        self._call_emit.pop(call.id, None)
+        self._call_tasks.pop(call.id, None)
+        self.state.clear()
+        self.state.update(copying.deepcopy(self._committed_state))
+        self._saved_state = _state_json(self.state)
+
+    async def _enforce_holds(
+        self,
+        call: ToolCallPart,
+        tool: Tool,
+        held: list[HeldEffect],
+    ) -> None:
+        policy = next(effect.on_unknown for effect in tool.effects if effect.name == held[0].effect)
+        if policy == "fail_run":
+            raise HeldEffectsError(held, retry_after=held[0].retry_after)
+        await self._defer_hold(call, held[0])
+
+    async def _execute_effect_call(
+        self,
+        call: ToolCallPart,
+        tool: Tool,
+        queue: asyncio.Queue[Any],
+    ) -> None:
+        if self._cancel.is_set():
+            return
+        ctx = self._ctx(tool_call_id=call.id, emit=queue.put_nowait)
+        operation_id = ctx.operation_id
+        try:
+            original_digest = arguments_digest(call.arguments)
+            hooked, changed_by = await self.hooks.before_tool_traced(ctx, call)
+            digest = (
+                arguments_digest(hooked.arguments) if isinstance(hooked, ToolCallPart) else None
+            )
+        except ValueError:
+            if self._has_intent(call.id):
+                raise SessionError("An open effects call has noncanonical arguments.") from None
+            result = _error_result(
+                call, prompts.EFFECT_ARGUMENTS_NOT_CANONICAL.format(name=call.name)
+            )
+            await self._record(result)
+            queue.put_nowait(ToolCallFinished(call=call, result=result, agent=self.agent.name))
+            return
+        auth = self._authorizations.get(call.id)
+        if digest != original_digest and isinstance(hooked, ToolCallPart):
+            if not self._has_intent(call.id) and auth is not None and auth.decision == "ask":
+                result = _error_result(call, prompts.APPROVAL_SCOPE_CHANGED)
+                await self._record(result)
+                queue.put_nowait(ToolCallFinished(call=call, result=result, agent=self.agent.name))
+                return
+            elif (
+                not self._has_intent(call.id)
+                and (await self.permissions.decide(ctx, tool, hooked)).behavior != "allow"
+            ):
+                result = _error_result(call, prompts.APPROVAL_SCOPE_CHANGED)
+                await self._record(result)
+                queue.put_nowait(ToolCallFinished(call=call, result=result, agent=self.agent.name))
+                return
+        if isinstance(hooked, ToolResultPart):
+            unresolved = self._unresolved_for(operation_id)
+            if unresolved:
+                await self._enforce_holds(call, tool, unresolved)
+                return
+            result = hooked
+        else:
+            scope = self._scope_for(call, tool, ctx, digest)
+            if (
+                self._has_intent(call.id)
+                and scope.original_arguments_digest != digest
+                and (held := self._unresolved_for(operation_id))
+            ):
+                await self._defer_hold(
+                    call,
+                    replace(
+                        held[0],
+                        reason=HoldReason.DIVERGED,
+                        detail=HOLD_DETAIL[HoldReason.DIVERGED],
+                    ),
+                )
+                return
+            self._scopes[call.id] = scope
+            data = {
+                "tool_call_id": call.id,
+                "name": call.name,
+                "operation_id": operation_id,
+                "attempt": scope.tool_attempt,
+                "arguments_digest": digest,
+                "authorization": scope.authorization.data().model_dump(mode="json"),
+                "arguments_changed_by": changed_by,
+            }
+            async with self._state_lock, self._batched():
+                await self._save_state_locked(provisional=operation_id)
+                await self._journal("tool_started", data)
+            self._replay_state.tool_attempts[operation_id] = scope.tool_attempt
+            self._replay_state.open_turn_starts.setdefault(call.id, []).append(data)
+            self._running.add(call.id)
+            self._call_emit[call.id] = ctx._emit
+            self._call_tasks[call.id] = _cancel_mark(asyncio.current_task())
+            queue.put_nowait(ToolCallStarted(call=hooked, agent=self.agent.name))
+            try:
+                result = await self._invoke(ctx, tool, hooked, scope=scope)
+            except EffectHeld as error:
+                await self._defer_hold(hooked, error.held)
+                return
+            except DeferToolCall:
+                raise SessionError(
+                    "An effects tool cannot defer a result outside the protocol."
+                ) from None
+            finally:
+                self._scopes.pop(call.id, None)
+            unresolved = scope.held or self._unresolved_for(operation_id)
+            if unresolved and call.id not in self._unknown_results:
+                logger.warning(
+                    "%s returned while an effect remained held",
+                    tool.name,
+                    extra={"qagents_finding": "swallowed_hold"},
+                )
+                await self._enforce_holds(hooked, tool, unresolved)
+                return
+        unknown_outcome = call.id in self._unknown_results
+        if unknown_outcome:
+            self._unknown_results.discard(call.id)
+            self.state.clear()
+            self.state.update(copying.deepcopy(self._committed_state))
+            self._saved_state = _state_json(self.state)
+        else:
+            result = await self.hooks.after_tool(ctx, call, result)
+        result = result.model_copy(update={"tool_call_id": call.id, "name": call.name})
+        async with self._state_lock, self._batched():
+            await self._save_state_locked()
+            await self._record(result, commit_provisional=not unknown_outcome)
+        self._held_calls.pop(call.id, None)
+        queue.put_nowait(ToolCallFinished(call=call, result=result, agent=self.agent.name))
+
     def _runs_alone(self, tool: Tool) -> bool:
         """Calls of ``tool`` run one at a time (`Limits.parallel_tools`)."""
         mode = self.limits.parallel_tools
-        return mode == "none" or (mode == "read_only" and not tool.read_only)
+        return bool(tool.effects) or mode == "none" or (mode == "read_only" and not tool.read_only)
 
     async def _wait_for_stuck_threads(
         self, tool: Tool, call: ToolCallPart
@@ -2601,7 +3128,14 @@ class _Run:
         result.metadata["timeout"] = limit
         return result
 
-    async def _invoke(self, ctx: RunContext[Any], tool: Tool, call: ToolCallPart) -> ToolResultPart:
+    async def _invoke(
+        self,
+        ctx: RunContext[Any],
+        tool: Tool,
+        call: ToolCallPart,
+        *,
+        scope: _ports.CallScope | None = None,
+    ) -> ToolResultPart:
         """Run a tool and turn whatever happens into a result the model can read.
 
         A tool that returns a `ToolResultPart` keeps its content, ``is_error`` and
@@ -2626,7 +3160,11 @@ class _Run:
 
         try:
             with _abandoned_threads_to(abandoned):
-                value = await tool.run(ctx, call.arguments, timeout=self.limits.tool_timeout_s)
+                ctx._call = scope
+                try:
+                    value = await tool.run(ctx, call.arguments, timeout=self.limits.tool_timeout_s)
+                finally:
+                    ctx._call = None
             if isinstance(value, ToolResultPart):
                 # A tool that builds its own result keeps its error flag and metadata;
                 # the loop still sets the call id and name (as for resume(results=...)).
@@ -2637,6 +3175,8 @@ class _Run:
                 is_error = False
         except DeferToolCall:
             raise
+        except (HeldEffectsError, JournalOutcomeUnknown, LeaseError):
+            raise
         except ToolArgumentError as error:
             content = prompts.INVALID_ARGUMENTS.format(name=call.name, error=error)
         except ToolError as error:
@@ -2644,7 +3184,26 @@ class _Run:
             extra = getattr(error, "metadata", None)
             if isinstance(extra, Mapping):
                 metadata.update(extra)
+            if scope is not None and scope.held and metadata.get("effect_outcome_unknown") is True:
+                self._unknown_results.add(call.id)
         except ToolTimeout as timeout:
+            if scope is not None:
+                held = scope.held or self._unresolved_for(scope.operation_id)
+                if held:
+                    if any(effect.on_unknown == "fail_run" for effect in tool.effects):
+                        raise HeldEffectsError(held, retry_after=held[0].retry_after) from None
+                    raise EffectHeld(held[0]) from None
+                content = (
+                    prompts.EFFECT_TOOL_TIMEOUT.format(
+                        seconds=timeout.seconds,
+                        committed=", ".join(f"{name} {key}" for name, key in scope.committed),
+                    )
+                    if scope.committed
+                    else prompts.EFFECT_TOOL_TIMEOUT_NONE.format(
+                        seconds=timeout.seconds,
+                    )
+                )
+                return _error_result(call, content)
             # Only the framework's own timeout: a TimeoutError of the tool's code is a failure.
             if not timeout.started:
                 template = prompts.TOOL_NOT_STARTED
@@ -2684,13 +3243,17 @@ class _Run:
             metadata=metadata,
         )
 
-    async def _record(self, result: ToolResultPart) -> None:
+    async def _record(self, result: ToolResultPart, *, commit_provisional: bool = True) -> None:
         self.results[result.tool_call_id] = result
         self.waiting.pop(result.tool_call_id, None)
         self._running.discard(result.tool_call_id)
         self._call_emit.pop(result.tool_call_id, None)
         self._call_tasks.pop(result.tool_call_id, None)
         data: dict[str, Any] = {"result": result.model_dump(mode="json")}
+        if result.tool_call_id in self._replay_state.open_turn_starts:
+            data["operation_id"] = self._operation_id(result.tool_call_id)
+            if not commit_provisional:
+                data["commit_provisional"] = False
         if result.tool_call_id in self._counted:
             data["counted"] = True  # toward Limits.max_tool_calls, restored on resume
         await self._journal("tool_result", data)
@@ -2745,7 +3308,12 @@ class _Run:
             tool_call_id=call.id, name=call.name, content=_shorten(render_tool_output(value), limit)
         )
 
-    async def _settle_open_calls(self, template: str) -> list[ToolCallFinished]:
+    async def _settle_open_calls(
+        self,
+        template: str,
+        *,
+        replacing: bool = False,
+    ) -> list[ToolCallFinished]:
         """Give every open tool call of the last assistant message a result, then close the turn.
 
         ``template`` is for calls that never started. A call that started in
@@ -2765,6 +3333,27 @@ class _Run:
         for call in last.tool_calls:
             if call.id in self.results:
                 continue
+            held = self._held_calls.get(call.id)
+            if held is None and self._has_intent(call.id):
+                unresolved = self._unresolved_for(self._operation_id(call.id))
+                held = unresolved[0] if unresolved else None
+            if held is not None:
+                if not replacing:
+                    if not self._writer.lease.lost():
+                        await self._defer_hold(call, held)
+                    else:
+                        self._held_calls[call.id] = held
+                    continue
+                result = _error_result(
+                    call,
+                    prompts.EFFECT_HELD_BY_NEW_RUN.format(
+                        effect=held.effect,
+                        key=held.key,
+                    ),
+                )
+                await self._record(result, commit_provisional=False)
+                settled.append(ToolCallFinished(call=call, result=result, agent=self.agent.name))
+                continue
             tool = self.tools.get(call.name)
             # Only a read-only call is harmless when it is cut short. An idempotent one may
             # be repeated after a crash, but it may have changed things before it stopped.
@@ -2780,7 +3369,8 @@ class _Run:
             result = _error_result(call, wording.format(name=call.name))
             await self._record(result)
             settled.append(ToolCallFinished(call=call, result=result, agent=self.agent.name))
-        await self._close_tool_turn(last.tool_calls)
+        if all(call.id in self.results for call in last.tool_calls):
+            await self._close_tool_turn(last.tool_calls)
         return settled
 
     async def _close_tool_turn(self, calls: list[ToolCallPart]) -> None:
@@ -2793,6 +3383,8 @@ class _Run:
         self.waiting = {}
         self.approvals = {}  # an answer applies only to the turn it was given for
         self.checkpoints = {}  # the turn's calls all have results: none of them repeats
+        self._replay_state.open_turn_starts.clear()
+        self._authorizations.clear()
 
     # -- plumbing ---------------------------------------------------------------------
 
@@ -2803,7 +3395,7 @@ class _Run:
             emit = _thread_safe(emit)  # a sync tool calls ctx.emit from its worker thread
         # run + position of the assistant message in the run + call: the
         # same after a resume, and unique even if a provider reuses call ids.
-        operation_id = f"{self.run_id}:{self._ordinal}:{tool_call_id}" if tool_call_id else None
+        operation_id = self._operation_id(tool_call_id) if tool_call_id else None
         return RunContext(
             deps=self.deps,
             run_id=self.run_id,
@@ -2851,12 +3443,17 @@ class _Run:
         async with self._state_lock:
             return await self._save_state_locked()
 
-    async def _save_state_locked(self) -> StateUpdated | None:
+    async def _save_state_locked(self, *, provisional: str | None = None) -> StateUpdated | None:
         """Save a snapshot while the caller holds `_state_lock` through its write."""
         snapshot = _state_json(self.state)
         if snapshot == self._saved_state:
             return None
-        await self._journal("state_updated", {"values": json.loads(snapshot)})
+        data = {"values": json.loads(snapshot)}
+        if provisional is not None:
+            data.update(provisional=True, operation_id=provisional)
+        await self._journal("state_updated", data)
+        if provisional is None:
+            self._committed_state = copying.deepcopy(data["values"])
         self._saved_state = snapshot
         return StateUpdated(values=json.loads(snapshot), agent=self.agent.name)
 
@@ -2869,6 +3466,10 @@ class _Run:
         """``RunContext.save_state``: `_save_state`, unless the run's journal is closed."""
         if self._journal_closed():
             return None
+        if self._scopes:
+            async with self._state_lock:
+                scope = next(iter(self._scopes.values()))
+                return await self._save_state_locked(provisional=scope.operation_id)
         return await self._save_state()
 
     async def _checkpoint(self, tool_call_id: str, operation_id: str, key: str, value: Any) -> None:
@@ -3182,8 +3783,8 @@ class _Run:
 
     async def _write(self, entries: list[Entry]) -> None:
         try:
-            if self._lease_owner is not None:  # fenced: written only while this run holds it
-                await self.session.store.append_leased(self.session.id, entries, self._lease_owner)
+            if self._writer is not None:
+                await self._writer.append(entries)
             else:
                 await self.session.append_entries(entries)
         except LeaseError:  # the store contract guarantees that nothing was written
@@ -3326,6 +3927,15 @@ class _Run:
             turns=self.turn,
             pending_approvals=list(self.pending),
             pending_inputs=list(self.inputs),
+            held_effects=list(
+                {
+                    item.id: item
+                    for item in (
+                        (self._writer.view().held(self.session.id) if self._writer else [])
+                        + list(self._held_calls.values())
+                    )
+                }.values()
+            ),
             guardrail=self.guardrail,
         )
         result._session = self.session

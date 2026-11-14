@@ -245,7 +245,11 @@ def derive_state(entries: list[Entry], *, session_id: str | None = None) -> Sess
     later_results: set[str] = set()
     provisional_counts: dict[str, bool] = {}
     for entry in reversed(accepted):
-        if entry.kind == "tool_result" and isinstance(entry.data.get("operation_id"), str):
+        if (
+            entry.kind == "tool_result"
+            and isinstance(entry.data.get("operation_id"), str)
+            and entry.data.get("commit_provisional", True)
+        ):
             later_results.add(entry.data["operation_id"])
         elif entry.kind == "state_updated":
             provisional_counts[entry.id] = _provisional_counts(entry, later_results)

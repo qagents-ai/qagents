@@ -916,7 +916,7 @@ async def _hold(
     if effect.on_unknown == "fail_run":
         raise HeldEffectsError(scope.held, retry_after=held.retry_after)
     if effect.on_unknown == "tell_model":
-        raise ToolError(
+        error = ToolError(
             prompts.EFFECT_OUTCOME_UNKNOWN.format(
                 effect=op.name,
                 key=op.key,
@@ -924,6 +924,8 @@ async def _hold(
                 or prompts.EFFECT_NONE_DONE,
             )
         )
+        error.metadata = {"effect_outcome_unknown": True}
+        raise error
     raise EffectHeld(held)
 
 

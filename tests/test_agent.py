@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 
 import pytest
 from pydantic import BaseModel
@@ -98,11 +97,16 @@ async def test_tool_failures_become_error_results():
 
 async def test_read_only_tools_run_together_and_the_rest_in_order():
     order: list[str] = []
+    lookups_started = set()
+    all_lookups_started = asyncio.Event()
 
     @tool(read_only=True)
     async def lookup(key: str) -> str:
         """Look something up."""
-        await asyncio.sleep(0.2)
+        lookups_started.add(key)
+        if len(lookups_started) == 3:
+            all_lookups_started.set()
+        await asyncio.wait_for(all_lookups_started.wait(), timeout=3)
         return key
 
     @tool
@@ -120,9 +124,8 @@ async def test_read_only_tools_run_together_and_the_rest_in_order():
             "Done.",
         ]
     )
-    began = time.perf_counter()
     result = await Agent(model, tools=[lookup, write]).run("go")
-    assert time.perf_counter() - began < 0.55  # three 0.2 s lookups overlapped
+    assert lookups_started == {"a", "b", "c"}
     assert order == ["start x", "end x", "start y", "end y"]
     assert [part.content for part in result.messages[2].tool_results] == ["a", "b", "c"]
 

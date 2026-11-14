@@ -59,7 +59,7 @@ class FailOn(Hooks):
 
 
 class FlakyStore(InMemoryStore):
-    """Fails the first append that contains an entry ``fail(entry)`` picks."""
+    """Definitely refuses the first append selected by ``fail(entry)``."""
 
     def __init__(self, fail) -> None:
         super().__init__()
@@ -70,16 +70,16 @@ class FlakyStore(InMemoryStore):
     async def append(self, session_id: str, entries: list[Entry]) -> None:
         if not self.failed and any(self.fail(entry) for entry in entries):
             self.failed = True
-            raise OSError("disk full")
+            raise SessionError("fixture refused the batch before writing")
         self.appends.append([entry.kind for entry in entries])
         await super().append(session_id, entries)
 
-    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
+    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> list[int]:
         if not self.failed and any(self.fail(entry) for entry in entries):
             self.failed = True
-            raise OSError("disk full")
+            raise SessionError("fixture refused the batch before writing")
         self.appends.append([entry.kind for entry in entries])
-        await super().append_leased(session_id, entries, owner)
+        return await super().append_leased(session_id, entries, owner)
 
 
 # -- an accepted final answer (F2, F77) ------------------------------------------------
@@ -143,7 +143,7 @@ async def test_a_store_failure_inside_an_answer_turn_writes_none_of_it():
     )
     session = Session(store, id="s")
     turn = [call("final_answer", value="done"), call("send_email", to="ceo@x")]
-    with pytest.raises(OSError):
+    with pytest.raises(SessionError, match="refused the batch"):
         await answer_agent(ScriptedModel([turn]), log).run("finish", session=session)
     assert "tool_result" not in [entry.kind for entry in await session.entries()]
 
@@ -163,7 +163,7 @@ def handoff_agents(billing_model: ScriptedModel) -> Agent:
 async def test_a_handoff_interrupted_before_the_switch_continues_with_the_target():
     store = FlakyStore(lambda entry: entry.kind == "agent_switched")
     session = Session(store, id="s")
-    with pytest.raises(OSError):
+    with pytest.raises(SessionError, match="refused the batch"):
         await handoff_agents(ScriptedModel([])).run("refund A1", session=session)
     # One write holds the handoff's result, the tool message and the switch: none was written.
     assert "tool_result" not in [entry.kind for entry in await session.entries()]
@@ -315,7 +315,7 @@ async def test_a_crash_while_a_run_starts_leaves_the_previous_run_finished():
     store = FlakyStore(lambda entry: entry.kind == "message" and "Transfer" in str(entry.data))
     session = Session(store, id="s")
     await Agent(ScriptedModel(["Athens."])).run("Capital of Greece?", session=session)
-    with pytest.raises(OSError):
+    with pytest.raises(SessionError, match="refused the batch"):
         await Agent(ScriptedModel([])).run("Transfer 500 EUR to Maria", session=session)
     state = await session.state()
     assert state.open_run_id is None  # nothing for recovery to "complete" with the old answer
