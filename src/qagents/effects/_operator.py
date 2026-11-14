@@ -147,16 +147,24 @@ def _revision(op: Operation, answer: Settle) -> None:
 
 
 def _answer_state(permissions: Permissions, session_id: str, op: Operation, answer: Settle) -> str:
-    """The state a resend is checked against (O3r). With signed pauses, a pending resend that
-    does not verify is no operator answer, so a new resend is checked against the record's
-    status without it: a forged resend cannot reopen a not_applied, closed_unknown or
-    rejected record for a real one (M25, SPEC 5.3). The other answers send nothing, so they
-    are checked against the folded state and can close such a record again."""
-    pending = op.pending_resend
-    if answer.outcome != "resend" or _engine._resend_verified(permissions, session_id, op):
+    """The state a resend is checked against (O3r). With signed pauses, a journaled resend
+    that does not verify is no operator answer, so a new resend is checked against the
+    record's status without any such resend, the pending one and every earlier one: forged
+    resends cannot reopen a not_applied, closed_unknown or rejected record for a real one
+    (M25, M67, SPEC 5.3). The other answers send nothing, so they are checked against the
+    folded state and can close such a record again."""
+    if answer.outcome != "resend":
         return op.state
-    others = [settlement for settlement in op.settlements if settlement is not pending]
-    return _fold._status_of(replace(op, settlements=others, pending_resend=None))
+    kept = [
+        settlement
+        for settlement in op.settlements
+        if settlement.outcome != "resend"
+        or _engine._settlement_verified(permissions, session_id, settlement)
+    ]
+    if len(kept) == len(op.settlements):
+        return op.state
+    pending = op.pending_resend if any(item is op.pending_resend for item in kept) else None
+    return _fold._status_of(replace(op, settlements=kept, pending_resend=pending))
 
 
 def _eligible(op: Operation, answer: Settle, state: str) -> None:
@@ -164,8 +172,8 @@ def _eligible(op: Operation, answer: Settle, state: str) -> None:
         if state != op.state:  # only a resend standing on an unverified one
             raise SettlementConflict(
                 "Settlement refused: already_settled. The record's pending resend does not "
-                f"verify under approval_secret, and without it the record is "
-                f"{_STATUS.get(state, state)}, so it is not resent.",
+                "verify under approval_secret, and without the resends that do not verify "
+                f"the record is {_STATUS.get(state, state)}, so it is not resent.",
                 reason="already_settled",
             )
         raise SettlementConflict(reason="already_settled" if state != "X" else "refused")

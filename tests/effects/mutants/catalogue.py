@@ -266,6 +266,19 @@ def _folded_state(original, permissions, session_id, op, answer):
     return op.state
 
 
+def _pending_resend_only(original, permissions, session_id, op, answer):
+    # AF-3 recheck: only the pending resend was set aside when it did not verify, so an
+    # earlier forged resend still made a closed record held for a real one.
+    from dataclasses import replace
+
+    from qagents.effects import _engine, _fold
+
+    if answer.outcome != "resend" or _engine._resend_verified(permissions, session_id, op):
+        return op.state
+    others = [item for item in op.settlements if item is not op.pending_resend]
+    return _fold._status_of(replace(op, settlements=others, pending_resend=None))
+
+
 def _count_from_zero(original, runtime, handle):
     # AF-4 review: the caller's count was compared with 0, not with its count when the
     # preparation began, so an older cancel request turned a lost lease into CancelledError.
@@ -482,7 +495,7 @@ _ROWS = [
     # reopened, so D5 re-sends a not_applied record (AF-3 review).
     (
         E
-        + "engine_settlement_mac.py::test_forged_resend_cannot_reopen_a_record_for_an_operator_resend[memory-not_applied]",
+        + "engine_settlement_mac.py::test_forged_resend_cannot_reopen_a_record_for_an_operator_resend[memory-not_applied-1_forged]",
         _folded_state,
     ),
     # M59: an unverifiable decision names the hold on every held record, also where no row
@@ -540,6 +553,14 @@ _ROWS = [
         E
         + "engine_claim_transfer.py::test_the_owner_takes_back_a_claim_whose_taker_never_sent_its_d2[memory-True-no_lookup-kept]",
         _every_replayed_rejection_changes_key,
+    ),
+    # M67: the operator path sets aside only the pending resend when it does not verify, so
+    # an earlier forged resend still makes a not_applied record held, and D5 re-sends it
+    # under a genuine resend (AF-3 recheck).
+    (
+        E
+        + "engine_settlement_mac.py::test_forged_resend_cannot_reopen_a_record_for_an_operator_resend[memory-not_applied-2_forged]",
+        _pending_resend_only,
     ),
 ]
 

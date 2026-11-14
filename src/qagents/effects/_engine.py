@@ -815,13 +815,21 @@ def _authorization_valid(rule: str, scope: CallScope, store_now: float) -> HoldR
 
 
 def _resend_verified(permissions: Permissions | None, session_id: str, op: Operation) -> bool:
-    """With an approval_secret, a pending operator resend counts only if its MAC signs the
-    journaled answer and it names the revision it followed (M50, SPEC 5.3). A copy of a
-    genuine answer appended later names an older revision. Without a secret the journal is
-    trusted, as before. Runs check it before any row sends; the operator path checks it
-    before it accepts another resend."""
+    """With an approval_secret, a pending operator resend counts only if it verifies
+    (`_settlement_verified`; M50, SPEC 5.3). Runs check it before any row sends."""
     settlement = op.pending_resend
-    if settlement is None or permissions is None or not permissions.signs_pauses:
+    return settlement is None or _settlement_verified(permissions, session_id, settlement)
+
+
+def _settlement_verified(
+    permissions: Permissions | None, session_id: str, settlement: kinds.EffectSettledData
+) -> bool:
+    """With an approval_secret, a folded ``effect_settled`` answer counts only if its MAC
+    signs the journaled answer and it names the revision it followed (SPEC 5.3). A copy of a genuine
+    answer appended later names an older revision. Without a secret the journal is trusted,
+    as before. The operator path checks every journaled resend with it before it accepts
+    another resend."""
+    if permissions is None or not permissions.signs_pauses:
         return True
     prior = (settlement.model_extra or {}).get("prior_revision")
     data = settlement.model_dump(mode="json", exclude=set(SETTLEMENT_FOLD_KEYS))

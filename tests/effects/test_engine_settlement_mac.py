@@ -4,9 +4,9 @@ A settlement written straight to the store, without the operator path, must not
 authorize a send: no MAC, a wrong MAC, a MAC over other fields or from another secret,
 or a genuine answer copied to a later position. Each is held as APPROVAL_UNVERIFIABLE
 until an operator answers again, also on a key no attempt used. The operator path checks a
-new resend against the record without such an entry, so one cannot reopen a not_applied,
-closed_unknown, rejected or unused record for a real resend. Without a secret the journal
-is trusted, as before.
+new resend against the record without any such entry, so neither one nor several can reopen
+a not_applied, closed_unknown, rejected or unused record for a real resend. Without a secret
+the journal is trusted, as before.
 """
 
 from contextlib import asynccontextmanager
@@ -477,62 +477,90 @@ async def _never_attempted(db, send, permissions):
     return None
 
 
-# What a record is without the forged resend: (make the send, reach that status, the sends
-# so far, the effect_settled outcomes after the forgery).
+# What a record is without the forged resends: (make the send, reach that status, the
+# sends so far, the effect_settled outcomes before the forgery).
 NOT_HELD = {
-    "not_applied": (refund, _not_applied, 1, ["not_applied", "resend"]),
-    "closed_unknown": (refund, _close_unknown, 1, ["close_unknown", "resend"]),
-    "rejected": (declining, _rejected, 1, ["resend"]),
-    "never_attempted": (lambda calls: refund(calls, failures=0), _never_attempted, 0, ["resend"]),
+    "not_applied": (refund, _not_applied, 1, ["not_applied"]),
+    "closed_unknown": (refund, _close_unknown, 1, ["close_unknown"]),
+    "rejected": (declining, _rejected, 1, []),
+    "never_attempted": (lambda calls: refund(calls, failures=0), _never_attempted, 0, []),
 }
 
 
-async def forge_on(db, status, calls, permissions):
+async def forge_on(db, status, calls, permissions, forged=1):
+    """Reach ``status``, then append ``forged`` unsigned resends straight to the store, each
+    naming the record's revision at that point."""
     make, reach, _, _ = NOT_HELD[status]
     send = make(calls)
     await reach(db, send, permissions)
     if status != "never_attempted":
         assert (await record(db)).status == status
-    await append_straight(
-        db, fresh_resend() if status == "never_attempted" else resend_data(await record(db))
-    )
+    for number in range(forged):
+        unused = status == "never_attempted" and number == 0
+        await append_straight(db, fresh_resend() if unused else resend_data(await record(db)))
     reopened = await record(db)
     assert reopened.status == "held"  # the fold has no secret
     return send, reopened
 
 
+@pytest.mark.parametrize("forged", [1, 2, 3], ids=lambda forged: f"{forged}_forged")
 @pytest.mark.parametrize("status", sorted(NOT_HELD))
-async def test_forged_resend_cannot_reopen_a_record_for_an_operator_resend(store, status):
-    """M25 and O3r: only a held record (D) can be resent. A forged resend makes the fold
+async def test_forged_resend_cannot_reopen_a_record_for_an_operator_resend(store, status, forged):
+    """M25 and O3r: only a held record (D) can be resent. Forged resends make the fold
     report a closed, rejected or unused record as held; the operator path must refuse a
-    real resend there, so D5 never sends it."""
+    real resend there, so D5 never sends it. Setting aside only the newest forged resend
+    is not enough: an earlier one would still make the record held (M67)."""
     db, now = store
     calls = []
     permissions = Permissions(approval_secret=SECRET)
-    send, reopened = await forge_on(db, status, calls, permissions)
+    send, reopened = await forge_on(db, status, calls, permissions, forged)
     now[0] += permissions.resend_min_age_s + 1
     with pytest.raises(SettlementConflict) as refused:
         await settle(db, send, permissions, Settle.resend(reopened, by="ops", evidence="told to"))
     assert refused.value.reason == "already_settled"
     assert "does not verify under approval_secret" in str(refused.value)
+    assert "without the resends that do not verify" in str(refused.value)
     assert_unverifiable(await perform_held(db, send, permissions))
     _, _, sends, outcomes = NOT_HELD[status]
     assert len(calls) == sends
     entries = await db.load(SESSION)
     assert [entry.data["rule"] for entry in intents(entries)] == ["D1"] * sends
     assert [entry.data["outcome"] for entry in entries if entry.kind == "effect_settled"] == (
-        outcomes
+        outcomes + ["resend"] * forged
     )
 
 
+@pytest.mark.parametrize("forged", [2, 3], ids=lambda forged: f"{forged}_forged")
+async def test_a_held_record_is_resent_once_over_several_forged_resends(store, forged):
+    """The check sets the forged resends aside; it does not refuse a record that is held
+    without them. A real resend is accepted and D5 sends once, under the same key."""
+    db, now = store
+    calls = []
+    send = refund(calls)
+    permissions = Permissions(approval_secret=SECRET)
+    await perform_held(db, send, permissions)
+    for _ in range(forged):
+        await append_straight(db, resend_data(await record(db)))
+    assert_unverifiable(await perform_held(db, send, permissions))
+    now[0] += permissions.resend_min_age_s + 1
+    accepted = await settle(
+        db, send, permissions, Settle.resend(await record(db), by="ops", evidence="re-checked")
+    )
+    assert accepted.status == "held" and accepted.settlement.outcome == "resend"
+    assert (await perform(db, send, permissions)).id == "paid"
+    assert len(calls) == 2 and len(set(calls)) == 1
+    assert [entry.data["rule"] for entry in intents(await db.load(SESSION))] == ["D1", "D5"]
+
+
+@pytest.mark.parametrize("forged", [1, 2], ids=lambda forged: f"{forged}_forged")
 @pytest.mark.parametrize("status", sorted(NOT_HELD))
-async def test_an_operator_closes_a_record_a_forged_resend_reopened(store, status):
+async def test_an_operator_closes_a_record_a_forged_resend_reopened(store, status, forged):
     """The other answers send nothing, so the hold's "settle again" works: not_applied closes
     the record again, and the tool sees EffectRejected with no send."""
     db, now = store
     calls = []
     permissions = Permissions(approval_secret=SECRET)
-    send, reopened = await forge_on(db, status, calls, permissions)
+    send, reopened = await forge_on(db, status, calls, permissions, forged)
     closed = await settle(
         db, send, permissions, Settle.not_applied(reopened, by="ops", evidence="ledger")
     )

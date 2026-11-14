@@ -2933,4 +2933,7 @@ SEAMS = [
     # (seam as M56), and D2 keeps a key that was never sent (seam as M33).
     ("M65", "qagents.effects._engine._claim_kind", "O2"),
     ("M66", "qagents.effects._engine._d2_plan", "O2"),
+    # Added by the AF-3 re-fix, round 2: the operator sets aside every unverified resend
+    # (seam as M58).
+    ("M67", "qagents.effects._operator._answer_state", "O5"),
 ]
