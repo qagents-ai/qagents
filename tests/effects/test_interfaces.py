@@ -21,7 +21,6 @@ from qagents.effects._types import MISSING
 from ._inventory import INTERFACES, SEAMS
 
 ROOT = Path(__file__).resolve().parents[2]
-IMPLEMENTED_OWNERS = {"O1", "O3"}
 
 
 def resolve(module, name):
@@ -109,9 +108,8 @@ def test_stage1_frozen_interfaces(module, name, owner, kind, contract, partial):
     "number,seam,owner", SEAMS, ids=[f"owner_{owner}:{number}" for number, _, owner in SEAMS]
 )
 def test_owner_mutant_seams(number, seam, owner):
-    if owner not in IMPLEMENTED_OWNERS:
-        pytest.skip(f"{owner} implementation gate has not been reached")
-    parts = seam.split(".")
+    module_path = seam.replace("tests/effects/mutants/", f"{__package__}.mutants.")
+    parts = module_path.split(".")
     for index in range(len(parts), 0, -1):
         try:
             value = resolve(".".join(parts[:index]), ".".join(parts[index:]))
