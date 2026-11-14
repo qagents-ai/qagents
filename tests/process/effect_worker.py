@@ -15,6 +15,7 @@ from qagents import Agent, RunContext, Session, SQLiteStore, tool
 from qagents.effects import Attempt, Dedupe, EffectContext, Key, effect
 from qagents.effects._ports import REACH_OBSERVER
 from qagents.messages import ToolCallPart
+from qagents.models.recording import request_fingerprint
 from qagents.models.testing import FunctionModel
 from qagents.session import Entry
 
@@ -54,8 +55,7 @@ class ObservedSQLiteStore(SQLiteStore):
         return await self._observe(super().append_leased, session_id, entries, owner)
 
 
-async def run(root: Path, now: float, effect_name: str):
-    request("hello", pid=os.getpid())
+def build_agent(model, effect_name: str):
 
     @effect(
         effect_name,
@@ -79,11 +79,21 @@ async def run(root: Path, now: float, effect_name: str):
         """Apply an approved amount to the test destination."""
         return (await ctx.perform(send, Credit(order_id=order_id, amount=10))).amount
 
+    return Agent(model, name="settlement", tools=[execute], lease_ttl_s=60)
+
+
+async def run(root: Path, now: float, effect_name: str):
+    request("hello", pid=os.getpid())
+
     def model(model_request):
-        reply = request("model", role=model_request.messages[-1].role)
+        reply = request(
+            "model",
+            role=model_request.messages[-1].role,
+            fingerprint=request_fingerprint(model_request),
+        )
         return reply if isinstance(reply, str) else ToolCallPart.model_validate(reply)
 
-    agent = Agent(FunctionModel(model), name="settlement", tools=[execute], lease_ttl_s=60)
+    agent = build_agent(FunctionModel(model), effect_name)
     observer = REACH_OBSERVER.set(lambda event: request("reach", **asdict(event)))
     try:
         async with ObservedSQLiteStore(root / "journal.db", now=now) as store:

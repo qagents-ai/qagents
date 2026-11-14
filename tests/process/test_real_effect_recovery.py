@@ -6,11 +6,17 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 import pytest_asyncio
 
 from qagents import SQLiteStore
+from qagents.messages import ToolCallPart
+from qagents.session import Entry
+from qagents.testing.crash import Faults, crash_test
+
+from .effect_worker import build_agent
 
 pytestmark = [
     pytest.mark.process,
@@ -122,6 +128,45 @@ async def reference(request, tmp_path_factory):
     return effect_name, committed
 
 
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def simulated(reference, tmp_path_factory):
+    effect_name, _ = reference
+    return await crash_test(
+        lambda env: build_agent(env.model, effect_name),
+        "Apply R1",
+        directory=tmp_path_factory.mktemp("simulated"),
+        session_id="case",
+        store="sqlite",
+        model=[
+            ToolCallPart(id="C1", name="execute", arguments={"order_id": "R1"}),
+            "Done.",
+        ],
+        faults=Faults.parse("kill_before,kill_after,commit_then_crash"),
+        mode="freeze",
+        transport="fake",
+        points="all-raw",
+    )
+
+
+def equivalent_point(report, phase, kind):
+    if phase == "send":
+        matches = [
+            point for point in report.points if "commit_then_crash" in point.execution.point.kinds
+        ]
+    else:
+        matches = [
+            point
+            for point in report.points
+            if point.id.startswith(f"{phase}(")
+            and any(
+                value.split("/", 1)[0] == kind
+                for value in unquote(point.id.split("/", 1)[1]).split(",")
+            )
+        ]
+    assert len(matches) == 1, report.explain()
+    return matches[0]
+
+
 @pytest.mark.parametrize(
     ("phase", "kind", "sent_before", "journaled_before", "total_requests"),
     [
@@ -135,7 +180,7 @@ async def reference(request, tmp_path_factory):
     ],
 )
 async def test_real_kill_preserves_one_application(
-    tmp_path, reference, phase, kind, sent_before, journaled_before, total_requests
+    tmp_path, reference, simulated, phase, kind, sent_before, journaled_before, total_requests
 ):
     effect_name, expected_commit = reference
     destination = Destination()
@@ -170,3 +215,36 @@ async def test_real_kill_preserves_one_application(
         "dedupe_resend" if (phase, kind) == ("after", "effect_intent") else "first_send"
     )
     assert expected_first in reached
+
+    simulated_point = equivalent_point(simulated, phase, kind)
+    assert simulated_point.verdict == "safe", simulated.explain(simulated_point.id)
+    assert simulated_point.outcome == "completed_as_reference"
+    assert simulated_point.execution.final_snapshot is not None
+    assert len(simulated_point.execution.applications) == len(destination.sends)
+    assert sum(not app.replayed for app in simulated_point.execution.applications) == len(
+        destination.applied
+    )
+    observed_reaches = [
+        event["point"] for event in destination.observations if event["kind"] == "reach"
+    ]
+    assert [event.point for event in simulated_point.execution.events] == observed_reaches
+    semantic_entries = {"effect_intent", "effect_committed", "tool_result", "run_finished"}
+    expected_entries = [
+        Entry.model_validate_json(raw)
+        for raw in simulated_point.execution.final_snapshot.entries_json
+    ]
+    assert [e.kind for e in after if e.kind in semantic_entries] == [
+        e.kind for e in expected_entries if e.kind in semantic_entries
+    ]
+
+    assert [item.fingerprint for item in simulated_point.execution.model_evidence] == [
+        event["fingerprint"] for event in destination.observations if event["kind"] == "model"
+    ]
+    for application, observed in zip(
+        simulated_point.execution.applications, destination.sends, strict=True
+    ):
+        assert (application.fake, application.attempt, application.epoch) == (
+            effect_name,
+            observed["attempt"],
+            observed["epoch"],
+        )
