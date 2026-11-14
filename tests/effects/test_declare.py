@@ -1,9 +1,11 @@
 """Public effect declarations and the errors tool authors may handle."""
 
 import asyncio
+import concurrent.futures
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from pydantic import BaseModel
 
@@ -313,6 +315,51 @@ def test_rejected_on_refuses_cancellation_but_accepts_explicit_refusal():
         ValueError,
         EffectRejected,
     )
+
+
+class _PaymentsTimeout(TimeoutError):
+    """A client's own timeout type: still a transport-level no answer."""
+
+
+@pytest.mark.parametrize(
+    "kind,relation,member",
+    [
+        (OSError, "is a base class of", "TimeoutError"),
+        (ConnectionError, "is", "ConnectionError"),
+        (ConnectionRefusedError, "derives from", "ConnectionError"),
+        (ConnectionResetError, "derives from", "ConnectionError"),
+        (_PaymentsTimeout, "derives from", "TimeoutError"),
+        (httpx.HTTPError, "is a base class of", "httpx.TransportError"),
+        (httpx.RequestError, "is a base class of", "httpx.TransportError"),
+        (httpx.TransportError, "is", "httpx.TransportError"),
+        (httpx.ConnectError, "derives from", "httpx.TransportError"),
+        (httpx.ReadTimeout, "derives from", "httpx.TransportError"),
+        (httpx.RemoteProtocolError, "derives from", "httpx.TransportError"),
+        (concurrent.futures.CancelledError, "is", "concurrent.futures._base.CancelledError"),
+    ],
+    ids=lambda value: value.__qualname__ if isinstance(value, type) else None,
+)
+def test_rejected_on_refuses_transport_no_answer_types_and_their_bases(kind, relation, member):
+    with pytest.raises(ConfigurationError) as refused:
+        declare(rejected_on=(ValueError, kind))
+    message = str(refused.value)
+    assert message.startswith("rejected_on must not list ")
+    assert kind.__qualname__ in message
+    assert f"it {relation} {member}," in message
+    assert "no answer came back" in message and "unknown" in message
+
+
+def test_rejected_on_accepts_own_refusals_and_received_http_status_errors():
+    class InvalidRequest(Exception):
+        """A 4xx validation refusal the client received."""
+
+    declared = declare(rejected_on=(InvalidRequest, httpx.HTTPStatusError))
+    assert declared.rejected_on == (InvalidRequest, httpx.HTTPStatusError)
+
+
+def test_rejected_on_names_a_non_type_entry():
+    with pytest.raises(ConfigurationError, match="exception types; got 'error'"):
+        declare(rejected_on=("error",))
 
 
 @pytest.mark.parametrize(

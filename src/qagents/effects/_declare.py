@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import math
 from collections.abc import Awaitable, Callable
@@ -26,6 +27,76 @@ Verdict = "Found[Any] | NotYetVisible | Absent | Unknown"
 def _pct(value: str, separator: str = ":") -> str:
     jcs(value)
     return value.replace("%", "%25").replace(separator, f"%{ord(separator):02X}")
+
+
+def _no_answer_types() -> tuple[type[BaseException], ...]:
+    """The transport-level "no answer" errors of SPEC 5.1, the one definition of the set.
+
+    A timeout, a lost, reset or refused connection, a cancellation and an httpx
+    transport error mean that no answer came back, so the destination may have
+    applied the call. Such an error is never a definite refusal: ``rejected_on``
+    may not overlap these types, and a send that raises one has an unknown
+    outcome whatever ``rejected_on`` lists.
+    """
+    # httpx is a core dependency, already loaded by `import qagents`. It is imported here
+    # because this module's top level imports only the standard library, pydantic and
+    # qagents itself (BUILD_PLAN 3.0).
+    import httpx
+
+    return (
+        TimeoutError,
+        ConnectionError,
+        asyncio.CancelledError,
+        concurrent.futures.CancelledError,
+        httpx.TransportError,
+    )
+
+
+def _no_answer(error: BaseException) -> bool:
+    """Whether a raised error is a transport-level no answer, so its outcome is unknown.
+
+    The engine and the crash harness's destination fakes call it before they read
+    ``EffectRejected`` or ``rejected_on`` (SPEC 5.1; mutant seam M48).
+    """
+    return isinstance(error, _no_answer_types())
+
+
+def _type_name(kind: type) -> str:
+    module = getattr(kind, "__module__", "")
+    return kind.__qualname__ if module == "builtins" else f"{module}.{kind.__qualname__}"
+
+
+def _check_rejected_on(rejected_on: object) -> None:
+    """Refuse entries that are not definite refusals (SPEC 5.1, checked at declaration)."""
+    if not isinstance(rejected_on, tuple):
+        raise ConfigurationError("rejected_on must be a tuple of definite refusal exception types.")
+    for kind in rejected_on:
+        if not isinstance(kind, type) or not issubclass(kind, BaseException):
+            raise ConfigurationError(f"rejected_on entries must be exception types; got {kind!r}.")
+        if kind in (BaseException, Exception, ToolError):
+            raise ConfigurationError(
+                f"rejected_on must not list {_type_name(kind)}: it is too broad to be a "
+                "definite refusal. List the exceptions your client raises for a refusal "
+                "it received from the destination."
+            )
+        for member in _no_answer_types():
+            if kind is member:
+                relation = "is"
+            elif issubclass(kind, member):
+                relation = "derives from"
+            elif issubclass(member, kind):
+                relation = "is a base class of"
+            else:
+                continue
+            raise ConfigurationError(
+                f"rejected_on must not list {_type_name(kind)}: it {relation} "
+                f"{_type_name(member)}, a transport-level error (a timeout, a lost or "
+                "refused connection, a cancellation or an httpx transport error). Such an "
+                "error means no answer came back and the destination may have applied the "
+                "call, so its outcome is unknown, never a definite refusal. List only the "
+                "exceptions your client raises for a refusal it received, such as a 4xx "
+                "validation error."
+            )
 
 
 @dataclass(frozen=True, init=False)
@@ -299,6 +370,14 @@ def effect(
 
     Unique's required lookup is checked when an agent is built, after the
     lookup decorator has had a chance to attach it.
+
+    ``rejected_on`` lists definite refusals only: the exceptions your client
+    raises for a refusal it received from the destination. A type that is,
+    derives from or is a base class of a transport-level error (a timeout, a
+    lost or refused connection, a cancellation or an httpx transport error) is
+    refused here, because such an error means no answer came back. A send that
+    raises one has an unknown outcome, even when its class also derives from a
+    type in ``rejected_on``.
     """
     if not isinstance(name, str) or not name.strip():
         raise ConfigurationError("effect name must be a nonempty string.")
@@ -311,18 +390,7 @@ def effect(
     _finite_nonnegative(timeout_s, "timeout_s", positive=True)
     if applies_within_s is not None:
         _finite_nonnegative(applies_within_s, "applies_within_s")
-    if not isinstance(rejected_on, tuple):
-        raise ConfigurationError("rejected_on must be a tuple of definite refusal exception types.")
-    for kind in rejected_on:
-        if (
-            not isinstance(kind, type)
-            or not issubclass(kind, BaseException)
-            or kind in (BaseException, Exception, ToolError)
-            or issubclass(kind, (TimeoutError, asyncio.CancelledError))
-        ):
-            raise ConfigurationError(
-                "rejected_on must not classify broad, timeout, or cancelled errors."
-            )
+    _check_rejected_on(rejected_on)
     if on_unknown not in ("pause", "fail_run", "tell_model"):
         raise ConfigurationError("on_unknown must be pause, fail_run, or tell_model.")
     if on_unknown == "tell_model" and key.is_per_call:
