@@ -188,7 +188,10 @@ HOLD_DETAIL: Mapping[HoldReason, str] = MappingProxyType(
         HoldReason.KEY_CHANGED: "The same call changed its business key; restore the original key.",
         HoldReason.VERSION_CHANGED: "Effect version changed; operator review needed.",
         HoldReason.APPROVAL_EXPIRED: "Approval expired; recheck or use an operator settlement.",
-        HoldReason.APPROVAL_UNVERIFIABLE: "Approval unverifiable; obtain a valid decision.",
+        HoldReason.APPROVAL_UNVERIFIABLE: (
+            "Approval unverifiable: no approval_secret, or no valid proof; "
+            "recheck or use an operator settlement."
+        ),
         HoldReason.LEASE: "The writer lost its lease; a current owner must recover the operation.",
         HoldReason.CONFLICT: "Conflicting journal evidence; inspect before settlement.",
         HoldReason.CLAIMED_ELSEWHERE: "Another session owns this operation; inspect its record.",

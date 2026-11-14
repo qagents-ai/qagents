@@ -32,6 +32,14 @@ def test_expired_intent_approval_points_to_operator_paths():
     assert "operator" in detail and "recheck" in detail
 
 
+def test_unverifiable_approval_names_the_secret_and_the_operator_paths():
+    """Without approval_secret no decision verifies, and a spent one cannot be asked again."""
+    detail = HOLD_DETAIL[HoldReason.APPROVAL_UNVERIFIABLE]
+    assert "valid decision" not in detail
+    assert "approval_secret" in detail
+    assert "operator" in detail and "recheck" in detail
+
+
 def test_settlement_constructors_preserve_revision_and_distinct_meanings():
     original = held()
     receipt = {"id": "refund-1"}
