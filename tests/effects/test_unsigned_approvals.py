@@ -13,7 +13,7 @@ import pytest
 from pydantic import BaseModel
 
 from qagents import Agent, Permissions, RunContext, Session, SQLiteStore, Toolkit, tool
-from qagents.effects import Attempt, Dedupe, EffectContext, Key, effect
+from qagents.effects import Absent, Attempt, Dedupe, EffectContext, Key, effect
 from qagents.effects._types import HoldReason
 from qagents.models.testing import FunctionModel, call
 
@@ -227,3 +227,82 @@ async def test_with_a_secret_the_effect_in_doubt_is_resent_under_its_key(tmp_pat
         done = await agent.run("Refund R1", session=Session(db, id="s"))
     assert done.status == "completed" and done.output == "Refunded."
     assert len(destination) == 2 and len(set(destination)) == 1  # D3: the same key
+
+
+def undeduplicated_effect(destination, *, authoritative):
+    """No dedupe contract: only D4, after an authoritative absence, can re-send it."""
+
+    @effect(
+        "refund",
+        key=Key("request", "id"),
+        timeout_s=0.05,
+        **({"applies_within_s": 0.01} if authoritative else {}),
+    )
+    async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+        destination.append(attempt.idempotency_key)
+        if len(destination) == 1:
+            await asyncio.sleep(1)  # past timeout_s: the outcome is in doubt
+        return Receipt(id="paid")
+
+    if authoritative:
+
+        @send.lookup(authoritative=True)
+        async def find(ctx, inquiry):
+            return Absent()
+
+    return send
+
+
+def clocked_agent(destination, secret, *, authoritative):
+    send = undeduplicated_effect(destination, authoritative=authoritative)
+    return Agent(
+        model(),
+        tools=[refund_tool(send=send)],
+        permissions=Permissions(approval_secret=secret, on_ask=lambda *args: True),
+    )
+
+
+@pytest.mark.parametrize(
+    "authoritative,reason",
+    [(False, HoldReason.RESPONSE_LOST), (True, HoldReason.NOT_YET_QUIESCENT)],
+    ids=["opaque", "authoritative_before_quiescence"],
+)
+async def test_an_effect_no_row_would_resend_holds_for_its_own_reason_without_a_secret(
+    tmp_path, authoritative, reason
+):
+    """SPEC 7.1 H1: an unverifiable decision is the reason only on a row that would send.
+
+    Here no row would, with or without a secret: an opaque effect has no automatic re-send,
+    and an authoritative absence counts only after quiescence. So the hold is the same as
+    under a valid decision, retry_after included.
+    """
+    holds = {}
+    for secret in (None, SECRET):
+        destination = []
+        agent = clocked_agent(destination, secret, authoritative=authoritative)
+        async with SQLiteStore(tmp_path / f"{secret is not None}.sqlite") as db:
+            paused = await agent.run("Refund R1", session=Session(db, id="s"))
+        [held] = paused.held_effects
+        holds[secret] = (held.reason, held.retry_after is not None, len(destination))
+    assert holds[None] == holds[SECRET] == (reason, authoritative, 1)
+
+
+@pytest.mark.parametrize("secret", [None, SECRET], ids=["no_secret", "secret"])
+async def test_once_d4_would_send_an_unverifiable_decision_holds_the_effect(tmp_path, secret):
+    """After quiescence D4 would send: without a secret the decision is now the reason."""
+    destination, now = [], [1000.0]
+    agent = clocked_agent(destination, secret, authoritative=True)
+    async with SQLiteStore(tmp_path / "d4.sqlite", clock=lambda: now[0]) as db:
+        paused = await agent.run("Refund R1", session=Session(db, id="s"))
+        [held] = paused.held_effects
+        assert held.reason == HoldReason.NOT_YET_QUIESCENT and held.retry_after is not None
+        now[0] += 3600  # the store clock passes every attempt's quiescence
+        again = await agent.resume(Session(db, id="s"))
+    if secret is None:
+        assert [(item.reason, item.retry_after) for item in again.held_effects] == [
+            (HoldReason.APPROVAL_UNVERIFIABLE, None)
+        ]
+        assert len(destination) == 1
+    else:
+        assert again.status == "completed" and again.output == "Refunded."
+        assert len(destination) == 2 and len(set(destination)) == 1  # D4: the same key

@@ -1088,6 +1088,18 @@ def _conflict(op: Operation) -> None:
     )
 
 
+def _authorization_decides(op: Operation, situation: table.PerformSituation) -> bool:
+    """Whether an expired or unverifiable decision is the reason this record is held.
+
+    It is only on a row that would send (SPEC 7.1 H1): with a valid decision, D3 or D4 would
+    send now. Otherwise the record's own evidence names the reason, as under a valid
+    decision, so an effect that no row re-sends yet (no dedupe contract and no authoritative
+    absence after quiescence) is held for that reason and keeps its retry_after (AF-5).
+    """
+    valid = replace(situation, auth_valid=True)
+    return table.decide(table.TState(op.state), table.TEvent.PERFORM, valid).sends
+
+
 def _dedupe_allowed(effect: Effect, op: Operation, scope: CallScope, now: float) -> bool:
     journal = scope.journal
     contract = effect.dedupe
@@ -1375,6 +1387,10 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
                 )
             ):
                 reason = HoldReason.WINDOW_EXPIRED
+            if invalid is not None and not (
+                resend_unverified or _authorization_decides(op, situation)
+            ):
+                invalid = None
             await _hold(
                 effect,
                 op,

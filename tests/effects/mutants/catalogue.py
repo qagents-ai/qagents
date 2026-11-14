@@ -456,6 +456,13 @@ _ROWS = [
         + "engine_settlement_mac.py::test_forged_resend_cannot_reopen_a_record_for_an_operator_resend[memory-not_applied]",
         _folded_state,
     ),
+    # M59: an unverifiable decision names the hold on every held record, also where no row
+    # would re-send, so without approval_secret an opaque effect hides RESPONSE_LOST (AF-5).
+    (
+        E
+        + "unsigned_approvals.py::test_an_effect_no_row_would_resend_holds_for_its_own_reason_without_a_secret[opaque]",
+        constant(True),
+    ),
 ]
 
 CASES = tuple(

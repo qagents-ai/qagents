@@ -2917,4 +2917,6 @@ SEAMS = [
     ("M57", "qagents.effects._table._lookup_inconclusive", "O2"),
     # Added by the AF-3 re-fix: the operator checks a resend without an unverified one.
     ("M58", "qagents.effects._operator._answer_state", "O5"),
+    # Added by the AF-5 re-fix: an invalid decision is the hold reason only where a row sends.
+    ("M59", "qagents.effects._engine._authorization_decides", "O2"),
 ]
