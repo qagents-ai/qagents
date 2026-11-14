@@ -7,6 +7,7 @@ import contextlib
 import copy
 import inspect
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -14,13 +15,16 @@ from qagents import session as _session
 from qagents.errors import ConfigurationError, LeaseError, SettlementConflict
 from qagents.session import Session
 
-from . import _canonical, _engine, _kinds, _ports, _quiescence, _table
+from . import _canonical, _engine, _fold, _kinds, _ports, _quiescence, _table
 from ._declare import Effect
 from ._fold import Operation
 from ._types import MISSING, Absent, EffectRecord, Found, HeldEffect, Settle
 
 if TYPE_CHECKING:
     from qagents.permissions import Permissions
+
+# The record statuses (EffectRecord.status) a forged resend can stand on.
+_STATUS = {"N": "never attempted", "R": "rejected", "NA": "not_applied", "CU": "closed_unknown"}
 
 
 @contextlib.asynccontextmanager
@@ -116,9 +120,29 @@ def _revision(op: Operation, answer: Settle) -> None:
         raise SettlementConflict(reason="revision")
 
 
-def _eligible(op: Operation, answer: Settle) -> None:
-    if op.state not in {"D", "X"} or (answer.outcome == "resend" and op.state != "D"):
-        raise SettlementConflict(reason="already_settled" if op.state != "X" else "refused")
+def _answer_state(permissions: Permissions, session_id: str, op: Operation, answer: Settle) -> str:
+    """The state a resend is checked against (O3r). With signed pauses, a pending resend that
+    does not verify is no operator answer, so a new resend is checked against the record's
+    status without it: a forged resend cannot reopen a not_applied, closed_unknown or
+    rejected record for a real one (M25, SPEC 5.3). The other answers send nothing, so they
+    are checked against the folded state and can close such a record again."""
+    pending = op.pending_resend
+    if answer.outcome != "resend" or _engine._resend_verified(permissions, session_id, op):
+        return op.state
+    others = [settlement for settlement in op.settlements if settlement is not pending]
+    return _fold._status_of(replace(op, settlements=others, pending_resend=None))
+
+
+def _eligible(op: Operation, answer: Settle, state: str) -> None:
+    if state not in {"D", "X"} or (answer.outcome == "resend" and state != "D"):
+        if state != op.state:  # only a resend standing on an unverified one
+            raise SettlementConflict(
+                "Settlement refused: already_settled. The record's pending resend does not "
+                f"verify under approval_secret, and without it the record is "
+                f"{_STATUS.get(state, state)}, so it is not resent.",
+                reason="already_settled",
+            )
+        raise SettlementConflict(reason="already_settled" if state != "X" else "refused")
 
 
 def _reach(writer: _session.LeasedWriter, op: Operation, rule: str, point: str | None) -> None:
@@ -161,7 +185,8 @@ async def settle(
     async with _take_lease(session, ttl_s=lease_ttl_s, worker=worker, purpose="settle") as writer:
         op = _resolve(writer, answer.record_id)
         _revision(op, answer)
-        _eligible(op, answer)  # C at entry is a conflict, even for a compatible receipt
+        # C at entry is a conflict, even for a compatible receipt
+        _eligible(op, answer, _answer_state(permissions, session.id, op, answer))
         op = await _findings(writer, op)
         _revision(op, answer)
         effect = _declaration(effects, op)
@@ -231,7 +256,7 @@ async def settle(
         entries = await writer.load()
         op = writer.view().get(op.namespace, op.name, op.key)
         _revision(op, answer)
-        _eligible(op, answer)
+        _eligible(op, answer, _answer_state(permissions, session.id, op, answer))
         if answer.outcome == "committed":
             patch, patch_error = _engine.on_commit_patch(
                 effect, _session.derive_state(entries).values, op.request, receipt
@@ -261,7 +286,8 @@ async def settle(
                 covers_attempts=[attempt.number for attempt in op.attempts],
             ).model_dump(mode="json")
             kind = _kinds.KIND_EFFECT_SETTLED
-        # The engine verifies a resend against these same fields before D5 (SPEC 5.3).
+        # With approval_secret, runs verify a pending resend against these same fields
+        # before any row sends, and settle before it accepts another resend (SPEC 5.3).
         data["mac"] = permissions.sign_settlement(
             _kinds.settlement_mac_fields(session.id, kind, data)
         )

@@ -238,6 +238,12 @@ def _rejected_reads_no_claim(original, op, claim, prepared, session_id):
     return "own" if op.state == "R" else original(op, claim, prepared, session_id)
 
 
+def _folded_state(original, permissions, session_id, op, answer):
+    # AF-3 review: the operator path checked a resend against the folded state, so a forged
+    # resend that reopened a closed record let a real one through.
+    return op.state
+
+
 E = "tests/effects/test_"
 M = "tests/effects/mutants/test_scenarios.py::"
 
@@ -442,6 +448,13 @@ _ROWS = [
         E
         + "engine_claim_transfer.py::test_an_inconclusive_lookup_in_another_session_holds_instead_of_sending[memory-not_yet_visible-True]",
         constant(False),
+    ),
+    # M58: the operator path accepts a resend on a record that only an unverified resend
+    # reopened, so D5 re-sends a not_applied record (AF-3 review).
+    (
+        E
+        + "engine_settlement_mac.py::test_forged_resend_cannot_reopen_a_record_for_an_operator_resend[memory-not_applied]",
+        _folded_state,
     ),
 ]
 

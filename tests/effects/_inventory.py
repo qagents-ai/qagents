@@ -2915,4 +2915,6 @@ SEAMS = [
     ("M56", "qagents.effects._engine._claim_kind", "O2"),
     # Added by the AF-2 re-fix: an inconclusive lookup holds a rejected record before D2.
     ("M57", "qagents.effects._table._lookup_inconclusive", "O2"),
+    # Added by the AF-3 re-fix: the operator checks a resend without an unverified one.
+    ("M58", "qagents.effects._operator._answer_state", "O5"),
 ]

@@ -15,7 +15,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
 
@@ -57,6 +57,9 @@ from ._types import (
     ReqT,
     Unknown,
 )
+
+if TYPE_CHECKING:
+    from qagents.permissions import Permissions
 
 Verdict = Found | NotYetVisible | Absent | Unknown
 _TOOLERROR_WARNED = False
@@ -811,18 +814,18 @@ def _authorization_valid(rule: str, scope: CallScope, store_now: float) -> HoldR
     return None
 
 
-def _resend_verified(scope: CallScope, op: Operation) -> bool:
+def _resend_verified(permissions: Permissions | None, session_id: str, op: Operation) -> bool:
     """With an approval_secret, a pending operator resend counts only if its MAC signs the
     journaled answer and it names the revision it followed (M50, SPEC 5.3). A copy of a
     genuine answer appended later names an older revision. Without a secret the journal is
-    trusted, as before."""
+    trusted, as before. Runs check it before any row sends; the operator path checks it
+    before it accepts another resend."""
     settlement = op.pending_resend
-    permissions = scope.permissions
     if settlement is None or permissions is None or not permissions.signs_pauses:
         return True
     prior = (settlement.model_extra or {}).get("prior_revision")
     data = settlement.model_dump(mode="json", exclude=set(SETTLEMENT_FOLD_KEYS))
-    fields = kinds.settlement_mac_fields(scope.session_id, kinds.KIND_EFFECT_SETTLED, data)
+    fields = kinds.settlement_mac_fields(session_id, kinds.KIND_EFFECT_SETTLED, data)
     return prior == settlement.expected_revision and permissions.verify_settlement(
         fields, settlement.mac
     )
@@ -1167,7 +1170,9 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
         resend_seq = (pending.model_extra or {}).get("seq") if pending is not None else None
         # A resend that does not verify authorizes nothing, and no row sends while it stands:
         # it may have reopened a record that was rejected or settled (SPEC 5.3, 7.5).
-        resend_unverified = pending is not None and not _resend_verified(scope, op)
+        resend_unverified = pending is not None and not _resend_verified(
+            scope.permissions, scope.session_id, op
+        )
         # Such a resend can also stand on a key that never had an attempt, so nothing that
         # reads the attempts' first use runs first: the record is held, not an error.
         dedupe = (

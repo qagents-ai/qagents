@@ -3,8 +3,10 @@
 A settlement written straight to the store, without the operator path, must not
 authorize a send: no MAC, a wrong MAC, a MAC over other fields or from another secret,
 or a genuine answer copied to a later position. Each is held as APPROVAL_UNVERIFIABLE
-until an operator answers again, also on a key no attempt used. Without a secret the
-journal is trusted, as before.
+until an operator answers again, also on a key no attempt used. The operator path checks a
+new resend against the record without such an entry, so one cannot reopen a not_applied,
+closed_unknown, rejected or unused record for a real resend. Without a secret the journal
+is trusted, as before.
 """
 
 from contextlib import asynccontextmanager
@@ -19,7 +21,7 @@ from qagents.effects import _engine as engine
 from qagents.effects import _kinds as kinds
 from qagents.effects import _operator as operator
 from qagents.effects._types import HoldReason
-from qagents.errors import EffectHeld
+from qagents.errors import EffectHeld, EffectRejected, SettlementConflict
 from qagents.models.testing import FunctionModel, call
 from qagents.permissions import Permissions
 from qagents.session import Entry, InMemoryStore, LeasedWriter
@@ -439,3 +441,115 @@ async def test_forged_resend_on_a_never_attempted_key_is_held_not_an_error(store
     assert intents(entries) == []
     assert entries[-1].kind == "effect_observed"
     assert entries[-1].data["reason"] == HoldReason.APPROVAL_UNVERIFIABLE
+
+
+def declining(calls):
+    """The destination refuses the first request: a rejected record, R(n)."""
+
+    @effect("refund", key=Key("request", "id"))
+    async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+        calls.append(attempt.idempotency_key)
+        if len(calls) == 1:
+            raise EffectRejected("card declined")
+        return Receipt(id="paid")
+
+    return send
+
+
+async def _not_applied(db, send, permissions):
+    await perform_held(db, send, permissions)
+    held = await record(db)
+    await settle(db, send, permissions, Settle.not_applied(held, by="ops", evidence="ledger"))
+
+
+async def _close_unknown(db, send, permissions):
+    await perform_held(db, send, permissions)
+    held = await record(db)
+    await settle(db, send, permissions, Settle.close_unknown(held, by="ops", reason="gave up"))
+
+
+async def _rejected(db, send, permissions):
+    with pytest.raises(EffectRejected):
+        await perform(db, send, permissions)
+
+
+async def _never_attempted(db, send, permissions):
+    return None
+
+
+# What a record is without the forged resend: (make the send, reach that status, the sends
+# so far, the effect_settled outcomes after the forgery).
+NOT_HELD = {
+    "not_applied": (refund, _not_applied, 1, ["not_applied", "resend"]),
+    "closed_unknown": (refund, _close_unknown, 1, ["close_unknown", "resend"]),
+    "rejected": (declining, _rejected, 1, ["resend"]),
+    "never_attempted": (lambda calls: refund(calls, failures=0), _never_attempted, 0, ["resend"]),
+}
+
+
+async def forge_on(db, status, calls, permissions):
+    make, reach, _, _ = NOT_HELD[status]
+    send = make(calls)
+    await reach(db, send, permissions)
+    if status != "never_attempted":
+        assert (await record(db)).status == status
+    await append_straight(
+        db, fresh_resend() if status == "never_attempted" else resend_data(await record(db))
+    )
+    reopened = await record(db)
+    assert reopened.status == "held"  # the fold has no secret
+    return send, reopened
+
+
+@pytest.mark.parametrize("status", sorted(NOT_HELD))
+async def test_forged_resend_cannot_reopen_a_record_for_an_operator_resend(store, status):
+    """M25 and O3r: only a held record (D) can be resent. A forged resend makes the fold
+    report a closed, rejected or unused record as held; the operator path must refuse a
+    real resend there, so D5 never sends it."""
+    db, now = store
+    calls = []
+    permissions = Permissions(approval_secret=SECRET)
+    send, reopened = await forge_on(db, status, calls, permissions)
+    now[0] += permissions.resend_min_age_s + 1
+    with pytest.raises(SettlementConflict) as refused:
+        await settle(db, send, permissions, Settle.resend(reopened, by="ops", evidence="told to"))
+    assert refused.value.reason == "already_settled"
+    assert "does not verify under approval_secret" in str(refused.value)
+    assert_unverifiable(await perform_held(db, send, permissions))
+    _, _, sends, outcomes = NOT_HELD[status]
+    assert len(calls) == sends
+    entries = await db.load(SESSION)
+    assert [entry.data["rule"] for entry in intents(entries)] == ["D1"] * sends
+    assert [entry.data["outcome"] for entry in entries if entry.kind == "effect_settled"] == (
+        outcomes
+    )
+
+
+@pytest.mark.parametrize("status", sorted(NOT_HELD))
+async def test_an_operator_closes_a_record_a_forged_resend_reopened(store, status):
+    """The other answers send nothing, so the hold's "settle again" works: not_applied closes
+    the record again, and the tool sees EffectRejected with no send."""
+    db, now = store
+    calls = []
+    permissions = Permissions(approval_secret=SECRET)
+    send, reopened = await forge_on(db, status, calls, permissions)
+    closed = await settle(
+        db, send, permissions, Settle.not_applied(reopened, by="ops", evidence="ledger")
+    )
+    assert closed.status == "not_applied"
+    with pytest.raises(EffectRejected):
+        await perform(db, send, permissions)
+    assert len(calls) == NOT_HELD[status][2]
+
+
+async def test_without_a_secret_an_operator_resend_on_a_journaled_resend_is_accepted(store):
+    """Without a secret the journaled resend is trusted, as before: the record is D."""
+    db, now = store
+    calls = []
+    permissions = Permissions()
+    send, reopened = await forge_on(db, "not_applied", calls, permissions)
+    now[0] += permissions.resend_min_age_s + 1
+    accepted = await settle(
+        db, send, permissions, Settle.resend(reopened, by="ops", evidence="told to")
+    )
+    assert accepted.status == "held" and accepted.settlement.outcome == "resend"
