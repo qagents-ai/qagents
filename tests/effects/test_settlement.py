@@ -18,6 +18,7 @@ from qagents.effects import (
     Settle,
     _canonical,
     _engine,
+    _kinds,
     _operator,
     effect,
 )
@@ -435,6 +436,10 @@ async def test_settlement_mac_binds_session_kind_and_every_payload_field(store, 
     assert entry.data["mac"] != permissions.sign_settlement(
         {**envelope, "data": {**payload, "by": "attacker"}}
     )
+    # The fields the engine verifies are the fields the operator signed.
+    shared = _kinds.settlement_mac_fields(session.id, entry.kind, entry.data)
+    assert shared == envelope
+    assert permissions.verify_settlement(shared, entry.data["mac"])
 
 
 async def test_resend_too_early_reports_time_and_covers_existing_attempts(store):

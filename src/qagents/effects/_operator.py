@@ -261,12 +261,9 @@ async def settle(
                 covers_attempts=[attempt.number for attempt in op.attempts],
             ).model_dump(mode="json")
             kind = _kinds.KIND_EFFECT_SETTLED
+        # The engine verifies a resend against these same fields before D5 (SPEC 5.3).
         data["mac"] = permissions.sign_settlement(
-            {
-                "session_id": session.id,
-                "kind": kind,
-                "data": {key: value for key, value in data.items() if key != "mac"},
-            }
+            _kinds.settlement_mac_fields(session.id, kind, data)
         )
         await writer.append_effect([_session.Entry(kind=kind, data=data)])
         op = writer.view().get(op.namespace, op.name, op.key)
