@@ -2907,4 +2907,6 @@ SEAMS = [
     ("M52", "qagents.effects._declare._error_links", "O1"),
     # Added by the AF-1 re-fix: an error after the engine's deadline cancel is the timeout.
     ("M53", "qagents.effects._engine._cancelled_at_deadline", "O2"),
+    # Added by the AF-1 re-fix: the one definition of the no-answer set.
+    ("M54", "qagents.effects._declare._no_answer_types", "O1"),
 ]

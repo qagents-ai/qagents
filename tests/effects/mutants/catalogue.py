@@ -223,6 +223,11 @@ def _cancellation_only(original, effect, timed_out, error):
     return timed_out and isinstance(error, asyncio.CancelledError)
 
 
+def _first_set_only(original):
+    # AF-1 review: the set before it held responses cut short and client-library types.
+    return original()[:5]
+
+
 E = "tests/effects/test_"
 M = "tests/effects/mutants/test_scenarios.py::"
 
@@ -399,6 +404,13 @@ _ROWS = [
         E
         + "engine_no_answer.py::test_refusal_raised_after_the_engine_cancelled_the_send_is_its_timeout[memory-after]",
         _cancellation_only,
+    ),
+    # M54: the no-answer set without the standard library's responses cut short and the
+    # client libraries' transport types, so an IncompleteReadError counts as rejected.
+    (
+        E
+        + "engine_guards.py::test_a_response_cut_short_or_a_client_library_disconnect_is_unknown[IncompleteReadError]",
+        _first_set_only,
     ),
 ]
 

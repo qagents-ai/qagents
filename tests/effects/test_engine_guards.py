@@ -264,6 +264,50 @@ def test_an_exception_group_holding_a_no_answer_error_is_unknown():
     assert engine._classify_send_error(send, refusals) == "rejected"
 
 
+def _lost_responses():
+    """Errors that mean no answer came back and carry no cause or context to read."""
+    import http.client
+    import ssl
+    import warnings
+
+    cases = [
+        (EOFError, asyncio.IncompleteReadError(b"", 10)),
+        (http.client.HTTPException, http.client.IncompleteRead(b"partial")),
+        (http.client.HTTPException, http.client.BadStatusLine("")),
+        (ssl.SSLError, ssl.SSLEOFError(8, "EOF occurred in violation of protocol")),
+        (ssl.SSLError, ssl.SSLZeroReturnError(6, "TLS/SSL connection has been closed")),
+    ]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # requests warns about its optional extras
+            import requests
+    except ImportError:
+        pass
+    else:
+        cases.append((requests.RequestException, requests.ConnectionError("aborted")))
+        cases.append((requests.RequestException, requests.exceptions.ChunkedEncodingError()))
+    try:
+        import aiohttp
+    except ImportError:
+        pass
+    else:
+        cases.append((aiohttp.ClientError, aiohttp.ServerDisconnectedError()))
+        cases.append((aiohttp.ClientError, aiohttp.ClientPayloadError("not completed")))
+    return cases
+
+
+_LOST = _lost_responses()
+
+
+@pytest.mark.parametrize("base,lost", _LOST, ids=[type(lost).__name__ for _, lost in _LOST])
+def test_a_response_cut_short_or_a_client_library_disconnect_is_unknown(base, lost):
+    # AF-1 review: these were accepted bases and classified as rejected.
+    send = declared()
+    send.rejected_on = (base,)  # refused at declaration now
+    assert isinstance(lost, base)
+    assert engine._classify_send_error(send, lost) == "unknown"
+
+
 def test_a_cycle_in_the_error_chain_ends():
     send = declared(rejected_on=(_Refused,))
     refused, other = _Refused("declined"), ValueError("cached")

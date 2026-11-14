@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import http.client
 import inspect
 import math
+import ssl
+import sys
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, NoReturn, TypeVar, get_args, get_origin, get_type_hints
@@ -29,27 +32,51 @@ def _pct(value: str, separator: str = ":") -> str:
     return value.replace("%", "%25").replace(separator, f"%{ord(separator):02X}")
 
 
+# Client libraries that are not qagents dependencies, with their own "no answer" errors
+# (SPEC 5.1). They are read from sys.modules, never imported: until its module is loaded,
+# such a type can be neither raised nor named in rejected_on.
+_CLIENT_NO_ANSWER = (
+    ("requests.exceptions", ("ConnectionError", "Timeout", "ChunkedEncodingError")),
+    ("urllib3.exceptions", ("TimeoutError", "ProtocolError")),
+    ("aiohttp", ("ClientConnectionError", "ClientPayloadError")),
+)
+
+
 def _no_answer_types() -> tuple[type[BaseException], ...]:
     """The transport-level "no answer" errors of SPEC 5.1, the one definition of the set.
 
-    A timeout, a lost, reset or refused connection, a cancellation and an httpx
-    transport error mean that no answer came back, so the destination may have
-    applied the call. Such an error is never a definite refusal: ``rejected_on``
-    may not overlap these types, and a send that raises one, or raises any error
-    from or while handling one, has an unknown outcome whatever ``rejected_on`` lists.
+    A timeout, a lost, reset or refused connection, a cancellation, a response cut
+    short and a client library's transport error mean that no answer came back, so
+    the destination may have applied the call. Such an error is never a definite
+    refusal: ``rejected_on`` may not overlap these types, and a send that raises
+    one, or raises any error from or while handling one, has an unknown outcome
+    whatever ``rejected_on`` lists.
     """
     # httpx is a core dependency, already loaded by `import qagents`. It is imported here
     # because this module's top level imports only the standard library, pydantic and
     # qagents itself (BUILD_PLAN 3.0).
     import httpx
 
-    return (
+    members: list[type[BaseException]] = [
         TimeoutError,
         ConnectionError,
         asyncio.CancelledError,
         concurrent.futures.CancelledError,
         httpx.TransportError,
-    )
+        asyncio.IncompleteReadError,
+        http.client.IncompleteRead,
+        http.client.BadStatusLine,
+        ssl.SSLEOFError,
+        ssl.SSLZeroReturnError,
+        ssl.SSLSyscallError,
+    ]
+    for module_name, names in _CLIENT_NO_ANSWER:
+        module = sys.modules.get(module_name)
+        for name in names:
+            kind = getattr(module, name, None)
+            if isinstance(kind, type) and issubclass(kind, BaseException):
+                members.append(kind)
+    return tuple(members)
 
 
 def _error_links(error: BaseException) -> Iterator[BaseException]:
@@ -125,7 +152,8 @@ def _check_rejected_on(rejected_on: object) -> None:
             raise ConfigurationError(
                 f"rejected_on must not list {_type_name(kind)}: it {relation} "
                 f"{_type_name(member)}, a transport-level error (a timeout, a lost or "
-                "refused connection, a cancellation or an httpx transport error). Such an "
+                "refused connection, a cancellation, a response cut short or a client "
+                "library's transport error). Such an "
                 "error means no answer came back and the destination may have applied the "
                 "call, so its outcome is unknown, never a definite refusal. List only the "
                 "exceptions your client raises for a refusal it received, such as a 4xx "
@@ -409,12 +437,13 @@ def effect(
     raises for a refusal it received from the destination, such as
     ``httpx.HTTPStatusError`` or an SDK's status error, not the SDK's catch-all
     base. A type that is, derives from or is a base class of a transport-level
-    error (a timeout, a lost or refused connection, a cancellation or an httpx
-    transport error) is refused here, because such an error means no answer
-    came back. A send that raises one has an unknown outcome, even when its
-    class also derives from a type in ``rejected_on``. So does a send that
-    raises any error from one or while handling one, as a client does when it
-    wraps a timeout in its own error (``raise PaymentsError(...) from error``).
+    error (a timeout, a lost or refused connection, a cancellation, a response
+    cut short, or a transport error of httpx, requests, urllib3 or aiohttp) is
+    refused here, because such an error means no answer came back. A send
+    that raises one has an unknown outcome, even when its class also derives
+    from a type in ``rejected_on``. So does a send that raises any error from
+    one or while handling one, as a client does when it wraps a timeout in its
+    own error (``raise PaymentsError(...) from error``).
     """
     if not isinstance(name, str) or not name.strip():
         raise ConfigurationError("effect name must be a nonempty string.")
