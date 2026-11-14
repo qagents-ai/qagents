@@ -47,30 +47,56 @@ async def _take_lease(
     )
     if not await writer.open():
         raise SettlementConflict(reason="session_busy")
+    # The operator works in its caller's task, so a lost lease cancels that task. Only
+    # that one cancel is the lease's own: it is taken back, and a cancel from outside
+    # propagates, counted from the caller's cancelling() now (as in the runtime).
     owner = asyncio.current_task()
-    lost = False
+    mark = 0 if owner is None else owner.cancelling()
+    lost = False  # the keeper reported the lease lost and cancelled the owner, once
+    owed = False  # that cancel is not taken back yet
 
     def on_lost(reason: str) -> None:
-        nonlocal lost
-        lost = True
-        if owner is not None:
+        nonlocal lost, owed
+        if owner is not None and not lost:
+            lost = owed = True
             owner.cancel()
+
+    def take_back() -> bool:
+        nonlocal owed
+        if not owed or owner is None:
+            return False
+        owed = False
+        return _take_back_cancel(owner, mark)
 
     keeper = asyncio.create_task(writer.keep(on_lost=on_lost))
     try:
         await writer.load()
         yield writer
     except asyncio.CancelledError:
-        if lost:
+        if take_back():  # the lease's own cancel: another worker took the session over
             raise SettlementConflict(reason="session_busy") from None
-        raise
+        raise  # a cancel from outside, with or without the lease's own
     except LeaseError as error:
         raise SettlementConflict(reason="session_busy") from error
     finally:
         keeper.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await keeper
-        await writer.close()
+        try:
+            await asyncio.wait([keeper])  # unlike awaiting it, lets an outside cancel through
+        finally:
+            take_back()  # a lease's cancel that the operator's code caught
+            await writer.close()
+        if not keeper.cancelled():
+            keeper.result()  # a keeper that failed fails the call, as before
+
+
+def _take_back_cancel(owner: asyncio.Task[Any], mark: int) -> bool:
+    """Take back the one cancel `_take_lease` gave ``owner`` for a lost lease.
+
+    True when no other cancel request remains (``owner.cancelling()`` is back at
+    ``mark``, its count when the lease was taken): the CancelledError is then the
+    lease's own and becomes ``SettlementConflict(reason="session_busy")``.
+    """
+    return owner.uncancel() <= mark
 
 
 def _resolve(writer: _session.LeasedWriter, reference: str) -> Operation:

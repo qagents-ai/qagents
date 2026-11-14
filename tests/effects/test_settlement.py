@@ -23,7 +23,7 @@ from qagents.effects import (
     effect,
 )
 from qagents.effects._types import MISSING, Absent, Unknown
-from qagents.errors import ConfigurationError, SettlementConflict
+from qagents.errors import ConfigurationError, LeaseError, SettlementConflict
 from qagents.permissions import Permissions
 from qagents.session import Entry, InMemoryStore, LeasedWriter, Session, SQLiteStore
 
@@ -621,6 +621,186 @@ async def test_cancelled_lookup_releases_operator_lease_without_an_answer(store,
         await task
     assert (await db.status(session.id)).lease_owner is None
     assert not any(entry.kind == "effect_settled" for entry in await session.entries())
+
+
+class CuedKeeper:
+    """Stands in for the operator lease's keeper (`LeasedWriter.keep`). When ``lose`` is
+    set it reports the lease lost, as after a refused renewal. ``running`` is set once it
+    runs, ``stopping`` when the operator stops it; it then waits for ``stop`` when that is
+    an event."""
+
+    def __init__(self) -> None:
+        self.lose = asyncio.Event()
+        self.running = asyncio.Event()
+        self.stopping = asyncio.Event()
+        self.stop: asyncio.Event | None = None
+
+
+@pytest.fixture
+def keeper(monkeypatch):
+    cue = CuedKeeper()
+
+    async def keep(writer, *, on_lost):
+        try:
+            cue.running.set()
+            await cue.lose.wait()
+            writer.lease._lost = True  # the self-fence, as Lease.keep marks it
+            on_lost("Lease renewal failed or arrived after the self-fence.")
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cue.stopping.set()
+            if cue.stop is not None:
+                await cue.stop.wait()
+            raise
+
+    monkeypatch.setattr(LeasedWriter, "keep", keep)
+    return cue
+
+
+async def outcome_in_own_task(operation, *, older_cancel=False):
+    """Run ``operation()`` in a task of its own: what it returned or raised, and how many
+    cancel requests that task has left beyond the ones it had before the call. With
+    ``older_cancel`` the task first catches a cancel without ``uncancel()``, so that
+    request stays counted."""
+
+    async def body():
+        me = asyncio.current_task()
+        if older_cancel:
+            me.cancel()
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                pass
+            assert me.cancelling() == 1
+        mark = me.cancelling()
+        try:
+            async with asyncio.timeout(5):
+                outcome = await operation()
+        except BaseException as raised:  # a CancelledError is an outcome here
+            outcome = raised
+        return outcome, me.cancelling() - mark
+
+    return await asyncio.create_task(body())
+
+
+@pytest.mark.parametrize("older_cancel", [False, True])
+@pytest.mark.parametrize("operation", ["settle", "recheck"])
+async def test_a_lease_lost_while_the_operator_waits_is_session_busy_and_takes_its_cancel_back(
+    store, lookup_port, keeper, operation, older_cancel
+):
+    """The lost lease cancels the caller's own task; the operator takes that cancel back
+    (AF-4 review). A cancel the caller caught earlier is not counted as one from outside."""
+    db, _ = store
+    session, held = await seed(db)
+    entered, release = asyncio.Event(), asyncio.Event()
+    lookup_port["wait"] = (entered, release)  # only the lease's cancel ends this lookup
+
+    async def operate():
+        if operation == "settle":
+            answer = Settle.not_applied(held, by="ops", evidence="checked")
+            return await settle(session, answer, declaration(lookup=True))
+        return await recheck(session, declaration(lookup=True))
+
+    operating = asyncio.create_task(outcome_in_own_task(operate, older_cancel=older_cancel))
+    await asyncio.wait_for(entered.wait(), 5)
+    keeper.lose.set()  # another worker takes the session over while the lookup runs
+    outcome, left = await asyncio.wait_for(operating, 5)
+    assert isinstance(outcome, SettlementConflict), repr(outcome)
+    assert outcome.reason == "session_busy"
+    assert left == 0  # not left cancelling: a later TaskGroup or start() is not cancelled
+    assert (await db.status(session.id)).lease_owner is None
+    assert not any(entry.kind == "effect_settled" for entry in await session.entries())
+    assert (await session.effects())[0].status == "held"
+
+
+async def test_an_outside_cancel_of_the_operator_propagates_when_the_lease_is_lost_too(
+    store, keeper
+):
+    db, _ = store
+    session, held = await seed(db)
+    entered = asyncio.Event()
+
+    async def authorize(answer, record):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:  # the outside cancel; the lease is lost as well
+            keeper.lose.set()
+            await asyncio.Event().wait()  # the lease's own cancel ends this wait
+            raise
+        return True
+
+    settling = asyncio.create_task(
+        settle(
+            session,
+            Settle.not_applied(held, by="ops", evidence="checked"),
+            permissions=Permissions(authorize_settlement=authorize),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    settling.cancel()
+    done, _ = await asyncio.wait([settling], timeout=5)
+    assert settling in done
+    assert settling.cancelled(), repr(settling.exception())  # not SettlementConflict
+    assert settling.cancelling() == 1  # the outside cancel stays; the lease's own is gone
+    assert (await db.status(session.id)).lease_owner is None
+    assert (await session.effects())[0].status == "held"
+
+
+async def test_a_lease_cancel_the_authorization_catches_is_still_taken_back(store, keeper):
+    db, clock = store
+    session, held = await seed(db)
+
+    async def authorize(answer, record):
+        keeper.lose.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass  # caught: the operator goes on, and its next write meets the new owner
+        clock[0] += 40
+        assert await db.acquire_lease(session.id, "new-owner", 30)
+        return True
+
+    async def operate():
+        answer = Settle.not_applied(held, by="ops", evidence="checked")
+        return await settle(
+            session, answer, permissions=Permissions(authorize_settlement=authorize)
+        )
+
+    outcome, left = await outcome_in_own_task(operate)
+    assert isinstance(outcome, SettlementConflict), repr(outcome)
+    assert outcome.reason == "session_busy"
+    assert isinstance(outcome.__cause__, LeaseError)
+    assert left == 0
+    assert (await session.effects())[0].status == "held"
+    assert (await db.status(session.id)).lease_owner == "new-owner"
+    await db.release_lease(session.id, "new-owner")
+
+
+async def test_an_outside_cancel_while_the_operator_stops_its_keeper_propagates(store, keeper):
+    db, _ = store
+    session, held = await seed(db)
+    keeper.stop = asyncio.Event()
+
+    async def authorize(answer, record):
+        await keeper.running.wait()  # the keeper runs before the operator stops it
+        return True
+
+    settling = asyncio.create_task(
+        settle(
+            session,
+            Settle.not_applied(held, by="ops", evidence="checked"),
+            permissions=Permissions(authorize_settlement=authorize),
+        )
+    )
+    await asyncio.wait_for(keeper.stopping.wait(), 5)  # the answer is written
+    settling.cancel()
+    keeper.stop.set()
+    done, _ = await asyncio.wait([settling], timeout=5)
+    assert settling in done
+    assert settling.cancelled(), repr(settling.exception())  # not swallowed
+    assert (await session.effects())[0].status == "not_applied"  # the answer is durable
+    assert (await db.status(session.id)).lease_owner is None
 
 
 async def test_operator_commit_ack_loss_reads_back_one_atomic_claim_and_entry():

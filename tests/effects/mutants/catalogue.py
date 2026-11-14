@@ -490,6 +490,13 @@ _ROWS = [
         "tests/test_runtime.py::test_an_older_cancel_request_on_the_caller_does_not_hide_a_lost_lease[start]",
         _count_from_zero,
     ),
+    # M63: the operator lease never takes its own cancel back and turns any CancelledError
+    # after a lost lease into session_busy, so the caller is left cancelling (AF-4 review).
+    (
+        E
+        + "settlement.py::test_a_lease_lost_while_the_operator_waits_is_session_busy_and_takes_its_cancel_back[memory-settle-False]",
+        constant(True),
+    ),
 ]
 
 CASES = tuple(

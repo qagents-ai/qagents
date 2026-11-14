@@ -2925,4 +2925,6 @@ SEAMS = [
     ("M61", "qagents.permissions.Permissions._callback_may_ask", "O4b"),
     # Added by the AF-4 re-fix: a lost lease is the runtime's own cancel, counted from the mark.
     ("M62", "qagents.runtime.AgentRuntime._stop_preparing", "O6"),
+    # Added by the AF-4 re-fix: the operator lease takes back only its own cancel.
+    ("M63", "qagents.effects._operator._take_back_cancel", "O5"),
 ]
