@@ -206,6 +206,11 @@ def _lookup_at_end(original, started, quiescent):
     return quiescent is not None
 
 
+def _local_attempts_only(original, effect, op):
+    # fable-3: only this record's own attempts let the lookup run, not a transferred claim's.
+    return "none_declared" if not op.attempts else original(effect, op)
+
+
 E = "tests/effects/test_"
 M = "tests/effects/mutants/test_scenarios.py::"
 
@@ -348,6 +353,13 @@ _ROWS = [
         E
         + "engine_no_answer.py::test_no_answer_after_application_is_held_not_resent_under_a_new_key[memory-timeout_subclass]",
         constant(False),
+    ),
+    # M49: a claim taken over from another session as rejected skips the declared lookup,
+    # and D2 applies the operation again under a new key (AF-2).
+    (
+        E
+        + "engine_claim_transfer.py::test_applied_then_rejection_shaped_error_is_found_not_applied_again[memory-True]",
+        _local_attempts_only,
     ),
 ]
 

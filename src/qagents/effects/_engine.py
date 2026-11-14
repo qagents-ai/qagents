@@ -407,7 +407,9 @@ async def _dispatch(
                 prompts.TOOL_THREADS_EXHAUSTED.format(name=effect.name, count=tools.TOOL_THREADS)
             )
     try:
-        number = max((item.number for item in op.attempts), default=0) + 1
+        number = (
+            max((item.number for item in [*op.attempts, *_claimed_attempts(op)]), default=0) + 1
+        )
         salt = await journal.salt()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + effect.timeout_s
@@ -791,6 +793,56 @@ def _d2_plan(effect: Effect, op: Operation) -> tuple[bool, int]:
     return effect.lookup_fn is not None, op.generation + int(changes_key)
 
 
+def _claimed_attempts(op: Operation) -> list[kinds.ClaimAttemptData]:
+    return list(op.claimed.attempts) if op.claimed is not None else []
+
+
+def _lookup_state(effect: Effect, op: Operation) -> Literal["not_run", "none_declared"]:
+    """A declared lookup runs first once the journal holds any earlier attempt (M49).
+
+    The attempts may be this record's own or another owner's, carried over by a
+    claim transfer (SPEC 4.4 D2, 7.10).
+    """
+    if effect.lookup_fn is None or not (op.attempts or op.claimed is not None):
+        return "none_declared"
+    return "not_run"
+
+
+async def _take_claim(
+    effect: Effect, op: Operation, claim: Any, prepared: _Prepared, scope: CallScope
+) -> None:
+    """Journal the move of a rejected claim, with its attempt history, before any
+    lookup or send (SPEC 7.10). The claim index refuses it if the claim changed."""
+    journal = scope.journal
+    payload = kinds.EffectClaimedData(
+        **_reference(op),
+        version=effect.version,
+        request_digest=prepared.frozen.digest,
+        destination_digest=prepared.descriptor.destination_digest,
+        request=prepared.frozen.json,
+        operation_tag=canonical.operation_tag(
+            op.namespace, op.name, op.key, prepared.frozen.digest
+        ),
+        receipt_identity=list(effect.receipt_identity)
+        if effect.receipt_identity is not None
+        else None,
+        operation_id=scope.operation_id,
+        tool_call_id=scope.tool_call_id,
+        previous_owner={
+            "session_id": claim.session_id,
+            "incarnation": claim.incarnation,
+            "record_id": claim.record_id,
+        },
+        status="rejected",
+        generation=claim.generation,
+        first_use_at=claim.first_use_at,
+        attempts=claim.attempts,
+        store_ts=await journal.store_now(),
+    )
+    await _append_outcome(scope, kinds.KIND_EFFECT_CLAIMED, payload)
+    _reach(scope, op, "C1")
+
+
 async def perform(
     effect: Effect[ReqT, RecT], request: ReqT, *, scope: CallScope, occurrence: int | None = None
 ) -> RecT:
@@ -1028,7 +1080,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
             else:
                 claim_kind = "held_elsewhere"
 
-    lookup = "none_declared" if effect.lookup_fn is None or not op.attempts else "not_run"
+    lookup = _lookup_state(effect, op)
     reason = None
     retry_blocked = False
     while True:
@@ -1197,10 +1249,19 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
                 )
                 _reach(scope, op, "C1", "claim_replayed")
                 return _receipt(effect, view.get(*key), scope, replayed=True)
-            # The atomic claim append checks for intervening changes and transfers ownership.
+            if claim_kind == "rejected":
+                if not situation.fence_ok:
+                    raise LeaseError("Effect dispatch refused: no safe lease margin.")
+                # Record first: the claim and its earlier attempts move here, then the
+                # folded R(n) rows decide, so a declared lookup runs before any D2.
+                await _take_claim(effect, op, claim, prepared, scope)
+                claim_kind = "none"
+                lookup = _lookup_state(effect, journal.view().get(*key))
+                continue
+            # Never sent: the atomic intent append checks the claim and transfers it (D1).
             op = replace(op, generation=claim.generation, first_use_at=claim.first_use_at)
             row = table.decide(
-                table.TState.R if claim_kind == "rejected" else table.TState.N,
+                table.TState.N,
                 table.TEvent.PERFORM,
                 replace(situation, claim="none", same_call=False),
             )
@@ -1279,17 +1340,22 @@ async def lookup_and_record(
     # The caller's view and the model in Inquiry can both change while lookup awaits.
     # Binding always uses the original durable JSON, independently of either object.
     original = deepcopy(op)
-    if original.request is None or original.descriptor is None or not original.attempts:
-        raise ConfigurationError("Lookup requires a journaled effect intent.")
+    if (
+        original.request is None
+        or original.descriptor is None
+        or not (original.attempts or original.claimed is not None)
+    ):
+        raise ConfigurationError("Lookup requires a journaled effect intent or claim transfer.")
     request = json.loads(jcs(original.request))
-    inquiry = types.Inquiry(
-        request=effect.request_type.model_validate_json(jcs(request)),
-        key=original.key,
-        operation_tag=canonical.operation_tag(
-            original.namespace, original.name, original.key, original.descriptor.request_digest
+    # Earlier owners' attempts come first: the lookup asks about every key ever sent.
+    attempts = (
+        *(
+            types.AttemptInfo(
+                a.number, a.generation, a.idempotency_key, a.epoch, a.store_ts, a.outcome
+            )
+            for a in _claimed_attempts(original)
         ),
-        idempotency_keys=tuple(dict.fromkeys(a.intent.idempotency_key for a in original.attempts)),
-        attempts=tuple(
+        *(
             types.AttemptInfo(
                 a.number,
                 a.generation,
@@ -1300,6 +1366,15 @@ async def lookup_and_record(
             )
             for a in original.attempts
         ),
+    )
+    inquiry = types.Inquiry(
+        request=effect.request_type.model_validate_json(jcs(request)),
+        key=original.key,
+        operation_tag=canonical.operation_tag(
+            original.namespace, original.name, original.key, original.descriptor.request_digest
+        ),
+        idempotency_keys=tuple(dict.fromkeys(a.idempotency_key for a in attempts)),
+        attempts=attempts,
         first_use_at=original.first_use_at,
     )
     ctx = types.EffectContext(deps, session_id=journal.session_id)
@@ -1405,11 +1480,12 @@ async def lookup_and_record(
     patch = patch_error = None
     if receipt is not None and current.commit_seq is None and current.state != "X":
         patch, patch_error = on_commit_patch(effect, state_values(), request, receipt)
-    target = original.attempts[-1]
+    # After a claim transfer with no local attempt, the find names no attempt of this record.
+    target = original.attempts[-1] if original.attempts else None
     committed = kinds.EffectCommittedData(
         **ref,
-        attempt=target.number,
-        intent_seq=target.intent_seq,
+        attempt=target.number if target is not None else None,
+        intent_seq=target.intent_seq if target is not None else None,
         via="lookup",
         receipt=receipt,
         receipt_error=receipt_error,
