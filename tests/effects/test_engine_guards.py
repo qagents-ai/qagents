@@ -248,6 +248,22 @@ def test_a_refusal_from_a_received_response_or_an_unrelated_error_stays_rejected
         )
 
 
+def test_an_exception_group_holding_a_no_answer_error_is_unknown():
+    # AF-1 review: an asyncio.TaskGroup child's timeout reaches the engine inside a group.
+    send = declared()
+    send.rejected_on = (_Refused, BaseExceptionGroup)  # refused at declaration now
+    timeout = ExceptionGroup("charge", [ValueError("audit"), httpx.ReadTimeout("lost")])
+    assert engine._classify_send_error(send, timeout) == "unknown"
+    cancelled = BaseExceptionGroup("charge", [asyncio.CancelledError()])
+    assert engine._classify_send_error(send, cancelled) == "unknown"
+    nested = ExceptionGroup("outer", [ExceptionGroup("inner", [ConnectionResetError()])])
+    assert engine._classify_send_error(send, nested) == "unknown"
+    wrapped = _wrapped(timeout, _Refused("payments request failed"), "from")
+    assert engine._classify_send_error(declared(rejected_on=(_Refused,)), wrapped) == "unknown"
+    refusals = type("Refusals", (_Refused, ExceptionGroup), {})("charge", [ValueError("bad")])
+    assert engine._classify_send_error(send, refusals) == "rejected"
+
+
 def test_a_cycle_in_the_error_chain_ends():
     send = declared(rejected_on=(_Refused,))
     refused, other = _Refused("declined"), ValueError("cached")

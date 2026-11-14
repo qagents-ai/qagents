@@ -53,12 +53,13 @@ def _no_answer_types() -> tuple[type[BaseException], ...]:
 
 
 def _error_links(error: BaseException) -> Iterator[BaseException]:
-    """The error and each error it was raised from or while handling.
+    """The error, each error it was raised from or while handling, and group members.
 
     Both ``__cause__`` and ``__context__`` are followed, even when ``raise ... from
     None`` hid the context: an error raised while handling a timeout still follows a
-    request that got no answer. Each error is yielded once, so a cycle ends (SPEC 5.1;
-    mutant seam M52).
+    request that got no answer. Each member of an exception group (an
+    ``asyncio.TaskGroup`` raises one) is followed the same way. Each error is
+    yielded once, so a cycle ends (SPEC 5.1; mutant seam M52).
     """
     seen: set[int] = set()
     pending = [error]
@@ -68,6 +69,8 @@ def _error_links(error: BaseException) -> Iterator[BaseException]:
             continue
         seen.add(id(link))
         yield link
+        if isinstance(link, BaseExceptionGroup):
+            pending.extend(reversed(link.exceptions))
         for linked in (link.__context__, link.__cause__):
             if linked is not None:
                 pending.append(linked)
@@ -76,9 +79,10 @@ def _error_links(error: BaseException) -> Iterator[BaseException]:
 def _no_answer(error: BaseException) -> bool:
     """Whether a raised error is a transport-level no answer, so its outcome is unknown.
 
-    It is when the error, or an error in its cause or context chain, is one of the
-    set. The engine and the crash harness's destination fakes call it before they
-    read ``EffectRejected`` or ``rejected_on`` (SPEC 5.1; mutant seam M48).
+    It is when the error, an error in its cause or context chain, or a member of an
+    exception group among them is one of the set. The engine and the crash harness's
+    destination fakes call it before they read ``EffectRejected`` or ``rejected_on``
+    (SPEC 5.1; mutant seam M48).
     """
     members = _no_answer_types()
     return any(isinstance(link, members) for link in _error_links(error))
@@ -101,6 +105,13 @@ def _check_rejected_on(rejected_on: object) -> None:
                 f"rejected_on must not list {_type_name(kind)}: it is too broad to be a "
                 "definite refusal. List the exceptions your client raises for a refusal "
                 "it received from the destination."
+            )
+        if issubclass(kind, BaseExceptionGroup):
+            raise ConfigurationError(
+                f"rejected_on must not list {_type_name(kind)}: it is an exception group, "
+                "which can hold any error, a transport-level one included, so it is too "
+                "broad to be a definite refusal. List the exceptions your client raises "
+                "for a refusal it received from the destination."
             )
         for member in _no_answer_types():
             if kind is member:

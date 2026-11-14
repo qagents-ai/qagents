@@ -349,6 +349,22 @@ def test_rejected_on_refuses_transport_no_answer_types_and_their_bases(kind, rel
     assert "no answer came back" in message and "unknown" in message
 
 
+class _PaymentsErrors(ExceptionGroup):
+    """A client's own exception group: it can still hold a transport error."""
+
+
+@pytest.mark.parametrize(
+    "kind", [ExceptionGroup, BaseExceptionGroup, _PaymentsErrors], ids=lambda kind: kind.__name__
+)
+def test_rejected_on_refuses_exception_groups(kind):
+    with pytest.raises(ConfigurationError) as refused:
+        declare(rejected_on=(ValueError, kind))
+    message = str(refused.value)
+    assert message.startswith("rejected_on must not list ")
+    assert f"{kind.__qualname__}: it is an exception group" in message
+    assert "too broad" in message
+
+
 def test_rejected_on_accepts_own_refusals_and_received_http_status_errors():
     class InvalidRequest(Exception):
         """A 4xx validation refusal the client received."""

@@ -8,6 +8,8 @@ are the AF-1 review's shape: the client wraps the httpx timeout in its own refus
 (``raise PaymentsError(...) from error``), as most clients and SDKs do.
 """
 
+import asyncio
+
 import httpx
 import pytest
 from pydantic import BaseModel
@@ -58,7 +60,8 @@ class Destination:
 
 
 # (raised error, rejected_on forced past the declaration check as in the probe, how the
-# send wraps a transport error in PaymentsError: None, "from", "context" or "from_none")
+# send wraps a transport error in PaymentsError: None, "from", "context" or "from_none";
+# "task_group" runs the charge in an asyncio.TaskGroup, so it raises an ExceptionGroup)
 CASES = {
     "timeout_subclass": (PaymentsTimeout, None, None),
     "httpx_subclass": (PaymentsReadTimeout, None, None),
@@ -66,6 +69,8 @@ CASES = {
     "wrapped_from": (httpx.ReadTimeout, None, "from"),
     "wrapped_context": (httpx.ReadTimeout, None, "context"),
     "wrapped_from_none": (httpx.ReadTimeout, None, "from_none"),
+    "task_group": (httpx.ReadTimeout, (ExceptionGroup,), "task_group"),
+    "task_group_wrapped": (httpx.ReadTimeout, None, "task_group_wrapped"),
 }
 
 
@@ -90,6 +95,19 @@ def build(destination: Destination, forced: tuple | None, wrap: str | None, *, l
     async def charge(ctx: EffectContext, attempt: Attempt[Charge]) -> ChargeReceipt:
         if wrap is None:
             return destination.charge(attempt)
+        if wrap.startswith("task_group"):
+
+            async def leg() -> ChargeReceipt:
+                return destination.charge(attempt)
+
+            try:
+                async with asyncio.TaskGroup() as group:  # say, the charge and an audit call
+                    task = group.create_task(leg())
+            except* httpx.HTTPError as lost:
+                if wrap == "task_group_wrapped":
+                    raise PaymentsError("payments request failed") from lost
+                raise
+            return task.result()
         try:
             return destination.charge(attempt)
         except httpx.HTTPError as error:
