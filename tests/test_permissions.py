@@ -106,6 +106,14 @@ def test_asks_by_rule_leaves_out_can_use_tool():
     assert Permissions(can_use_tool=lambda *args: "ask")._asks_by_rule(send_email) is False
 
 
+def test_callback_may_ask_for_any_call_no_deny_rule_refuses_first():
+    """can_use_tool decides per call, so the build check counts every call it may see."""
+    _, refund_order, _ = make_tools([])
+    callback = Permissions(can_use_tool=lambda *args: "allow", deny=["send_*"])
+    assert [callback._callback_may_ask(item) for item in make_tools([])] == [True, True, False]
+    assert not Permissions(mode="ask_all")._callback_may_ask(refund_order)  # no callback
+
+
 async def test_denied_calls_are_reported_to_the_model():
     log: list[str] = []
     model = ScriptedModel([call("send_email", to="a@example.com"), "I could not send it."])

@@ -470,6 +470,13 @@ _ROWS = [
         + "unsigned_approvals.py::test_an_approval_gated_effects_tool_with_no_automatic_resend_does_not_warn[opaque]",
         constant(True),
     ),
+    # M61: the build check ignores can_use_tool, so an effects tool that the callback sends
+    # to "ask" holds APPROVAL_UNVERIFIABLE with no warning (AF-5 review).
+    (
+        E
+        + "unsigned_approvals.py::test_build_warns_once_when_can_use_tool_may_ask_for_an_effects_tool[no_rule]",
+        constant(False),
+    ),
 ]
 
 CASES = tuple(

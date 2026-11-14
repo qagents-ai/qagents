@@ -209,6 +209,64 @@ def test_one_warning_names_every_approval_gated_effects_tool(caplog):
     )
 
 
+def ask(*args):
+    return "ask"
+
+
+@pytest.mark.parametrize("requires_approval", [False, True], ids=["no_rule", "rule_too"])
+def test_build_warns_once_when_can_use_tool_may_ask_for_an_effects_tool(caplog, requires_approval):
+    """can_use_tool decides per call, so the build cannot tell whether it asks: it warns."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    Agent(
+        model(),
+        tools=[refund_tool(requires_approval=requires_approval)],
+        permissions=Permissions(can_use_tool=ask),
+    )
+    records = warnings_about_secret(caplog)
+    assert len(records) == 1  # one warning, not one per check
+    message = records[0].getMessage()
+    assert message.startswith("refund_order: this effects tool may ask for approval")
+    assert "can_use_tool decides per call" in message
+    assert "APPROVAL_UNVERIFIABLE" in message and "D3 and D4" in message
+    assert "Set Permissions(approval_secret=...)" in message
+
+
+@pytest.mark.parametrize(
+    "permissions,send",
+    [
+        (Permissions(can_use_tool=ask, approval_secret=SECRET), None),
+        (Permissions(can_use_tool=ask, deny=["refund_*"]), None),  # refused before it
+        (Permissions(can_use_tool=ask), shaped_effect("opaque")),  # nothing to re-send
+    ],
+    ids=["secret", "denied", "opaque"],
+)
+def test_can_use_tool_does_not_warn_with_a_secret_a_deny_rule_or_no_resend(
+    caplog, permissions, send
+):
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    tool_ = refund_tool(requires_approval=False, send=send) if send else refund_tool()
+    Agent(model(), tools=[tool_], permissions=permissions)
+    assert warnings_about_secret(caplog) == []
+
+
+async def test_an_effect_that_can_use_tool_asked_for_holds_unverifiable(tmp_path):
+    """What the can_use_tool warning says: the same hold as for a tool the rules ask."""
+    destination = []
+    agent = Agent(
+        model(),
+        tools=[
+            refund_tool(requires_approval=False, send=refund_effect(destination, slow_first=True))
+        ],
+        permissions=Permissions(can_use_tool=ask, on_ask=lambda *args: True),
+    )
+    async with SQLiteStore(tmp_path / "callback.sqlite") as db:
+        paused = await agent.run("Refund R1", session=Session(db, id="s"))
+    assert [(item.reason, item.retry_after) for item in paused.held_effects] == [
+        (HoldReason.APPROVAL_UNVERIFIABLE, None)
+    ]
+    assert len(destination) == 1
+
+
 class RefundToolkit(Toolkit):
     def __init__(self, tool_):
         self.tool = tool_

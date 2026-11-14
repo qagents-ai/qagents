@@ -2921,4 +2921,6 @@ SEAMS = [
     ("M59", "qagents.effects._engine._authorization_decides", "O2"),
     # Added by the AF-5 re-fix: the warning names only tools with an automatic re-send.
     ("M60", "qagents.agent._resends_automatically", "O4a"),
+    # Added by the AF-5 re-fix: with can_use_tool, the build warns that a call may ask.
+    ("M61", "qagents.permissions.Permissions._callback_may_ask", "O4b"),
 ]

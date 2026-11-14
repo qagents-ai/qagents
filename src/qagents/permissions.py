@@ -391,6 +391,16 @@ class Permissions:
         """
         return not _matches(tool.name, self.deny) and self._by_rules(tool).behavior == "ask"
 
+    def _callback_may_ask(self, tool: Tool) -> bool:
+        """Whether ``can_use_tool`` may lead to an "ask" before ``tool`` runs.
+
+        It decides per call, before the ``ask`` patterns and the mode, so the build cannot
+        tell: any call that no ``deny`` pattern refuses first may be asked, by the callback
+        or by the rules it leaves the call to. False without ``can_use_tool``. The agent
+        checks it when it is built, as `_asks_by_rule` without a callback.
+        """
+        return self.can_use_tool is not None and not _matches(tool.name, self.deny)
+
     def _by_rules(self, tool: Tool) -> Decision:
         """Steps 3 to 5 of the order: the ``ask`` and ``allow`` patterns, then the mode
         (under ``"default"``, ``requires_approval``)."""

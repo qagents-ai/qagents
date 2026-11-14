@@ -504,29 +504,41 @@ class Agent:
         verifiable decision (5.4), so these effects are never re-sent automatically: where
         one of them would, an effect whose outcome is in doubt holds as
         APPROVAL_UNVERIFIABLE. Only tools with an effect that D3 or D4 can re-send are named:
-        for the others the secret changes no hold (7.1 H1). The hold is right; the warning
-        tells the developer before the first crash does."""
-        if self.permissions.signs_pauses:
+        for the others the secret changes no hold (7.1 H1). With ``can_use_tool`` the build
+        cannot tell which calls ask, so every such tool that no deny pattern refuses may ask
+        and is named. The hold is right; the warning tells the developer before the first
+        crash does."""
+        permissions = self.permissions
+        if permissions.signs_pauses:
             return
+        per_call = permissions.can_use_tool is not None
+        may_ask = permissions._callback_may_ask if per_call else permissions._asks_by_rule
         names = [
             tool.name
             for tool in effects_tools
             if tool.name not in self._unsigned_approvals_warned
             and _resends_automatically(tool)
-            and self.permissions._asks_by_rule(tool)
+            and may_ask(tool)
         ]
         if not names:
             return
         self._unsigned_approvals_warned.update(names)
+        subject = "this effects tool" if len(names) == 1 else "these effects tools"
+        if per_call:
+            subject += (
+                " may ask for approval (can_use_tool decides per call, so the build cannot tell)"
+            )
+        else:
+            subject += " asks for approval" if len(names) == 1 else " ask for approval"
         logger.warning(
-            "%s: %s for approval, but Permissions has no approval_secret, so no decision is "
-            "signed. Without a verifiable decision, rules D3 and D4 never re-send an effect "
-            "automatically, in the run or after a crash: where one of them would, an effect "
-            "whose outcome is in doubt, and that no lookup finds, is held as "
-            "APPROVAL_UNVERIFIABLE until an operator settles it (agent.settle). Set "
-            "Permissions(approval_secret=...) to sign approval decisions.",
+            "%s: %s, but Permissions has no approval_secret, so no decision is signed. Without "
+            "a verifiable decision, rules D3 and D4 never re-send an effect automatically, in "
+            "the run or after a crash: where one of them would, an effect whose outcome is in "
+            "doubt, and that no lookup finds, is held as APPROVAL_UNVERIFIABLE until an "
+            "operator settles it (agent.settle). Set Permissions(approval_secret=...) to sign "
+            "approval decisions.",
             ", ".join(names),
-            "this effects tool asks" if len(names) == 1 else "these effects tools ask",
+            subject,
         )
 
     def stream(
