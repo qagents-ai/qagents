@@ -196,6 +196,12 @@ class RunHandle:
         self._preparing_task = asyncio.current_task()
         """The caller's task, which prepares the run until it is launched; a lost lease
         cancels it (see `AgentRuntime._stop_preparing`)."""
+        self._preparing_mark = (
+            0 if self._preparing_task is None else self._preparing_task.cancelling()
+        )
+        """``_preparing_task.cancelling()`` when the preparation began. An older cancel
+        request (one that code caught without ``uncancel``) is not a cancel of this
+        preparation from outside."""
         self._preparation_cancelled = False
         """`AgentRuntime._lose_lease` cancelled ``_preparing_task``; the runtime takes that
         cancel back when the preparation ends."""
@@ -1357,15 +1363,16 @@ class AgentRuntime:
         The run is prepared in the task that called `start`, `resume` or `recover`.
         When `_lose_lease` cancelled that task, take the cancel back (``Task.uncancel``),
         so the caller is not left cancelling. True when the lease was lost and nothing
-        else asked to cancel the caller: the CancelledError is then the runtime's own,
-        and the caller gets a `LeaseError` (or `recover` passes the session over). A
-        cancel from outside still propagates.
+        else asked to cancel the caller since the preparation began (its count is back
+        at ``_preparing_mark``): the CancelledError is then the runtime's own, and the
+        caller gets a `LeaseError` (or `recover` passes the session over). A cancel
+        from outside still propagates.
         """
         task, handle._preparing_task = handle._preparing_task, None
         if task is None or not handle._preparation_cancelled:
             return False
         handle._preparation_cancelled = False
-        return task.uncancel() == 0
+        return task.uncancel() <= handle._preparing_mark
 
     def _lost_while_preparing(self, session_id: str) -> LeaseError:
         return LeaseError(

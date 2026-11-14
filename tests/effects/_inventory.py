@@ -2923,4 +2923,6 @@ SEAMS = [
     ("M60", "qagents.agent._resends_automatically", "O4a"),
     # Added by the AF-5 re-fix: with can_use_tool, the build warns that a call may ask.
     ("M61", "qagents.permissions.Permissions._callback_may_ask", "O4b"),
+    # Added by the AF-4 re-fix: a lost lease is the runtime's own cancel, counted from the mark.
+    ("M62", "qagents.runtime.AgentRuntime._stop_preparing", "O6"),
 ]

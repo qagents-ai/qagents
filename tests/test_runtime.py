@@ -1542,6 +1542,50 @@ async def test_an_outside_cancel_during_start_still_propagates(lease_lost_too):
     await runtime.shutdown()
 
 
+@pytest.mark.parametrize("entry", ["start", "recover"])
+async def test_an_older_cancel_request_on_the_caller_does_not_hide_a_lost_lease(entry):
+    """A cancel the caller caught earlier without ``uncancel()`` still counts in its
+    ``cancelling()``. It is not a cancel of this preparation from outside (AF-4 review)."""
+    store = LosesLeaseOnCue()
+    if entry == "recover":
+        await store.append("s", open_run())
+
+    async def deps(session_id: str) -> None:
+        store.refused = True  # another worker takes the session over meanwhile
+        await asyncio.Event().wait()
+
+    runtime = AgentRuntime(store, [echo_agent()], deps_factory=deps, **CUE)
+
+    async def caller() -> tuple[object, int]:
+        me = asyncio.current_task()
+        assert me is not None
+        me.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass  # caught without uncancel(): the request stays counted
+        assert me.cancelling() == 1
+        try:
+            async with asyncio.timeout(5):
+                if entry == "start":
+                    return await runtime.start("worker", "go", session_id="s"), me.cancelling()
+                return await runtime.recover(), me.cancelling()
+        except BaseException as raised:  # a CancelledError too: that was the bug
+            return raised, me.cancelling()
+
+    outcome, cancelling = await asyncio.create_task(caller())
+    if entry == "start":
+        assert isinstance(outcome, LeaseError), repr(outcome)
+        assert "while it prepared the run" in str(outcome)
+    else:
+        assert outcome == [], repr(outcome)  # recover() passes the session over
+    assert cancelling == 1  # the runtime took back its own cancel, not the older one
+    status = await store.status("s")
+    assert status.lease_owner is None
+    assert runtime.handles == {}
+    await runtime.shutdown()
+
+
 async def test_a_lease_lost_while_a_recovery_is_prepared_leaves_run_forever_polling():
     store = LosesLeaseOnCue()
     await store.append("s", open_run())

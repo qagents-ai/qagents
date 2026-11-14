@@ -244,6 +244,13 @@ def _folded_state(original, permissions, session_id, op, answer):
     return op.state
 
 
+def _count_from_zero(original, runtime, handle):
+    # AF-4 review: the caller's count was compared with 0, not with its count when the
+    # preparation began, so an older cancel request turned a lost lease into CancelledError.
+    handle._preparing_mark = 0
+    return original(runtime, handle)
+
+
 E = "tests/effects/test_"
 M = "tests/effects/mutants/test_scenarios.py::"
 
@@ -476,6 +483,12 @@ _ROWS = [
         E
         + "unsigned_approvals.py::test_build_warns_once_when_can_use_tool_may_ask_for_an_effects_tool[no_rule]",
         constant(False),
+    ),
+    # M62: a caller that caught an older cancel without uncancel() gets the runtime's own
+    # CancelledError, not LeaseError, when its lease is lost while the run is prepared (AF-4).
+    (
+        "tests/test_runtime.py::test_an_older_cancel_request_on_the_caller_does_not_hide_a_lost_lease[start]",
+        _count_from_zero,
     ),
 ]
 
