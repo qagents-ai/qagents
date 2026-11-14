@@ -32,6 +32,8 @@ BACKENDS = [
     ),
 ]
 FAST = {"lease_ttl_s": 0.3, "heartbeat_s": 0.05}
+CUE = {"lease_ttl_s": 30.0, "heartbeat_s": 0.01}
+"""A lease that is lost only when its store refuses a renewal, noticed at the next heartbeat."""
 
 
 class CrashableStore(SessionStore):
@@ -595,6 +597,10 @@ async def test_a_worker_that_loses_its_lease_stops_and_cannot_write():
     entries = len(await store.load("s"))
     with pytest.raises(RunInterrupted, match="lost its lease"):
         await asyncio.wait_for(handle.wait(), 5)
+    # Once launched, a lost lease cancels the runtime's own task, never the caller's.
+    caller = asyncio.current_task()
+    assert caller is not None and caller.cancelling() == 0
+    assert handle._task is not None and handle._task.cancelled()
     gate.set()
     await asyncio.sleep(0.05)
     assert len(await store.load("s")) == entries  # w1 wrote nothing after losing the lease
@@ -1361,7 +1367,7 @@ async def test_renewal_errors_stop_the_run_at_its_last_confirmed_deadline(failur
         await runtime.shutdown(timeout_s=0)
 
 
-async def test_unconfirmed_lease_also_cancels_preparation():
+async def test_unconfirmed_lease_also_stops_preparation_with_a_lease_error():
     class UnreachableRenewal(InMemoryStore):
         async def renew_lease(self, session_id, owner, ttl):
             raise ConnectionError("renewal unavailable")
@@ -1377,13 +1383,163 @@ async def test_unconfirmed_lease_also_cancels_preparation():
     runtime = AgentRuntime(UnreachableRenewal(), [echo_agent()], deps_factory=deps, **FAST)
     starting = asyncio.create_task(runtime.start("worker", "go", session_id="s"))
     try:
-        done, _ = await asyncio.wait([starting], timeout=1)
-        assert starting in done and starting.cancelled()
+        done, _ = await asyncio.wait([starting], timeout=5)
+        assert starting in done and not starting.cancelled()
+        assert isinstance(starting.exception(), LeaseError)  # not the runtime's own cancel
+        assert starting.cancelling() == 0
         assert stopped.is_set()
     finally:
         starting.cancel()
         await asyncio.gather(starting, return_exceptions=True)
         await runtime.shutdown(timeout_s=0)
+
+
+class LosesLeaseOnCue(InMemoryStore):
+    """Renews leases until ``refused`` is set, then refuses, as after a takeover.
+
+    ``stall`` names an entry kind: the first leased write with one sets ``refused`` and
+    waits, writing nothing, until it is cancelled. The identical retry goes through.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refused = False
+        self.stall: str | None = None
+
+    async def renew_lease(self, session_id, owner, ttl_s):
+        if self.refused:
+            return False
+        return await super().renew_lease(session_id, owner, ttl_s)
+
+    async def append_leased(self, session_id, entries, owner):
+        if self.stall is not None and any(entry.kind == self.stall for entry in entries):
+            self.stall, self.refused = None, True
+            await asyncio.Event().wait()
+        return await super().append_leased(session_id, entries, owner)
+
+
+def open_run(agent: str = "worker") -> list[Entry]:
+    """The journal of a run that started and was never finished."""
+    return [
+        Entry(kind="run_started", run_id="r", data={"agent": agent}),
+        Entry(kind="message", run_id="r", data={"message": Message.user("go").model_dump()}),
+    ]
+
+
+@pytest.mark.parametrize("phase", ["start", "resume", "start_journaled"])
+async def test_a_lease_lost_while_the_run_is_prepared_raises_lease_error(phase):
+    store = LosesLeaseOnCue()
+    stopped = asyncio.Event()
+
+    async def deps(session_id: str) -> None:
+        store.refused = True  # another worker takes the session over meanwhile
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    if phase == "resume":
+        await store.append("s", open_run())
+    journaled = phase == "start_journaled"
+    if journaled:  # lost after the run is journaled, while its limits are written
+        store.stall = LIMITS_KIND
+    runtime = AgentRuntime(store, [echo_agent()], deps_factory=None if journaled else deps, **CUE)
+    before = [entry.kind for entry in await store.load("s")]
+    caller = asyncio.current_task()
+    assert caller is not None
+    outcome: BaseException | None = None
+    try:
+        async with asyncio.timeout(5):
+            if phase == "resume":
+                await runtime.resume("s")
+            else:
+                limits = Limits(max_turns=3) if journaled else None
+                await runtime.start("worker", "go", session_id="s", limits=limits)
+    except BaseException as raised:  # a CancelledError too: that was the bug
+        outcome = raised
+    assert isinstance(outcome, LeaseError), repr(outcome)
+    assert "while it prepared the run" in str(outcome)
+    assert caller.cancelling() == 0  # the runtime took its own cancel back
+    await asyncio.sleep(0)  # and the caller goes on as usual
+    assert runtime.handles == {}
+    status = await store.status("s")
+    assert status.lease_owner is None  # released: recover() need not wait for it to expire
+    kinds = [entry.kind for entry in await store.load("s")]
+    if phase == "start":
+        assert stopped.is_set() and kinds == [] and status.status == "idle"
+    elif phase == "resume":
+        assert stopped.is_set() and kinds == before and status.status == "running"
+    else:  # the run was journaled: it stays open, and recover() resumes it
+        assert {"run_started", "message", LIMITS_KIND} <= set(kinds)
+        assert status.status == "running"
+        store.refused = False
+        other = AgentRuntime(store, [echo_agent()], worker_id="other")
+        (handle,) = await other.recover()
+        assert (await handle.wait()).text == "answering: go"
+        await other.shutdown()
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize("lease_lost_too", [False, True])
+async def test_an_outside_cancel_during_start_still_propagates(lease_lost_too):
+    store = LosesLeaseOnCue()
+    preparing = asyncio.Event()
+
+    async def deps(session_id: str) -> None:
+        preparing.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if lease_lost_too:  # the lease is lost as well before start() ends
+                store.refused = True
+                await asyncio.Event().wait()  # the runtime's own cancel ends this wait
+            raise
+
+    runtime = AgentRuntime(store, [echo_agent()], deps_factory=deps, **CUE)
+    starting = asyncio.create_task(runtime.start("worker", "go", session_id="s"))
+    async with asyncio.timeout(5):
+        await preparing.wait()
+        starting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await starting
+    assert starting.cancelled()
+    assert starting.cancelling() == 1  # the outside cancel stays; only the runtime's is gone
+    status = await store.status("s")
+    assert status.lease_owner is None and await store.load("s") == []
+    assert runtime.handles == {}
+    await runtime.shutdown()
+
+
+async def test_a_lease_lost_while_a_recovery_is_prepared_leaves_run_forever_polling():
+    store = LosesLeaseOnCue()
+    await store.append("s", open_run())
+    attempts = 0
+    third = asyncio.Event()
+
+    async def deps(session_id: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 3:
+            third.set()
+        store.refused = True
+        await asyncio.Event().wait()
+
+    runtime = AgentRuntime(store, [echo_agent()], deps_factory=deps, **CUE)
+    caller = asyncio.current_task()
+    assert caller is not None
+    async with asyncio.timeout(5):
+        assert await runtime.recover() == []  # not a CancelledError
+    assert caller.cancelling() == 0
+    status = await store.status("s")
+    assert (status.status, status.lease_owner) == ("running", None)
+    assert [entry.kind for entry in await store.load("s")] == ["run_started", "message"]
+
+    polling = asyncio.create_task(runtime.run_forever(poll_interval_s=0.01))
+    async with asyncio.timeout(5):
+        await third.wait()  # run_forever polled again after its first poll lost the lease
+    assert not polling.done()
+    await runtime.shutdown(timeout_s=0)
+    await asyncio.wait_for(polling, 5)
 
 
 async def test_reused_worker_name_cannot_share_or_renew_another_acquisition():

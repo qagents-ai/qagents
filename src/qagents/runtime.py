@@ -194,6 +194,11 @@ class RunHandle:
         self._done = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._preparing_task = asyncio.current_task()
+        """The caller's task, which prepares the run until it is launched; a lost lease
+        cancels it (see `AgentRuntime._stop_preparing`)."""
+        self._preparation_cancelled = False
+        """`AgentRuntime._lose_lease` cancelled ``_preparing_task``; the runtime takes that
+        cancel back when the preparation ends."""
         self._heartbeat: asyncio.Task[None] | None = None
         """Renews the lease from the moment it is taken, through preparation and the run."""
         self._stream: RunStream | None = None
@@ -512,8 +517,10 @@ class AgentRuntime:
                 journaled, so the run keeps them when another worker recovers it.
 
         Raises:
-            LeaseError: Another worker is driving this session, or this
-                runtime already runs it.
+            LeaseError: Another worker is driving this session, this runtime
+                already runs it, or this worker lost the lease while it
+                prepared the run. The run is then not started here; if it was
+                already journaled, it stays open and `recover` resumes it.
             ConfigurationError: No agent has that name.
             RuntimeError: The runtime is shut down.
             Exception: What the run raised before it was journaled (nothing
@@ -635,7 +642,8 @@ class AgentRuntime:
 
         Raises:
             SessionError: The session has no unfinished run.
-            LeaseError: Another worker is driving this session.
+            LeaseError: Another worker is driving this session, or this worker
+                lost the lease while it prepared the run (which stays open).
             ConfigurationError: The run's agent is not registered here.
             RuntimeError: The runtime is shut down.
         """
@@ -670,7 +678,9 @@ class AgentRuntime:
         limits journaled for the run). Sessions are skipped, with a log
         message, when the agent is not registered here, when a failed run has
         reached ``max_failures`` or failed ambiguously, or when a run is in a
-        crash loop (``max_recoveries``). Paused runs are never resumed. When
+        crash loop (``max_recoveries``). A session whose lease this worker
+        loses while it prepares the run is passed over too: its run stays open
+        for a later `recover`. Paused runs are never resumed. When
         two workers recover at once, the lease decides: each run is taken by
         exactly one of them.
 
@@ -924,12 +934,21 @@ class AgentRuntime:
                 else:
                     await self._back_out(handle)
                 return None
-            except BaseException:
+            except BaseException as raised:
+                lost = handle is not None and self._stop_preparing(handle)
                 if handle is None:
                     await self._release(writer)
                 else:
                     await self._back_out(handle)
-                raise
+                if not (lost and isinstance(raised, asyncio.CancelledError)):
+                    raise
+                logger.warning(
+                    "Worker %s lost the lease of session %r while it prepared the recovery, "
+                    "so it does not resume the run; a later recover() can",
+                    self.worker_id,
+                    session_id,
+                )
+                return None
             # No await from here to the launch, so a shutdown cannot slip in between.
             if self._closing.is_set() or handle._lease_lost:
                 await self._back_out(handle)
@@ -1014,16 +1033,16 @@ class AgentRuntime:
                         # limits entry after the start gate accepts the new run.
                         await store.append(session_id, [_limits_entry(prepared.run_id, journal)])
                         journal = None
-                if handle._lease_lost:
-                    raise LeaseError(
-                        f"Worker {self.worker_id!r} lost the lease of session {session_id!r} "
-                        "while it prepared the run: another worker took the session over."
-                    )
-            except BaseException:
+                if handle._lease_lost:  # its cancel was swallowed along the way
+                    raise self._lost_while_preparing(session_id)
+            except BaseException as raised:
+                lost = self._stop_preparing(handle)
                 if prepared is not None:
                     with contextlib.suppress(Exception):
                         await prepared.aclose()
                 await self._back_out(handle)
+                if lost and isinstance(raised, asyncio.CancelledError):
+                    raise self._lost_while_preparing(session_id) from None
                 raise
             self._launch(handle, open_stream, deps, limits=limits, journal=journal)
             if prepared is not None:
@@ -1093,6 +1112,7 @@ class AgentRuntime:
 
     async def _back_out(self, handle: RunHandle) -> None:
         """Give up a handle that will not run: stop its heartbeat and release the lease."""
+        self._stop_preparing(handle)  # a lost lease no longer cancels the caller
         heartbeat = handle._heartbeat
         if heartbeat is not None:
             heartbeat.cancel()
@@ -1324,9 +1344,35 @@ class AgentRuntime:
             handle.session_id,
         )
         handle._lease_lost = True
-        task = handle._task or handle._preparing_task
-        if task is not None:
-            task.cancel()
+        if handle._task is not None:
+            handle._task.cancel()
+        elif handle._preparing_task is not None and not handle._preparation_cancelled:
+            # The caller's own task: _stop_preparing takes this one cancel back.
+            handle._preparation_cancelled = True
+            handle._preparing_task.cancel()
+
+    def _stop_preparing(self, handle: RunHandle) -> bool:
+        """End the handle's preparation: a lost lease no longer cancels the caller's task.
+
+        The run is prepared in the task that called `start`, `resume` or `recover`.
+        When `_lose_lease` cancelled that task, take the cancel back (``Task.uncancel``),
+        so the caller is not left cancelling. True when the lease was lost and nothing
+        else asked to cancel the caller: the CancelledError is then the runtime's own,
+        and the caller gets a `LeaseError` (or `recover` passes the session over). A
+        cancel from outside still propagates.
+        """
+        task, handle._preparing_task = handle._preparing_task, None
+        if task is None or not handle._preparation_cancelled:
+            return False
+        handle._preparation_cancelled = False
+        return task.uncancel() == 0
+
+    def _lost_while_preparing(self, session_id: str) -> LeaseError:
+        return LeaseError(
+            f"Worker {self.worker_id!r} lost the lease of session {session_id!r} while it "
+            "prepared the run, so the run was not started here. Another worker may be "
+            "driving the session; a run that was already journaled stays open for recover()."
+        )
 
     async def _release(self, writer: _session.LeasedWriter) -> None:
         """Drain admitted sends before releasing their fencing epoch."""
