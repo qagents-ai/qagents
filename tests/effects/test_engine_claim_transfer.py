@@ -20,6 +20,8 @@ from qagents.effects import (
     Found,
     HoldReason,
     Key,
+    NotYetVisible,
+    Unknown,
     effect,
 )
 from qagents.effects import _engine as engine
@@ -43,6 +45,7 @@ class Destination:
 
     def __init__(self, mode="reject"):
         self.mode = mode
+        self.verdict = "tag"  # or "not_yet_visible", "unknown", "raise": the lookup cannot tell
         self.applied = []  # (idempotency_key, operation_tag, receipt)
         self.events = []  # ("send" | "lookup", session_id, idempotency key or Inquiry)
 
@@ -87,6 +90,12 @@ def declare(destination, *, replays_rejections=False, lookup=True, timeout_s=Non
         @send.lookup
         async def find(ctx, inquiry):
             destination.events.append(("lookup", ctx.session_id, inquiry))
+            if destination.verdict == "not_yet_visible":
+                return NotYetVisible(retry_after_s=5)
+            if destination.verdict == "unknown":
+                return Unknown("destination timed out")
+            if destination.verdict == "raise":
+                raise TimeoutError("lookup timed out")
             for _, tag, receipt in destination.applied:
                 if tag == inquiry.operation_tag:
                     return Found(receipt, tag=tag)
@@ -652,3 +661,101 @@ async def test_agent_owner_session_retries_after_a_taker_died_before_sending(bac
     ]
     assert len(destination.applied) == 1
     assert [(r.status, r.via) for r in records] == [("committed", "direct")]
+
+
+# An inconclusive lookup holds a rejected record; D2 sends only after Absent (SPEC 4.4 D2, 5.1).
+# Review AF-2-inconclusive-lookup: the destination applied, answered rejection-shaped, and the
+# lookup could not tell; under replays_rejections=True D2 applied it again under a new key.
+INCONCLUSIVE = {
+    "not_yet_visible": HoldReason.NOT_YET_VISIBLE,
+    "unknown": HoldReason.LOOKUP_INCONCLUSIVE,
+    "raise": HoldReason.LOOKUP_INCONCLUSIVE,
+}
+
+
+@pytest.mark.parametrize("replays_rejections", [False, True])
+@pytest.mark.parametrize("verdict", list(INCONCLUSIVE))
+async def test_an_inconclusive_lookup_in_another_session_holds_instead_of_sending(
+    store, verdict, replays_rejections
+):
+    db, _ = store
+    destination = Destination("apply_then_refuse")
+    send = declare(destination, replays_rejections=replays_rejections)
+    await reject_in_session_one(db, destination, send)
+    destination.mode, destination.verdict = "apply", verdict
+
+    held = await outcome_of(perform(db, send, "two", "run-2:1:call"))
+
+    assert isinstance(held, EffectHeld), held
+    assert held.held.reason == INCONCLUSIVE[verdict]
+    assert held.held.detail == engine._REJECTED_LOOKUP_INCONCLUSIVE
+    assert destination.sends("two") == [] and len(destination.applied) == 1
+    entries = await db.load("two")
+    assert kinds_of(entries) == ["effect_claimed", "effect_observed", "effect_observed"]
+    assert fold_effects(entries).get(*KEY).state == "R"
+    claim = await db.get_claim(*KEY)
+    assert claim.session_id == "two" and claim.status == "rejected"
+    # Once the lookup can answer, the same call finds the application; nothing is re-sent.
+    destination.verdict = "tag"
+    assert (await perform(db, send, "two", "run-2:1:call")).id == "refund-1"
+    assert destination.sends("two") == [] and len(destination.applied) == 1
+
+
+@pytest.mark.parametrize("replays_rejections", [False, True])
+@pytest.mark.parametrize("verdict", list(INCONCLUSIVE))
+async def test_an_inconclusive_lookup_within_one_session_holds_instead_of_sending(
+    store, verdict, replays_rejections
+):
+    db, _ = store
+    destination = Destination("apply_then_refuse")
+    send = declare(destination, replays_rejections=replays_rejections)
+    async with opened(db, "one", "run-1:1:call") as scope:
+        with pytest.raises(EffectRejected):
+            await engine.perform(send, Request(id="R1"), scope=scope)
+        destination.mode, destination.verdict = "apply", verdict
+        later = replace(scope, operation_id="run-1:2:call")
+        held = await outcome_of(engine.perform(send, Request(id="R1"), scope=later))
+        assert isinstance(held, EffectHeld), held
+        assert held.held.reason == INCONCLUSIVE[verdict]
+        assert len(destination.sends()) == 1 and len(destination.applied) == 1
+        destination.verdict = "tag"
+        assert (await engine.perform(send, Request(id="R1"), scope=later)).id == "refund-1"
+    assert len(destination.sends()) == 1 and len(destination.applied) == 1
+    assert [e[0] for e in destination.events] == ["send", "lookup", "lookup"]
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_agent_run_paused_by_an_inconclusive_lookup_resumes_and_finds_it(backend, tmp_path):
+    """The hold pauses the run (on_unknown="pause"); resume looks again and sends nothing."""
+    destination = Destination("apply_then_refuse")
+    send = declare(destination, replays_rejections=True)
+
+    @tool(effects=[send])
+    async def refund(ctx: RunContext, id: str) -> str:
+        """Refund the order."""
+        try:
+            return (await ctx.perform(send, Request(id=id))).id
+        except EffectRejected:
+            return "rejected"
+
+    def agent(*script):
+        return Agent(ScriptedModel(list(script)), tools=[refund])
+
+    db = InMemoryStore() if backend == "memory" else SQLiteStore(tmp_path / "agent.sqlite")
+    async with db:
+        await agent(call("refund", id="R1"), "Done.").run("Refund", session=Session(db, id="s1"))
+        destination.mode, destination.verdict = "apply", "not_yet_visible"
+        paused = await agent(call("refund", id="R1"), "Done.").run(
+            "Refund", session=Session(db, id="s2")
+        )
+        destination.verdict = "tag"
+        resumed = await agent("Done.").resume(Session(db, id="s2"))
+        records = await Session(db, id="s2").effects()
+    assert (paused.status, resumed.status) == ("paused", "completed")
+    assert [(kind, session) for kind, session, _ in destination.events] == [
+        ("send", "s1"),
+        ("lookup", "s2"),
+        ("lookup", "s2"),
+    ]
+    assert len(destination.applied) == 1
+    assert [(r.status, r.via) for r in records] == [("committed", "lookup")]

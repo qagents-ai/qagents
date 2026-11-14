@@ -436,6 +436,13 @@ _ROWS = [
         + "engine_claim_transfer.py::test_the_owner_takes_its_claim_back_from_a_taker_that_sent_nothing[memory-False]",
         _rejected_reads_no_claim,
     ),
+    # M57: D2 sends after a lookup that said NotYetVisible or Unknown, so an application
+    # answered rejection-shaped is applied again under a new key (AF-2 review).
+    (
+        E
+        + "engine_claim_transfer.py::test_an_inconclusive_lookup_in_another_session_holds_instead_of_sending[memory-not_yet_visible-True]",
+        constant(False),
+    ),
 ]
 
 CASES = tuple(

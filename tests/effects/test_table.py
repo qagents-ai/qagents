@@ -83,6 +83,17 @@ def test_lookup_precedes_resend_and_a_bound_found_never_sends():
     assert rule("R", lookup="found") == "L2"
 
 
+@pytest.mark.parametrize("lookup", ["not_yet_visible", "unknown"])
+def test_an_inconclusive_lookup_holds_a_rejected_record_instead_of_d2(lookup):
+    """SPEC 4.4 D2, 5.1: only Absent, or no declared lookup, lets D2 send."""
+    row = t.decide(t.TState.R, t.TEvent.PERFORM, perform(lookup=lookup))
+    assert (row.rule, row.action, row.sends) == ("L2", "hold_inconclusive_lookup", False)
+    assert rule("R", lookup=lookup, same_call=True) == "L2"
+    assert rule("R", lookup=lookup, same_call=True, own_rejection=True) == "P3r"
+    for answered in ("none_declared", "absent", "absent_authoritative_after_q"):
+        assert rule("R", lookup=answered) == "D2"
+
+
 def test_only_d_rows_send_and_their_order_is_fixed():
     assert {row.rule for row in t.ROWS if row.sends} == {"D1", "D2", "D3", "D4", "D5"}
     assert rule("N") == "D1"
@@ -288,7 +299,7 @@ def valid_internal_perform(state, s):
         return (
             s.own_rejection
             or s.claim not in ("none", "own")
-            or s.lookup in ("not_run", "found")
+            or s.lookup in ("not_run", "found", "not_yet_visible", "unknown")
             or not s.fence_ok
             or (not s.same_call and s.auth_valid)
         )

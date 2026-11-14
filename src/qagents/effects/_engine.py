@@ -64,6 +64,11 @@ _TOOLERROR_WARNED = False
 _RESEND_UNVERIFIABLE = (
     "Operator resend unverifiable: no valid MAC for this record and revision; settle again."
 )
+# An R(n) record has no operator recheck (O1), so its hold names the way to look again.
+_REJECTED_LOOKUP_INCONCLUSIVE = (
+    "The lookup could not tell whether the rejected request was applied, so no retry was "
+    "sent; perform it again or resume to look again."
+)
 
 
 @dataclass
@@ -1329,6 +1334,19 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
                 table.TState.N,
                 table.TEvent.PERFORM,
                 replace(situation, claim="none", same_call=False),
+            )
+        if row.rule == "L2":
+            # The declared lookup could not answer, so the rejection may be wrong: hold, and
+            # let the next call look again rather than send D2 (SPEC 4.4 D2, 5.1).
+            await _hold(
+                effect,
+                op,
+                scope,
+                HoldReason.NOT_YET_VISIBLE
+                if lookup == "not_yet_visible"
+                else HoldReason.LOOKUP_INCONCLUSIVE,
+                rule="L2",
+                detail=_REJECTED_LOOKUP_INCONCLUSIVE,
             )
         if row.rule == "F1":
             raise LeaseError("Effect dispatch refused: no safe lease margin.")

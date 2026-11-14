@@ -2913,4 +2913,6 @@ SEAMS = [
     ("M55", "qagents.effects._engine._may_move_claim", "O2"),
     # Added by the AF-2 re-fix: a rejected record reads a claim another session took over.
     ("M56", "qagents.effects._engine._claim_kind", "O2"),
+    # Added by the AF-2 re-fix: an inconclusive lookup holds a rejected record before D2.
+    ("M57", "qagents.effects._table._lookup_inconclusive", "O2"),
 ]
