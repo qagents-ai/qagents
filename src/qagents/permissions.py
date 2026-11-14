@@ -212,8 +212,13 @@ class Permissions:
             on_ask: Answers "ask" decisions in-process. Without it the run pauses.
             approval_secret: Signs every pause, so that ``agent.resume`` accepts
                 only answers that carry the pause's token, for calls the journal
-                still records unchanged. Use at least 16 random bytes, for
-                example ``secrets.token_hex(32)``, and keep it out of the code.
+                still records unchanged. It also signs the approval decisions of
+                effects tools: without it no decision verifies, so an effect of a
+                tool that asks is never re-sent automatically, and one whose
+                outcome is in doubt is held as ``APPROVAL_UNVERIFIABLE`` until an
+                operator settles it (the agent warns when it is built). Use at
+                least 16 random bytes, for example ``secrets.token_hex(32)``, and
+                keep it out of the code.
             approval_ttl_s: Decision validity from the recorded store time, in seconds.
             authorize_settlement: Host policy for operator answers; may be asynchronous.
             resend_min_age_s: Minimum operator resend age, in store-clock seconds.

@@ -399,6 +399,8 @@ class Agent:
         """Agents this one may hand the conversation to; change it to connect agents
         both ways. Names must stay unique among the agents reachable through handoffs."""
         self.compactor = compactor
+        self._unsigned_approvals_warned: set[str] = set()
+        """Effects tools already warned about: approval decisions that nothing signs."""
         self._check_effect_tools(item for item in self.tools if isinstance(item, Tool))
         for target in self.handoffs:
             if refusal := _effects_child_refusal(target, durable_session=False):
@@ -476,9 +478,8 @@ class Agent:
     ) -> None:
         limits = limits or self.limits
         timing = timing or _ports.Timing.for_lease(self.lease_ttl_s, 1.0, effects=True)
-        for tool in tools:
-            if not tool.effects:
-                continue
+        effects_tools = [tool for tool in tools if tool.effects]
+        for tool in effects_tools:
             timeout = tool.timeout if tool.timeout is not None else limits.tool_timeout_s
             for warning in _engine.check_declarations(
                 tool.effects,
@@ -486,6 +487,35 @@ class Agent:
                 tool_timeout_s=timeout,
             ):
                 logger.warning("%s: %s", tool.name, warning)
+        self._warn_unsigned_approvals(effects_tools)
+
+    def _warn_unsigned_approvals(self, effects_tools: list[Tool]) -> None:
+        """Warn, once per tool, about effects tools that ask for approval while no
+        ``approval_secret`` signs the decisions (SPEC 5.1). D3 and D4 re-send only under a
+        verifiable decision (5.4), so these effects are never re-sent automatically: one whose
+        outcome is in doubt holds as APPROVAL_UNVERIFIABLE. The hold is right; the warning
+        tells the developer before the first crash does."""
+        if self.permissions.signs_pauses:
+            return
+        names = [
+            tool.name
+            for tool in effects_tools
+            if tool.name not in self._unsigned_approvals_warned
+            and self.permissions._asks_by_rule(tool)
+        ]
+        if not names:
+            return
+        self._unsigned_approvals_warned.update(names)
+        logger.warning(
+            "%s: %s for approval, but Permissions has no approval_secret, so no decision is "
+            "signed. Without a verifiable decision, rules D3 and D4 never re-send an effect "
+            "automatically, in the run or after a crash: an effect whose outcome is in doubt, "
+            "and that no lookup finds, is held as APPROVAL_UNVERIFIABLE until an operator "
+            "settles it (agent.settle). Set Permissions(approval_secret=...) to sign approval "
+            "decisions.",
+            ", ".join(names),
+            "this effects tool asks" if len(names) == 1 else "these effects tools ask",
+        )
 
     def stream(
         self,

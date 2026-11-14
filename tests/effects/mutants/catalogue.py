@@ -367,6 +367,13 @@ _ROWS = [
         E + "engine_settlement_mac.py::test_forged_resend_is_held_and_never_sent[memory-no_mac]",
         constant(True),
     ),
+    # M51: the build check misses an effects tool that asks for approval, so nothing warns
+    # that, without approval_secret, its effects hold APPROVAL_UNVERIFIABLE (AF-5).
+    (
+        E
+        + "unsigned_approvals.py::test_build_warns_once_for_an_approval_gated_effects_tool_without_a_secret[requires_approval]",
+        constant(False),
+    ),
 ]
 
 CASES = tuple(

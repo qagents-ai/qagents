@@ -2901,4 +2901,6 @@ SEAMS = [
     ("M49", "qagents.effects._engine._lookup_state", "O2"),
     # Added by AF-3 (interface-changes.md): an operator resend is checked before any row sends.
     ("M50", "qagents.effects._engine._resend_verified", "O2"),
+    # Added by AF-5 (interface-changes.md): the build warns when no secret signs approvals.
+    ("M51", "qagents.permissions.Permissions._asks_by_rule", "O4b"),
 ]
