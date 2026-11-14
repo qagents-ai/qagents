@@ -10,23 +10,16 @@ Every documentation page, in the order of the site navigation. Each page starts 
 
 # qagents
 
-A small, explicit agent framework for Python. One loop, typed tools, durable sessions, and QCloud
-as the first-class model provider, without being tied to it.
+Build long-running Python agents that can call tools, wait for a human decision,
+and resume on another worker. The session journal preserves messages, decisions,
+and application state across restarts. Connect retrieval memory or a QAgent Gym
+playbook when the agent needs knowledge from earlier sessions.
 
-```python
-from qagents import Agent, tool
+![Agent loop from model request through tools and a durable session](assets/agent-flow.svg)
 
-
-@tool(read_only=True)
-def get_weather(city: str) -> str:
-    """Look up the current weather for a city."""
-    return f"Sunny in {city}"
-
-
-agent = Agent("qcloud:<model-id>", instructions="Be brief.", tools=[get_weather])
-result = agent.run_sync("What is the weather in Athens?")
-print(result.output)
-```
+[Run the approval and recovery example](guides/support-review.md) ·
+[Configure a model provider](providers.md) ·
+[Connect memory and QAgent Gym](integrations/gym.md)
 
 !!! warning "Status: 0.2.0, alpha"
     The offline test suite passes, including the QCloud provider driven through the real
@@ -55,26 +48,24 @@ print(result.output)
 | Learning loops, memory and adapter recipes | the separate QAgent Gym package | [Gym and integrations](integrations/gym.md) |
 | Docs your coding agent can query | `python -m qagents.docs_mcp` (MCP) or `qagents docs search "..."` | [Docs for coding agents](coding-agents.md) |
 
-## Why another framework
+## Why qagents
 
-Long-running agents need to preserve progress, wait for approval and recover after a process
-stops. qagents gives applications a journal for those decisions and a small, inspectable loop.
+An agent that finishes in one request has few state transitions to coordinate.
+An agent that works across several requests must recover its progress when a
+worker stops, keep a pending decision tied to the right tool call, and report
+an uncertain external outcome accurately. The session journal records the
+conversation and the decisions that drive execution. Run limits, permissions
+and tool declarations give application code control at each boundary.
 
-- **Resume at the tool call, not at the node.** Graph frameworks checkpoint at step boundaries
-  and re-run the whole step after a crash or an approval. qagents journals every message, tool
-  start and tool result as it happens, so a finished tool call never runs twice.
-- **Nothing hidden.** Every string the framework sends to a model is in one file,
-  [`qagents.prompts`](reference/prompts.md), and `Hooks.before_model` sees the exact request.
-- **Provider rules enforced early.** QCloud rejects unknown request fields; qagents rejects them
-  when the agent is built, with the list of accepted fields.
-- **No replay of billable requests.** A request the provider may already have processed is never
-  sent again unless you opt in.
-- **Control by code, outside the model.** Permissions are deterministic rules; a failing check
-  refuses the call.
-- **Coding agents under your rules.** A coding agent such as Devvi is driven over ACP as an
-  external agent: its permission requests go through your `Permissions`, your limits stop it,
-  and your journal records the call. MCP is used only to give it tools.
-  See [External agents](concepts/external-agents.md).
+![Session memory, retrieval memory and QAgent Gym playbooks](assets/memory-layers.svg)
+
+Use session memory for one workflow or conversation. Use a scoped retrieval
+store such as Mem0 for information that should carry into another run. Gym can
+turn feedback from completed episodes into playbook updates for later runs.
+Choose identity, access and retention rules in the application.
+
+QCloud, OpenAI Chat and Anthropic have built-in adapters. The provider guide
+shows the configuration and model choices that were verified.
 
 ## Layout
 
@@ -1812,6 +1803,378 @@ execute_tool coder
   reports its end: that span has no `turn_finished` event.
 - `MLflowHooks` does not record these events. To see them in MLflow, export the spans of
   `OTelHooks` to the MLflow server's `/v1/traces` endpoint.
+
+---
+
+<!-- page: guides/support-review.md | guides/support-review/ -->
+
+# Build an agent that queues support reviews
+
+The support agent checks an order with a read-only tool, proposes a case,
+and waits for a person to approve it. A separate SQLite queue stores each
+case with the durable tool operation ID and its payload. Starting the
+resume in another worker reopens the same journal. The example uses demo
+orders and writes a local review case.
+
+![An approval is journaled before the review tool runs](../assets/approval-flow.svg)
+
+## Configure the model
+
+Install the project from your private checkout. Use the Anthropic extra
+when you select that provider.
+
+```bash
+python -m pip install -e .
+python -m pip install -e ".[anthropic]"
+```
+
+Set credentials in your environment or secret manager. Select a model ID
+available in your provider account.
+
+| Provider | Model variable | Credential variable | CLI value |
+| --- | --- | --- | --- |
+| QCloud | `QCLOUD_MODEL` | `QCLOUD_API_KEY` | `qcloud` |
+| OpenAI | `OPENAI_MODEL` | `OPENAI_API_KEY` | `openai` |
+| Anthropic | `ANTHROPIC_MODEL` | `ANTHROPIC_API_KEY` | `anthropic` |
+
+From the checkout, run the example and follow the approval prompt.
+
+```bash
+python examples/support_review.py --provider openai
+```
+
+The tests run the same tools with a scripted model and a real local SQLite
+queue. They exercise pausing, restarting, approving and declining a write
+without credentials.
+
+```bash
+python -m pytest tests/examples/test_support_review.py
+```
+
+## Inspect the source
+
+```python
+"""A support agent that queues an approved case using QCloud, OpenAI or Anthropic.
+
+Model calls use your configured provider. The orders are explicit demo fixtures.
+The review queue is a real local SQLite database with operation-key deduplication.
+
+    python examples/support_review.py --provider qcloud
+    python examples/support_review.py --provider openai
+    python examples/support_review.py --provider anthropic
+
+Set QCLOUD_MODEL/QCLOUD_API_KEY, OPENAI_MODEL/OPENAI_API_KEY or
+ANTHROPIC_MODEL/ANTHROPIC_API_KEY. No provider is silently substituted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import sqlite3
+from contextlib import closing
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+
+from qagents import Agent, Approval, Limits, ModelSettings, RunContext, Session, SQLiteStore, tool
+from qagents.errors import ToolError
+from qagents.models.base import Model
+
+DEMO_ORDERS = {
+    "A-1001": {"status": "delivered", "amount_minor": 4250, "currency": "EUR"},
+    "A-1002": {"status": "in_transit", "amount_minor": 1900, "currency": "EUR"},
+}
+
+
+class ReviewQueue:
+    """A local destination with a durable operation key and payload binding."""
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS cases ("
+                "operation_id TEXT PRIMARY KEY, case_id TEXT NOT NULL, payload TEXT NOT NULL)"
+            )
+
+    def enqueue(self, operation_id: str, order_id: str, reason: str) -> dict:
+        payload = json.dumps({"order_id": order_id, "reason": reason}, sort_keys=True)
+        case_id = "case-" + hashlib.sha256(operation_id.encode()).hexdigest()
+        with closing(sqlite3.connect(self.path, timeout=10)) as db, db:
+            db.execute(
+                "INSERT OR IGNORE INTO cases VALUES (?, ?, ?)", (operation_id, case_id, payload)
+            )
+            row = db.execute(
+                "SELECT case_id, payload FROM cases WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
+            if row[1] != payload:
+                raise ToolError("This operation already holds a different review request.")
+        return {"case_id": row[0], "status": "awaiting_review", "order_id": order_id}
+
+
+@dataclass
+class SupportDeps:
+    orders: dict[str, dict]
+    reviews: ReviewQueue
+
+
+@tool(read_only=True)
+def inspect_order(ctx: RunContext[SupportDeps], order_id: str) -> dict:
+    """Read an order's delivery status, paid amount and currency."""
+    if order_id not in ctx.deps.orders:
+        raise ToolError("Order not found.")
+    return {"order_id": order_id, **deepcopy(ctx.deps.orders[order_id])}
+
+
+@tool(requires_approval=True, idempotent=True)
+def queue_review(ctx: RunContext[SupportDeps], order_id: str, reason: str) -> dict:
+    """Queue a support case for human review. This does not issue a refund."""
+    if order_id not in ctx.deps.orders:
+        raise ToolError("Order not found.")
+    if not reason.strip() or len(reason) > 2000:
+        raise ToolError("Give a review reason of 1 to 2000 characters.")
+    return ctx.deps.reviews.enqueue(ctx.operation_id, order_id, reason)
+
+
+def build_agent(model: Model) -> Agent:
+    return Agent(
+        model,
+        name="support-review",
+        instructions=(
+            "Help the customer using the order tools. Inspect the order before proposing a case. "
+            "Queue a review only when asked. "
+            "Never claim a refund or external notification was sent. "
+            "After queueing, report the returned case id and status."
+        ),
+        tools=[inspect_order, queue_review],
+        settings=ModelSettings(max_tokens=1200),
+        limits=Limits(max_turns=6, max_total_tokens=12000, timeout_s=90, tool_timeout_s=15),
+    )
+
+
+def configured_model(provider: str) -> Model:
+    """Require an explicit model and credential for the selected provider."""
+    prefix = {"qcloud": "QCLOUD", "openai": "OPENAI", "anthropic": "ANTHROPIC"}[provider]
+    model_id, api_key = os.environ.get(prefix + "_MODEL"), os.environ.get(prefix + "_API_KEY")
+    if not model_id or not api_key:
+        raise ValueError(f"Set {prefix}_MODEL and {prefix}_API_KEY before running this example.")
+    if provider == "qcloud":
+        from qagents import QCloudModel
+
+        return QCloudModel(model_id, api_key=api_key, timeout=30)
+    if provider == "anthropic":
+        from qagents import AnthropicModel
+
+        return AnthropicModel(model_id, api_key=api_key, timeout=30)
+    from qagents import OpenAIChatModel
+
+    return OpenAIChatModel(
+        model_id,
+        base_url="https://api.openai.com/v1",
+        api_key=api_key,
+        provider="openai",
+        max_tokens_param="max_completion_tokens",
+        timeout=30,
+    )
+
+
+async def run_demo(provider: str, directory: Path, prompt: str, session_id: str) -> None:
+    model = configured_model(provider)
+    try:
+        deps = SupportDeps(deepcopy(DEMO_ORDERS), ReviewQueue(directory / "reviews.db"))
+        agent = build_agent(model)
+        async with SQLiteStore(directory / "sessions.db") as store:
+            session = Session(store, id=session_id)
+            result = await agent.run(prompt, session=session, deps=deps)
+            while result.status == "paused" and result.pending_approvals:
+                decisions = {}
+                for pending in result.pending_approvals:
+                    arguments = json.dumps(pending.arguments, ensure_ascii=False)
+                    print(f"\nProposed {pending.name}: {arguments}")
+                    answer = await asyncio.to_thread(input, "Approve this exact action? [y/N] ")
+                    approved = answer.strip().lower() == "y"
+                    decisions[pending.tool_call_id] = Approval.for_call(
+                        pending, approved=approved, by="terminal-user"
+                    )
+                result = await agent.resume(session, approvals=decisions, deps=deps)
+            print(f"\nStatus: {result.status}\n{result.text}")
+    finally:
+        await model.aclose()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--provider", required=True, choices=("qcloud", "openai", "anthropic"))
+    parser.add_argument("--directory", type=Path, default=Path(".work/support-review"))
+    parser.add_argument("--session", default="support-demo")
+    parser.add_argument(
+        "--prompt",
+        default="Order A-1001 arrived damaged. Check it and open a case for human review.",
+    )
+    args = parser.parse_args()
+    asyncio.run(run_demo(args.provider, args.directory, args.prompt, args.session))
+```
+
+For persistent preferences, see [scoped session memory](../integrations/gym.md#start-with-session-memory).
+
+---
+
+<!-- page: guides/recover-effect.md | guides/recover-effect/ -->
+
+# Recover an external action after a lost response
+
+A provider can apply a write and lose the response. The worker needs a
+durable intent before it sends the request. During recovery, the recorded
+receipt, the destination's lookup and idempotency contract, or an operator
+decision determine how execution continues.
+
+This example uses a scripted model and two SQLite databases. One database
+holds the run journal. The other simulates the destination's durable ledger.
+The first worker commits a credit and then loses its response. A second
+worker opens the journal, records an operator's verified receipt, and resumes
+the agent. The example checks that the destination contains one credit.
+
+```bash
+python -m examples.recover_credit --directory work/credit-recovery-demo
+```
+
+Use a fresh directory for each run. The example runs on the Effects
+development branch. In an application, verify the destination record against
+the business identity and amount, then supply the authenticated operator's
+identity to `Settle.committed()`.
+
+```python
+"""Recover an acknowledged-lost credit using two workers and a durable local destination."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sqlite3
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path
+
+from pydantic import BaseModel
+
+from qagents import Agent, AgentRuntime, RunContext, SQLiteStore, tool
+from qagents.effects import Attempt, EffectContext, Key, Settle, effect
+from qagents.models.testing import FunctionModel, call
+
+
+class Credit(BaseModel):
+    order: str
+    amount: int
+
+
+class Receipt(BaseModel):
+    order: str
+    amount: int
+
+
+@dataclass
+class Destination:
+    path: Path
+    lose_acknowledgement: bool
+
+    def credit(self, attempt: Attempt[Credit]) -> Receipt:
+        request = attempt.request
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS credits "
+                "(token TEXT PRIMARY KEY, order_id TEXT NOT NULL, amount INTEGER NOT NULL)"
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO credits VALUES (?, ?, ?)",
+                (attempt.idempotency_key, request.order, request.amount),
+            )
+            row = db.execute(
+                "SELECT order_id, amount FROM credits WHERE token = ?",
+                (attempt.idempotency_key,),
+            ).fetchone()
+            if row != (request.order, request.amount):
+                raise ValueError("The existing key is bound to a different request.")
+        if self.lose_acknowledgement:
+            self.lose_acknowledgement = False
+            raise ConnectionError("The destination committed before its response was lost.")
+        return Receipt(order=request.order, amount=request.amount)
+
+
+@effect(
+    "example.credit",
+    key=Key("request", "order"),
+    timeout_s=2,
+)
+async def credit(ctx: EffectContext, attempt: Attempt[Credit]) -> Receipt:
+    """Send the durable attempt key with the credit request."""
+    return await asyncio.to_thread(ctx.deps.credit, attempt)
+
+
+@tool(effects=[credit])
+async def credit_order(ctx: RunContext[Destination], order: str) -> Receipt:
+    """Credit the test order for ten units."""
+    return await ctx.perform(credit, Credit(order=order, amount=10))
+
+
+def build_agent() -> Agent:
+    def reply(request):
+        if request.messages[-1].role == "tool":
+            return "Credit recorded."
+        return call("credit_order", order="DEMO-1")
+
+    return Agent(FunctionModel(reply), name="credit-review", tools=[credit_order])
+
+
+async def main(directory: Path) -> None:
+    await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
+    journal, ledger = directory / "runs.db", directory / "credits.db"
+    if journal.exists() or ledger.exists():
+        raise FileExistsError("Choose a fresh directory for the demonstration.")
+    async with SQLiteStore(journal) as store:
+        destination = Destination(ledger, lose_acknowledgement=True)
+        async with AgentRuntime(store, [build_agent()], worker_id="initial") as runtime:
+            first = await runtime.start(
+                "credit-review", "Credit DEMO-1", session_id="example", deps=destination
+            )
+            paused = await first.wait()
+            assert paused.stop_reason == "effect_held"
+    with closing(sqlite3.connect(ledger)) as db:
+        (row,) = db.execute("SELECT order_id, amount FROM credits").fetchall()
+    verified = Receipt(order=row[0], amount=row[1])
+    async with SQLiteStore(journal) as store:
+        destination = Destination(ledger, lose_acknowledgement=False)
+        async with AgentRuntime(store, [build_agent()], worker_id="recovery") as runtime:
+            await runtime.settle(
+                "example",
+                Settle.committed(
+                    paused.held_effects[0],
+                    receipt=verified,
+                    by="demo-operator",
+                    evidence="single matching row in the destination ledger",
+                ),
+            )
+            resumed = await runtime.resume("example", deps=destination)
+            assert (await resumed.wait()).text == "Credit recorded."
+    with closing(sqlite3.connect(ledger)) as db:
+        assert db.execute("SELECT COUNT(*) FROM credits").fetchone() == (1,)
+    print("One durable credit recorded.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--directory", type=Path, required=True)
+    asyncio.run(main(parser.parse_args().directory))
+```
+
+The [Gym recovery benchmark](https://github.com/mpvasilis/qagent-gym/blob/main/docs/recovery-benchmark.md)
+uses worker process termination and a separate HTTP destination. It includes
+trials with destination deduplication disabled to confirm that the benchmark
+detects duplicate credits.
 
 ---
 

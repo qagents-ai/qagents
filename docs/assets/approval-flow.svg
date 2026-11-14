@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="510" viewBox="0 0 1200 510" role="img" aria-labelledby="title desc">
+<title id="title">A support case with human approval</title>
+<desc id="desc">The agent reads a demo order, proposes a support case and persists the pending decision. Approval writes to the local SQLite queue using a stable operation id. Decline leaves the queue unchanged. A retry with the same payload returns the existing case.</desc>
+<defs>
+              <linearGradient id="night" x2="1" y2="1">
+                <stop stop-color="#122b38"/><stop offset="1" stop-color="#101722"/>
+              </linearGradient>
+              <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+                <circle cx="1" cy="1" r="1" fill="#476272" opacity=".22"/>
+              </pattern>
+              <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 1 1 L 8 5 L 1 9" fill="none" stroke="#6d9b9a" stroke-width="1.5"/>
+              </marker>
+            </defs>
+<g font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif">
+<rect x="0" y="0" width="1200" height="510" rx="26" fill="#f1f5f3" stroke="none"/>
+<text x="48" y="48" fill="#26796c" font-size="15" font-weight="700" text-anchor="start">03</text>
+<text x="90" y="48" fill="#526d75" font-size="15" font-weight="600" text-anchor="start">RUNNABLE SUPPORT ASSISTANT</text>
+<text x="48" y="102" fill="#142d3c" font-size="40" font-weight="650" text-anchor="start">An action you can inspect.</text>
+<text x="48" y="140" fill="#526d75" font-size="20" font-weight="400" text-anchor="start">A real local queue, an explicit approval and an operation id that binds the request.</text>
+<rect x="48" y="196" width="272" height="186" rx="18" fill="#ffffff" stroke="#d8e3de"/>
+<g transform="translate(72 219) scale(1)">
+<path d="M5 6l-4 7 4 7 M19 6l4 7-4 7 M15 3l-6 20" fill="none" stroke="#26796c" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="72" y="277" fill="#142d3c" font-size="26" font-weight="600" text-anchor="start">Inspect an order</text>
+<text x="72" y="315" fill="#526d75" font-size="18" font-weight="400" text-anchor="start">Read demo order data.</text>
+<text x="72" y="345" fill="#526d75" font-size="18" font-weight="400" text-anchor="start">Propose a support case.</text>
+<path d="M320 290H377" fill="none" stroke="#6d9b9a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="391" y="196" width="330" height="186" rx="18" fill="#142d3c" stroke="none"/>
+<g transform="translate(415 218) scale(1)">
+<path d="M3 13l6 6L22 5" fill="none" stroke="#f3cc85" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="415" y="277" fill="#f7fbfa" font-size="26" font-weight="600" text-anchor="start">Pause for approval</text>
+<text x="415" y="315" fill="#c7d8dc" font-size="18" font-weight="400" text-anchor="start">Show the exact arguments.</text>
+<text x="415" y="345" fill="#c7d8dc" font-size="18" font-weight="400" text-anchor="start">Save the pending decision.</text>
+<path d="M721 262H803" fill="none" stroke="#6d9b9a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="748" y="247" fill="#26796c" font-size="15" font-weight="600" text-anchor="start">Approve</text>
+<rect x="817" y="196" width="335" height="186" rx="18" fill="#dff2e9" stroke="#a9cdbc"/>
+<g transform="translate(841 216) scale(1)">
+<path d="M3 7c0-5 20-5 20 0s-20 5-20 0v14c0 5 20 5 20 0V7 M3 14c0 5 20 5 20 0" fill="none" stroke="#26796c" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="841" y="277" fill="#142d3c" font-size="26" font-weight="600" text-anchor="start">Persist the case</text>
+<text x="841" y="315" fill="#355e54" font-size="18" font-weight="400" text-anchor="start">SQLite queue + payload binding.</text>
+<text x="841" y="345" fill="#355e54" font-size="18" font-weight="400" text-anchor="start">Same retry → same case.</text>
+<path d="M556 382V431H790" fill="none" stroke="#7e8f94" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="581" y="418" fill="#526d75" font-size="15" font-weight="600" text-anchor="start">Decline</text>
+<text x="817" y="438" fill="#526d75" font-size="18" font-weight="400" text-anchor="start">Queue stays unchanged.</text>
+<text x="48" y="481" fill="#526d75" font-size="16" font-weight="400" text-anchor="start">Example boundary: demo orders and local review cases. Model requests use your selected provider.</text>
+</g></svg>

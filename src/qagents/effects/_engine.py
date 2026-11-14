@@ -968,6 +968,17 @@ def _dedupe_allowed(effect: Effect, op: Operation, scope: CallScope, now: float)
     ) and quiescence._concurrency_permits(effect, op, journal.view(), journal.timing, now)
 
 
+def _absence_is_final(effect, verdict, op, situation):
+    """Require an authoritative absence observed after all possible applications."""
+    started = op.hold.started_at if op.hold else None
+    return (
+        isinstance(verdict, Absent)
+        and effect.authoritative
+        and started is not None
+        and quiescence._lookup_after_quiescence(started, situation)
+    )
+
+
 async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any:
     journal = scope.journal
     key = (prepared.namespace, effect.name, prepared.key)
@@ -1088,12 +1099,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
             elif isinstance(verdict, Absent):
                 lookup = "absent"
                 q = quiescence._all_quiescent(current, view, journal.timing)
-                started = current.hold.started_at if current.hold else None
-                if (
-                    effect.authoritative
-                    and started is not None
-                    and quiescence._lookup_after_quiescence(started, q)
-                ):
+                if _absence_is_final(effect, verdict, current, q):
                     observation = current.hold.model_copy(update={"final": True})
                     await _append_outcome(scope, kinds.KIND_EFFECT_OBSERVED, observation)
                     if not retry_blocked:

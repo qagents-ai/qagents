@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="610" viewBox="0 0 1200 610" role="img" aria-labelledby="title desc">
+<title id="title">Three kinds of memory</title>
+<desc id="desc">Execution history lives in the journal. Structured application state belongs to a session. Optional retrieved memory and ACE playbooks are supplied through application or QAgent Gym adapters. The application derives tenant and user scope before retrieving context.</desc>
+<defs>
+              <linearGradient id="night" x2="1" y2="1">
+                <stop stop-color="#122b38"/><stop offset="1" stop-color="#101722"/>
+              </linearGradient>
+              <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+                <circle cx="1" cy="1" r="1" fill="#476272" opacity=".22"/>
+              </pattern>
+              <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 1 1 L 8 5 L 1 9" fill="none" stroke="#6d9b9a" stroke-width="1.5"/>
+              </marker>
+            </defs>
+<g font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif">
+<rect x="0" y="0" width="1200" height="610" rx="26" fill="#f1f5f3" stroke="none"/>
+<text x="48" y="48" fill="#26796c" font-size="15" font-weight="700" text-anchor="start">02</text>
+<text x="90" y="48" fill="#526d75" font-size="15" font-weight="600" text-anchor="start">MEMORY ARCHITECTURE</text>
+<text x="48" y="102" fill="#142d3c" font-size="40" font-weight="650" text-anchor="start">Remember the right things.</text>
+<text x="48" y="140" fill="#526d75" font-size="20" font-weight="400" text-anchor="start">Execution history, application state and learned context have different jobs.</text>
+<rect x="48" y="184" width="350" height="274" rx="18" fill="#ffffff" stroke="#d8e3de"/>
+<rect x="70" y="207" width="52" height="52" rx="14" fill="#eef4f1" stroke="none"/>
+<g transform="translate(83 220) scale(1)">
+<path d="M3 7c0-5 20-5 20 0s-20 5-20 0v14c0 5 20 5 20 0V7 M3 14c0 5 20 5 20 0" fill="none" stroke="#26796c" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="139" y="239" fill="#26796c" font-size="14" font-weight="700" text-anchor="start">EXECUTION</text>
+<text x="72" y="300" fill="#142d3c" font-size="28" font-weight="650" text-anchor="start">Journal</text>
+<text x="72" y="341" fill="#526d75" font-size="20" font-weight="400" text-anchor="start">Messages, decisions,</text>
+<text x="72" y="371" fill="#526d75" font-size="20" font-weight="400" text-anchor="start">tool starts and results.</text>
+<path d="M72 395H374" fill="none" stroke="#e1e9e4" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="72" y="429" fill="#26796c" font-size="17" font-weight="600" text-anchor="start">Session replay &amp; recovery</text>
+<rect x="425" y="184" width="350" height="274" rx="18" fill="#ffffff" stroke="#d8e3de"/>
+<rect x="447" y="207" width="52" height="52" rx="14" fill="#eef4f1" stroke="none"/>
+<g transform="translate(460 220) scale(1)">
+<path d="M13 1L2 6v9c0 6 11 11 11 11s11-5 11-11V6z M8 13l4 4 6-7" fill="none" stroke="#6952a2" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="516" y="239" fill="#6952a2" font-size="14" font-weight="700" text-anchor="start">APPLICATION</text>
+<text x="449" y="300" fill="#142d3c" font-size="28" font-weight="650" text-anchor="start">Structured state</text>
+<text x="449" y="341" fill="#526d75" font-size="20" font-weight="400" text-anchor="start">Preferences and facts</text>
+<text x="449" y="371" fill="#526d75" font-size="20" font-weight="400" text-anchor="start">owned by your application.</text>
+<path d="M449 395H751" fill="none" stroke="#e1e9e4" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="449" y="429" fill="#6952a2" font-size="17" font-weight="600" text-anchor="start">RunContext.state</text>
+<rect x="802" y="184" width="350" height="274" rx="18" fill="#ffffff" stroke="#d8e3de"/>
+<rect x="824" y="207" width="52" height="52" rx="14" fill="#eef4f1" stroke="none"/>
+<g transform="translate(837 220) scale(1)">
+<path d="M1 3h9l3 3 3-3h9v20h-9l-3 2-3-2H1z M13 6v19" fill="none" stroke="#9a6526" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="893" y="239" fill="#9a6526" font-size="14" font-weight="700" text-anchor="start">LEARNING</text>
+<text x="826" y="300" fill="#142d3c" font-size="28" font-weight="650" text-anchor="start">Retrieved context</text>
+<text x="826" y="341" fill="#526d75" font-size="20" font-weight="400" text-anchor="start">Mem0 memory and</text>
+<text x="826" y="371" fill="#526d75" font-size="20" font-weight="400" text-anchor="start">ACE-style playbooks.</text>
+<path d="M826 395H1128" fill="none" stroke="#e1e9e4" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="826" y="429" fill="#9a6526" font-size="17" font-weight="600" text-anchor="start">Optional QAgent Gym adapters</text>
+<rect x="48" y="490" width="1104" height="76" rx="16" fill="#142d3c" stroke="none"/>
+<g transform="translate(70 513) scale(1)">
+<path d="M13 1L2 6v9c0 6 11 11 11 11s11-5 11-11V6z M8 13l4 4 6-7" fill="none" stroke="#8ce6c4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="116" y="523" fill="#f7fbfa" font-size="20" font-weight="600" text-anchor="start">Identity comes from your application.</text>
+<text x="116" y="549" fill="#c7d8dc" font-size="17" font-weight="400" text-anchor="start">Derive tenant / user scope before loading memory; select what enters the model context.</text>
+</g></svg>

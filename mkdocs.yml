@@ -81,6 +81,8 @@ nav:
       - External agents: concepts/external-agents.md
       - Hooks, context and tracing: concepts/hooks.md
   - Guides:
+      - Support review agent: guides/support-review.md
+      - Recover an external action: guides/recover-effect.md
       - QAgent Gym and integrations: integrations/gym.md
       - Model providers: providers.md
       - Ready-made tools: toolkits.md
