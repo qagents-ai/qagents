@@ -32,10 +32,23 @@ def _pct(value: str, separator: str = ":") -> str:
     return value.replace("%", "%25").replace(separator, f"%{ord(separator):02X}")
 
 
-# Client libraries that are not qagents dependencies, with their own "no answer" errors
-# (SPEC 5.1). They are read from sys.modules, never imported: until its module is loaded,
+# Client libraries other than httpx, with their own "no answer" errors (SPEC 5.1). httpx2
+# is a separate package (none of its classes derives from httpx's or from a builtin): the
+# anthropic and mcp extras use it. httpcore and httpcore2 sit under httpx and httpx2; their
+# entries are the errors httpx maps to its TransportError. The others are not qagents
+# dependencies. They are read from sys.modules, never imported: until its module is loaded,
 # such a type can be neither raised nor named in rejected_on.
+_HTTPCORE_NO_ANSWER = (
+    "TimeoutException",
+    "NetworkError",
+    "ProtocolError",
+    "ProxyError",
+    "UnsupportedProtocol",
+)
 _CLIENT_NO_ANSWER = (
+    ("httpx2", ("TransportError",)),
+    ("httpcore", _HTTPCORE_NO_ANSWER),
+    ("httpcore2", _HTTPCORE_NO_ANSWER),
     ("requests.exceptions", ("ConnectionError", "Timeout", "ChunkedEncodingError")),
     ("urllib3.exceptions", ("TimeoutError", "ProtocolError")),
     ("aiohttp", ("ClientConnectionError", "ClientPayloadError")),
@@ -438,12 +451,13 @@ def effect(
     ``httpx.HTTPStatusError`` or an SDK's status error, not the SDK's catch-all
     base. A type that is, derives from or is a base class of a transport-level
     error (a timeout, a lost or refused connection, a cancellation, a response
-    cut short, or a transport error of httpx, requests, urllib3 or aiohttp) is
-    refused here, because such an error means no answer came back. A send
-    that raises one has an unknown outcome, even when its class also derives
-    from a type in ``rejected_on``. So does a send that raises any error from
-    one or while handling one, as a client does when it wraps a timeout in its
-    own error (``raise PaymentsError(...) from error``).
+    cut short, or a transport error of httpx, httpx2, httpcore, requests,
+    urllib3 or aiohttp) is refused here, because such an error means no
+    answer came back. A send that raises one has an unknown outcome, even
+    when its class also derives from a type in ``rejected_on``. So does a
+    send that raises any error from one or while handling one, as a client
+    does when it wraps a timeout in its own error (``raise PaymentsError(...)
+    from error``) and as the anthropic SDK does with its connection errors.
     """
     if not isinstance(name, str) or not name.strip():
         raise ConfigurationError("effect name must be a nonempty string.")

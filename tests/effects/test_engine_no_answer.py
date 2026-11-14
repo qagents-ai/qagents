@@ -5,7 +5,10 @@ base class of a timeout, the timeout counted as a definite refusal. Under
 ``replays_rejections=True`` (the Stripe preset) the model's retry took D2 with a new
 idempotency key, and the destination applied the charge twice. The ``wrapped_*`` cases
 are the AF-1 review's shape: the client wraps the httpx timeout in its own refusal type
-(``raise PaymentsError(...) from error``), as most clients and SDKs do.
+(``raise PaymentsError(...) from error``), as most clients and SDKs do. The ``httpx2_*``
+cases are the AF-1 recheck's shape: httpx2, the transport of anthropic>=2.8 and mcp>=2.3,
+shares no class with httpx, and its error for a server that closes without answering has
+no builtin error in its chain.
 """
 
 import asyncio
@@ -20,6 +23,14 @@ from qagents.effects.contracts import STRIPE_IDEMPOTENCY_V1
 from qagents.errors import EffectRejected
 from qagents.models.testing import ScriptedModel, call
 from qagents.session import InMemoryStore, Session, SQLiteStore
+
+try:
+    import httpx2
+except ImportError:  # installed with the anthropic and mcp extras
+    httpx2 = None
+
+# The transport errors a client wraps in its own refusal type.
+TRANSPORT_ERRORS = (httpx.HTTPError,) if httpx2 is None else (httpx.HTTPError, httpx2.HTTPError)
 
 
 class Charge(BaseModel):
@@ -72,6 +83,9 @@ CASES = {
     "task_group": (httpx.ReadTimeout, (ExceptionGroup,), "task_group"),
     "task_group_wrapped": (httpx.ReadTimeout, None, "task_group_wrapped"),
 }
+if httpx2 is not None:
+    CASES["httpx2_direct"] = (httpx2.RemoteProtocolError, (httpx2.HTTPError,), None)
+    CASES["httpx2_wrapped_from"] = (httpx2.RemoteProtocolError, None, "from")
 
 
 @pytest.fixture(params=("memory", "sqlite"))
@@ -103,14 +117,14 @@ def build(destination: Destination, forced: tuple | None, wrap: str | None, *, l
             try:
                 async with asyncio.TaskGroup() as group:  # say, the charge and an audit call
                     task = group.create_task(leg())
-            except* httpx.HTTPError as lost:
+            except* TRANSPORT_ERRORS as lost:
                 if wrap == "task_group_wrapped":
                     raise PaymentsError("payments request failed") from lost
                 raise
             return task.result()
         try:
             return destination.charge(attempt)
-        except httpx.HTTPError as error:
+        except TRANSPORT_ERRORS as error:
             # The usual client wrapper: its own error type, listed in rejected_on.
             if wrap == "from":
                 raise PaymentsError(f"payments request failed: {error}") from error

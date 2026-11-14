@@ -2927,4 +2927,6 @@ SEAMS = [
     ("M62", "qagents.runtime.AgentRuntime._stop_preparing", "O6"),
     # Added by the AF-4 re-fix: the operator lease takes back only its own cancel.
     ("M63", "qagents.effects._operator._take_back_cancel", "O5"),
+    # Added by the AF-1 re-fix, round 2: httpx2 and httpcore in the no-answer set (as M54).
+    ("M64", "qagents.effects._declare._no_answer_types", "O1"),
 ]

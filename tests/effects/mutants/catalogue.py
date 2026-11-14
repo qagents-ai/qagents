@@ -228,6 +228,12 @@ def _first_set_only(original):
     return original()[:5]
 
 
+def _without_httpx2(original):
+    # AF-1 recheck: the set without httpx2 (anthropic>=2.8, mcp>=2.3) and httpcore.
+    dropped = ("httpx2", "httpcore", "httpcore2")
+    return tuple(kind for kind in original() if kind.__module__.split(".")[0] not in dropped)
+
+
 def _lease_kept_only(original, journal, effect):
     # AF-2 review: the claim moved whenever the lease was not lost, without the self-fence.
     return not journal.lease.lost()
@@ -496,6 +502,14 @@ _ROWS = [
         E
         + "settlement.py::test_a_lease_lost_while_the_operator_waits_is_session_busy_and_takes_its_cancel_back[memory-settle-False]",
         constant(True),
+    ),
+    # M64: the no-answer set without httpx2 and httpcore, so a client's refusal type raised
+    # from httpx2's error for a server that closed without answering counts as rejected,
+    # and D2 re-sends it under a new key (AF-1 recheck).
+    (
+        E
+        + "engine_no_answer.py::test_no_answer_after_application_is_held_not_resent_under_a_new_key[memory-httpx2_wrapped_from]",
+        _without_httpx2,
     ),
 ]
 

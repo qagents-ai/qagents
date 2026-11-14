@@ -308,6 +308,58 @@ def test_a_response_cut_short_or_a_client_library_disconnect_is_unknown(base, lo
     assert engine._classify_send_error(send, lost) == "unknown"
 
 
+_DISCONNECTED = "Server disconnected without sending a response."
+
+
+@pytest.mark.parametrize("module", ["httpx2", "httpcore", "httpcore2"])
+def test_a_disconnect_reported_by_httpx2_or_httpcore_is_unknown(module):
+    # AF-1 review: httpx2 (the transport of anthropic>=2.8 and mcp>=2.3) shares no class
+    # with httpx, and a server that closes without answering leaves no builtin error in
+    # the chain, so httpx2.RemoteProtocolError counted as a refusal.
+    library = pytest.importorskip(module)
+    base = library.HTTPError if module == "httpx2" else library.ProtocolError
+    send = declared()
+    send.rejected_on = (base,)  # refused at declaration now
+    lost = library.RemoteProtocolError(_DISCONNECTED)
+    assert isinstance(lost, base)
+    assert engine._classify_send_error(send, lost) == "unknown"
+
+
+@pytest.mark.parametrize("style", ["from", "context", "from_none"])
+def test_a_refusal_raised_from_or_while_handling_an_httpx2_disconnect_is_unknown(style):
+    httpx2 = pytest.importorskip("httpx2")
+    httpcore2 = pytest.importorskip("httpcore2")
+    # The chain httpx2 builds (its error raised from httpcore2's), wrapped by the client.
+    core = httpcore2.RemoteProtocolError(_DISCONNECTED)
+    lost = _wrapped(core, httpx2.RemoteProtocolError(_DISCONNECTED), "from")
+    refused = _wrapped(lost, _Refused("payments request failed"), style)
+    assert engine._classify_send_error(declared(rejected_on=(_Refused,)), refused) == "unknown"
+    # A response that was received is still a refusal, raised directly or wrapped.
+    request = httpx2.Request("POST", "https://payments.example/charges")
+    status = httpx2.HTTPStatusError(
+        "400 Bad Request", request=request, response=httpx2.Response(400, request=request)
+    )
+    received = declared(rejected_on=(httpx2.HTTPStatusError,))
+    assert engine._classify_send_error(received, status) == "rejected"
+    wrapped = _wrapped(status, _Refused("bad"), style)
+    assert engine._classify_send_error(declared(rejected_on=(_Refused,)), wrapped) == "rejected"
+
+
+def test_an_sdk_connection_error_raised_from_an_httpx2_disconnect_is_unknown():
+    anthropic = pytest.importorskip("anthropic")
+    httpx2 = pytest.importorskip("httpx2")
+    # anthropic>=2.8 raises APIConnectionError from the httpx2 error. The SDK's catch-all
+    # base is accepted at declaration, so only the chain makes the disconnect unknown.
+    send = declared(rejected_on=(anthropic.APIError,))
+    request = httpx2.Request("POST", "https://api.anthropic.example/v1/messages")
+    connection = anthropic.APIConnectionError(request=request)
+    lost = _wrapped(httpx2.RemoteProtocolError(_DISCONNECTED), connection, "from")
+    assert engine._classify_send_error(send, lost) == "unknown"
+    response = httpx2.Response(400, request=request)
+    refused = anthropic.BadRequestError("invalid request", response=response, body=None)
+    assert engine._classify_send_error(send, refused) == "rejected"
+
+
 def test_a_cycle_in_the_error_chain_ends():
     send = declared(rejected_on=(_Refused,))
     refused, other = _Refused("declined"), ValueError("cached")

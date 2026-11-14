@@ -379,9 +379,37 @@ def _client_types(module: str, *names: str) -> list[type[BaseException]]:
     return [getattr(loaded, name) for name in names]
 
 
+_HTTPCORE_REFUSED = (
+    "TimeoutException",
+    "ReadTimeout",
+    "NetworkError",
+    "ConnectError",
+    "ProtocolError",
+    "RemoteProtocolError",
+    "ProxyError",
+    "UnsupportedProtocol",
+)
+
+
 @pytest.mark.parametrize(
     "module,refused,accepted",
     [
+        # AF-1 review: httpx2 (anthropic>=2.8, mcp>=2.3) shares no class with httpx, so
+        # its HTTPError and TransportError were accepted.
+        (
+            "httpx2",
+            (
+                "HTTPError",
+                "RequestError",
+                "TransportError",
+                "RemoteProtocolError",
+                "ReadTimeout",
+                "ConnectError",
+            ),
+            ("HTTPStatusError",),
+        ),
+        ("httpcore", _HTTPCORE_REFUSED, ()),
+        ("httpcore2", _HTTPCORE_REFUSED, ()),
         (
             "requests.exceptions",
             ("RequestException", "ConnectionError", "Timeout", "ReadTimeout", "ConnectTimeout"),
@@ -404,6 +432,15 @@ def test_rejected_on_refuses_loaded_client_library_transport_types(module, refus
     assert declare(rejected_on=received).rejected_on == received
 
 
+def test_rejected_on_names_the_httpx2_transport_error_it_overlaps():
+    httpx2 = pytest.importorskip("httpx2")
+    with pytest.raises(ConfigurationError) as refused:
+        declare(rejected_on=(httpx2.HTTPError,))
+    assert str(refused.value).startswith(
+        "rejected_on must not list httpx2.HTTPError: it is a base class of httpx2.TransportError,"
+    )
+
+
 def test_client_library_types_are_read_only_from_loaded_modules():
     import subprocess
     import sys
@@ -412,7 +449,7 @@ def test_client_library_types_are_read_only_from_loaded_modules():
         "import sys\n"
         "from qagents.effects import _declare\n"
         "found = {kind.__module__.split('.')[0] for kind in _declare._no_answer_types()}\n"
-        "names = ('requests', 'urllib3', 'aiohttp')\n"
+        "names = ('httpx2', 'httpcore2', 'requests', 'urllib3', 'aiohttp')\n"
         "print(sorted(name for name in names if name in sys.modules or name in found))\n"
     )
     done = subprocess.run(
