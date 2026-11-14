@@ -361,6 +361,12 @@ _ROWS = [
         + "engine_claim_transfer.py::test_applied_then_rejection_shaped_error_is_found_not_applied_again[memory-True]",
         _local_attempts_only,
     ),
+    # M50: an operator resend is trusted without its MAC, so a forged effect_settled entry
+    # written straight to the store authorizes a D5 send (AF-3).
+    (
+        E + "engine_settlement_mac.py::test_forged_resend_is_held_and_never_sent[memory-no_mac]",
+        constant(True),
+    ),
 ]
 
 CASES = tuple(

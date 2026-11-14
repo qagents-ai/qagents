@@ -42,7 +42,7 @@ from . import _table as table
 from . import _types as types
 from ._canonical import LIMIT_BYTES, JSONValue, check_model_numbers, jcs, resolve_namespace
 from ._declare import Dedupe, Effect, Unique
-from ._fold import Operation, _new_operation
+from ._fold import SETTLEMENT_FOLD_KEYS, Operation, _new_operation
 from ._kinds import StatePatchData
 from ._ports import FINDINGS_LOGGER, CallScope, EffectJournal, Timing
 from ._types import (
@@ -60,6 +60,10 @@ from ._types import (
 
 Verdict = Found | NotYetVisible | Absent | Unknown
 _TOOLERROR_WARNED = False
+# The hold detail for an operator resend that does not verify under the approval_secret.
+_RESEND_UNVERIFIABLE = (
+    "Operator resend unverifiable: no valid MAC for this record and revision; settle again."
+)
 
 
 @dataclass
@@ -773,6 +777,7 @@ def _authorization_valid(rule: str, scope: CallScope, store_now: float) -> HoldR
             None
             if scope.authorization.decision == "resend"
             and scope.authorization.settlement_seq is not None
+            and scope.authorization.verifiable
             else HoldReason.APPROVAL_UNVERIFIABLE
         )
     if rule not in {"D1", "D2", "D3", "D4"}:
@@ -785,6 +790,23 @@ def _authorization_valid(rule: str, scope: CallScope, store_now: float) -> HoldR
     if auth.expires_at is not None and store_now > auth.expires_at:
         return HoldReason.APPROVAL_EXPIRED
     return None
+
+
+def _resend_verified(scope: CallScope, op: Operation) -> bool:
+    """With an approval_secret, a pending operator resend counts only if its MAC signs the
+    journaled answer and it names the revision it followed (M50, SPEC 5.3). A copy of a
+    genuine answer appended later names an older revision. Without a secret the journal is
+    trusted, as before."""
+    settlement = op.pending_resend
+    permissions = scope.permissions
+    if settlement is None or permissions is None or not permissions.signs_pauses:
+        return True
+    prior = (settlement.model_extra or {}).get("prior_revision")
+    data = settlement.model_dump(mode="json", exclude=set(SETTLEMENT_FOLD_KEYS))
+    fields = kinds.settlement_mac_fields(scope.session_id, kinds.KIND_EFFECT_SETTLED, data)
+    return prior == settlement.expected_revision and permissions.verify_settlement(
+        fields, settlement.mac
+    )
 
 
 def _d2_plan(effect: Effect, op: Operation) -> tuple[bool, int]:
@@ -1100,6 +1122,9 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
         )
         pending = op.pending_resend
         resend_seq = (pending.model_extra or {}).get("seq") if pending is not None else None
+        # A resend that does not verify authorizes nothing, and no row sends while it stands:
+        # it may have reopened a record that was rejected or settled (SPEC 5.3, 7.5).
+        resend_unverified = pending is not None and not _resend_verified(scope, op)
         dedupe = op.state == "D" and not retry_blocked and _dedupe_allowed(effect, op, scope, now)
         if op.state == "D" and send_running(journal.store, scope.session_id, op.record_id):
             await _hold(effect, op, scope, HoldReason.SEND_STILL_RUNNING)
@@ -1107,6 +1132,8 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
             "D3" if dedupe else "D4" if op.state == "D" else "D2" if op.state == "R" else "D1"
         )
         invalid = _authorization_valid(auth_rule, scope, now)
+        if resend_unverified:
+            invalid = HoldReason.APPROVAL_UNVERIFIABLE
         situation = table.PerformSituation(
             allowed=True,
             same_call=same_call,
@@ -1121,7 +1148,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
             fence_ok=not journal.lease.lost(),
             auth_valid=invalid is None,
             dedupe_valid=dedupe,
-            resend_accepted=resend_seq is not None and not retry_blocked,
+            resend_accepted=resend_seq is not None and not retry_blocked and not resend_unverified,
         )
         if op.state in ("N", "R") and invalid is not None and not own_rejection:
             raise ConfigurationError("The tool attempt has no valid authorization to send.")
@@ -1279,7 +1306,13 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
                 )
             ):
                 reason = HoldReason.WINDOW_EXPIRED
-            await _hold(effect, op, scope, invalid or reason or HoldReason.DISPATCH_UNKNOWN)
+            await _hold(
+                effect,
+                op,
+                scope,
+                invalid or reason or HoldReason.DISPATCH_UNKNOWN,
+                detail=_RESEND_UNVERIFIABLE if resend_unverified else None,
+            )
 
         dispatch_scope = scope
         generation = op.generation
@@ -1291,6 +1324,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
                 authorization=ports.Authorization(
                     "resend",
                     settlement_seq=resend_seq,
+                    verifiable=not resend_unverified,
                 ),
             )
         token = _DISPATCH_INPUT.set(prepared)
