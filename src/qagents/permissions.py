@@ -374,6 +374,22 @@ class Permissions:
             decision = _as_decision(answer)
             if decision is not None:
                 return decision
+        return self._by_rules(tool)
+
+    def _asks_by_rule(self, tool: Tool) -> bool:
+        """Whether the patterns, the ``mode`` and ``requires_approval`` ask before ``tool`` runs.
+
+        This is the decision for a call that no ``deny`` pattern refuses and that
+        ``can_use_tool`` leaves to the rules (it is not consulted here: it decides
+        per call). The agent checks it when it is built, to warn about effects
+        tools whose approval decisions no ``approval_secret`` signs.
+        """
+        return not _matches(tool.name, self.deny) and self._by_rules(tool).behavior == "ask"
+
+    def _by_rules(self, tool: Tool) -> Decision:
+        """Steps 3 to 5 of the order: the ``ask`` and ``allow`` patterns, then the mode
+        (under ``"default"``, ``requires_approval``)."""
+        name = tool.name
         if _matches(name, self.ask):
             return Decision(behavior="ask", reason="an ask rule matches this tool.")
         if _matches(name, self.allow):

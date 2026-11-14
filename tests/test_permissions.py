@@ -77,6 +77,35 @@ async def test_callback_decides_and_fails_closed():
     ).behavior == "deny"
 
 
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        Permissions(),
+        Permissions(mode="allow_all"),
+        Permissions(mode="ask_all"),
+        Permissions(mode="read_only"),
+        Permissions(ask=["send_*"]),
+        Permissions(allow=["refund_*"]),
+        Permissions(ask=["refund_*"], allow=["refund_*"]),
+        Permissions(mode="ask_all", allow=["read_*"]),
+        Permissions(mode="ask_all", deny=["send_*"]),
+        Permissions(ask=["*"], deny=["refund_order"]),
+    ],
+)
+async def test_asks_by_rule_agrees_with_decide_without_a_callback(permissions):
+    """The agent's build-time check (an approval no secret signs) uses the same rule order."""
+    for target in make_tools([]):
+        asks = (await decide(permissions, target, order="A", amount=1)).behavior == "ask"
+        assert permissions._asks_by_rule(target) is asks, target.name
+
+
+def test_asks_by_rule_leaves_out_can_use_tool():
+    _, refund_order, send_email = make_tools([])
+    permissions = Permissions(can_use_tool=lambda *args: "allow")
+    assert permissions._asks_by_rule(refund_order) is True  # requires_approval, by the rules
+    assert Permissions(can_use_tool=lambda *args: "ask")._asks_by_rule(send_email) is False
+
+
 async def test_denied_calls_are_reported_to_the_model():
     log: list[str] = []
     model = ScriptedModel([call("send_email", to="a@example.com"), "I could not send it."])
