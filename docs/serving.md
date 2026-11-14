@@ -52,7 +52,12 @@ for (;;) {
 ## Before production
 
 - **Authenticate and authorise.** Check who is calling, and that the session id belongs to them,
-  before reading or resuming a session. Approvals are not signed in 0.1.
+  before reading or resuming a session.
+- **Sign approvals.** Set `Permissions(approval_secret=...)` from your secret store, the same on
+  every worker. It signs paused calls, so `resume` accepts only answers that carry their token
+  ([signed pauses](concepts/permissions.md#signed-pauses)). For effects tools that ask for
+  approval it also lets an effect whose outcome is unknown be re-sent under its decision; see
+  [Effects tools that ask for approval](guides/recover-effect.md#effects-tools-that-ask-for-approval).
 - **One model client per process.** Build the agent, and its `QCloudModel`, once at startup.
 - **Choose the store.** `SQLiteStore` suits one host. Several replicas need a shared store; a
   Postgres store is on the [roadmap](design.md#roadmap), and the interface is

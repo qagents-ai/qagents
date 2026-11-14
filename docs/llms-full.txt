@@ -618,10 +618,12 @@ or the rest of the journal.
 Effects tools need the secret as well. When an effect's outcome is unknown, a tool that asks
 for approval re-sends it automatically (rules D3 and D4) only under its original decision,
 and only if that decision verifies. Without `approval_secret` no decision verifies, so such
-an effect is never re-sent automatically, in the run or after a crash: unless a declared
-lookup finds it, it is held as `APPROVAL_UNVERIFIABLE` until an operator settles it with
-`agent.settle`. The agent logs a warning when it is built (or, for a toolkit's tools, when
-a run starts). See
+an effect is never re-sent automatically, in the run or after a crash: where D3 or D4 would
+re-send it, and unless a declared lookup finds it (also through `agent.recheck`), it is held
+as `APPROVAL_UNVERIFIABLE` until an operator settles it with `agent.settle`. The agent logs a
+warning when it is built (or, for a toolkit's tools, when a run starts). It names the effects
+tools that D3 or D4 can re-send and that ask; with `can_use_tool`, which decides per call, it
+names each one that may ask. See
 [Effects tools that ask for approval](../guides/recover-effect.md#effects-tools-that-ask-for-approval).
 
 Signed JSON integers must be between `-(2**53 - 1)` and `2**53 - 1`, inclusive. Larger
@@ -2314,25 +2316,36 @@ detects duplicate credits.
 ## Effects tools that ask for approval
 
 A tool asks for approval when it is declared `requires_approval=True`, matches
-an `ask` pattern, or runs under `Permissions(mode="ask_all")`. Its effects are
-sent under the decision a person made. When an attempt's outcome is unknown,
-the automatic re-sends need that decision again: rule D3 (the same key, inside
-the destination's dedupe window) and rule D4 (after an authoritative absence)
+an `ask` pattern, runs under `Permissions(mode="ask_all")`, or when your
+`can_use_tool` returns `"ask"` for the call. Its effects are sent under the
+decision a person made. When an attempt's outcome is unknown, the automatic
+re-sends need that decision again: rule D3 (the same key, inside the
+destination's dedupe window) and rule D4 (after an authoritative absence)
 send only under the original decision, and only if it verifies and has not
 expired. A decision verifies only under `Permissions(approval_secret=...)`,
 which signs the journaled decision.
 
+Only the recovery of effects that D3 or D4 can re-send depends on the secret:
+those with a `Dedupe` or `Unique` contract, or with an authoritative lookup. An effect with
+neither is never re-sent automatically, with or without the secret, and is
+held for its own reason, such as `RESPONSE_LOST`.
+
 Without `approval_secret`:
 
 - No effect of such a tool is re-sent automatically, in the same run or after
-  a crash. Unless a declared lookup finds it, an effect whose outcome is
-  unknown is held with `APPROVAL_UNVERIFIABLE` and no `retry_after`.
+  a crash. Where D3 or D4 would re-send it, and unless a declared lookup finds
+  it, an effect whose outcome is unknown is held with `APPROVAL_UNVERIFIABLE`
+  and no `retry_after`. Before then it keeps its own reason: an authoritative
+  absence seen too early is `NOT_YET_QUIESCENT`, with a `retry_after`.
 - The held effect waits for `agent.recheck` (its lookup) or for an operator's
   answer through `agent.settle`: `Settle.committed`, `Settle.not_applied`,
   `Settle.resend` or `Settle.close_unknown`.
 - A call whose effect had not started is asked again after a crash.
 - The agent logs a warning when it is built, or at run start for tools a
-  toolkit provides. It names the tools and the fix.
+  toolkit provides. It names the tools and the fix. With `can_use_tool` the
+  build cannot tell which calls ask, so the warning names every effects tool
+  that D3 or D4 can re-send and that no `deny` pattern refuses, and says it
+  may ask.
 
 ```python
 import os
@@ -2353,7 +2366,10 @@ Two hold reasons concern the decision:
 | `APPROVAL_EXPIRED` | The decision is older than `approval_ttl_s` (store clock) when a re-send would go out. | Recheck, or settle as an operator. |
 | `APPROVAL_UNVERIFIABLE` | The decision does not verify: no `approval_secret`, a MAC that does not match, or an operator `resend` that does not verify. | Recheck, or settle as an operator. Set `approval_secret` for later calls. |
 
-A held effect never asks the person again: the first intent spent the decision.
+Both reasons appear only where a re-send (D3 or D4) would otherwise go out,
+except an operator `resend` that does not verify, which is always
+`APPROVAL_UNVERIFIABLE`. A held effect never asks the person again: the first
+intent spent the decision.
 
 
 ## Run the offline crash harness
@@ -3207,7 +3223,12 @@ for (;;) {
 ## Before production
 
 - **Authenticate and authorise.** Check who is calling, and that the session id belongs to them,
-  before reading or resuming a session. Approvals are not signed in 0.1.
+  before reading or resuming a session.
+- **Sign approvals.** Set `Permissions(approval_secret=...)` from your secret store, the same on
+  every worker. It signs paused calls, so `resume` accepts only answers that carry their token
+  ([signed pauses](concepts/permissions.md#signed-pauses)). For effects tools that ask for
+  approval it also lets an effect whose outcome is unknown be re-sent under its decision; see
+  [Effects tools that ask for approval](guides/recover-effect.md#effects-tools-that-ask-for-approval).
 - **One model client per process.** Build the agent, and its `QCloudModel`, once at startup.
 - **Choose the store.** `SQLiteStore` suits one host. Several replicas need a shared store; a
   Postgres store is on the [roadmap](design.md#roadmap), and the interface is
