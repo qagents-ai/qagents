@@ -355,6 +355,17 @@ APPROVAL_MAC_FIELDS = (
 )  # SPEC 7.5
 
 
+def settlement_mac_fields(session_id: str, kind: str, data: dict[str, Any]) -> dict[str, Any]:
+    """What an operator answer's MAC signs (SPEC 5.3): the session id, the entry kind
+    (``effect_settled``, or ``effect_committed`` for ``via=operator``) and every journaled
+    data field except ``mac``. The operator signs these fields; the engine verifies them."""
+    return {
+        "session_id": session_id,
+        "kind": kind,
+        "data": {name: value for name, value in data.items() if name != "mac"},
+    }
+
+
 def lease_entry_id(owner_token: str) -> str:
     """A re-appended acquisition uses the same client-generated entry identity."""
     return "la_" + digest(owner_token)[:24]

@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 
 State = Literal["N", "C", "R", "D", "NA", "CU", "X"]
 
+# The keys the fold adds to each folded effect_settled data (Operation.settlements);
+# without them the data is what the operator journaled and signed.
+SETTLEMENT_FOLD_KEYS = frozenset({"seq", "voided", "prior_revision"})
+
 
 @dataclass
 class AttemptState:
@@ -152,8 +156,10 @@ def _conflict_key(finding: kinds.EffectConflictData) -> tuple[str, tuple[int, ..
 def _resolve_prefix(
     op: Operation, seq: int, expected_revision: int | None, by: str | None, evidence: str | None
 ) -> bool:
-    # The operator boundary verifies the decision/MAC before appending. The pure fold
-    # additionally requires a complete answer to this exact prefix; it has no secret.
+    # The fold has no secret and checks no MAC: it trusts operator answers as it trusts
+    # every effect entry. With approval_secret set, the engine checks a pending resend's
+    # MAC and position before any row sends (SPEC 5.3); the other answers authorize no
+    # send. Here an answer resolves an X prefix only if it is complete and names its revision.
     if (
         op.state not in ("D", "X")
         or expected_revision != op.revision
@@ -317,7 +323,11 @@ class EffectView:
             return
         elif entry.kind == kinds.KIND_EFFECT_SETTLED:
             data = kinds.EffectSettledData.model_validate(entry.data)
-            data = data.model_copy(update={"seq": entry.seq, "voided": False})
+            # prior_revision: the record's revision just before this answer. A genuine
+            # answer names it as expected_revision; a copy appended later names an older one.
+            data = data.model_copy(
+                update={"seq": entry.seq, "voided": False, "prior_revision": previous_revision}
+            )
             if data.outcome != "resend" and _resolve_prefix(
                 op,
                 entry.seq,

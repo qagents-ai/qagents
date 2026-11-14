@@ -103,3 +103,14 @@ def test_approval_record_mac_inventory_and_extra_fields():
     )
     assert (record.v, record.ask, record.arguments_changed, record.arguments) == (3, 1, False, None)
     assert record.model_dump()["future_hint"] == "retained"
+
+
+def test_settlement_mac_fields_bind_session_kind_and_every_field_but_the_mac():
+    data = {"record_id": "ef_1", "outcome": "resend", "expected_revision": 4, "mac": "ab"}
+    fields = kinds.settlement_mac_fields("s", kinds.KIND_EFFECT_SETTLED, data)
+    assert fields == {
+        "session_id": "s",
+        "kind": "effect_settled",
+        "data": {"record_id": "ef_1", "outcome": "resend", "expected_revision": 4},
+    }
+    assert data["mac"] == "ab"  # the journaled data is not changed

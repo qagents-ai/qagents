@@ -5,9 +5,10 @@ from dataclasses import asdict
 
 import pytest
 
-from qagents.effects._fold import fold_effects
+from qagents.effects import _kinds as kinds
+from qagents.effects._fold import SETTLEMENT_FOLD_KEYS, fold_effects
 
-from ._samples import committed, intent
+from ._samples import committed, failed, intent, reference
 from .test_fold import entry, settlement
 
 
@@ -174,3 +175,27 @@ def test_any_later_attempt_voids_prior_resend_authorization(rule):
     )
     assert view.get("shop", "refund", "R1").pending_resend is None
     assert view.records("session")[0].settlement.voided
+
+
+def test_each_answer_keeps_the_revision_it_followed_and_a_later_copy_does_not_match():
+    genuine = entry(3, "effect_settled", settlement("resend", expected_revision=2))
+    copy = entry(5, "effect_settled", settlement("resend", expected_revision=2), identity="copy")
+    view = fold_effects(
+        [
+            entry(1, "effect_intent", intent()),
+            entry(2, "effect_failed", failed()),
+            genuine,
+            entry(4, "effect_observed", {**reference(), "attempts": [1], "verdict": None}),
+        ]
+    )
+    op = view.get("shop", "refund", "R1")
+    assert op.pending_resend.model_extra == {"seq": 3, "voided": False, "prior_revision": 2}
+    assert op.pending_resend.expected_revision == op.pending_resend.model_extra["prior_revision"]
+    view.apply(copy)
+    assert op.pending_resend.model_extra["seq"] == 5
+    assert (
+        op.pending_resend.model_extra["prior_revision"] == 3 != op.pending_resend.expected_revision
+    )
+    assert set(op.pending_resend.model_extra) == SETTLEMENT_FOLD_KEYS
+    signed = op.pending_resend.model_dump(mode="json", exclude=SETTLEMENT_FOLD_KEYS)
+    assert signed == kinds.EffectSettledData.model_validate(copy.data).model_dump(mode="json")
