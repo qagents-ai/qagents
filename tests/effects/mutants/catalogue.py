@@ -228,6 +228,11 @@ def _first_set_only(original):
     return original()[:5]
 
 
+def _lease_kept_only(original, journal, effect):
+    # AF-2 review: the claim moved whenever the lease was not lost, without the self-fence.
+    return not journal.lease.lost()
+
+
 E = "tests/effects/test_"
 M = "tests/effects/mutants/test_scenarios.py::"
 
@@ -411,6 +416,13 @@ _ROWS = [
         E
         + "engine_guards.py::test_a_response_cut_short_or_a_client_library_disconnect_is_unknown[IncompleteReadError]",
         _first_set_only,
+    ),
+    # M55: a worker whose lease cannot cover a send still takes a rejected claim over, and
+    # the owner's own retry then fails with ClaimConflict (AF-2 review).
+    (
+        E
+        + "engine_claim_transfer.py::test_a_takeover_whose_self_fence_fails_journals_nothing_and_keeps_the_claim[memory]",
+        _lease_kept_only,
     ),
 ]
 

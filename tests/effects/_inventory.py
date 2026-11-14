@@ -2909,4 +2909,6 @@ SEAMS = [
     ("M53", "qagents.effects._engine._cancelled_at_deadline", "O2"),
     # Added by the AF-1 re-fix: the one definition of the no-answer set.
     ("M54", "qagents.effects._declare._no_answer_types", "O1"),
+    # Added by the AF-2 re-fix: a rejected claim moves only when the self-fence passes.
+    ("M55", "qagents.effects._engine._may_move_claim", "O2"),
 ]

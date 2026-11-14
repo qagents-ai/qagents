@@ -844,6 +844,13 @@ def _lookup_state(effect: Effect, op: Operation) -> Literal["not_run", "none_dec
     return "not_run"
 
 
+async def _may_move_claim(journal: EffectJournal, effect: Effect) -> bool:
+    """A rejected claim moves to this record only if this worker could send next: the
+    self-fence must pass, else nothing is journaled (SPEC 7.1 C1, F1; M55). A worker
+    that cannot send would otherwise take the claim from its owner and strand it."""
+    return await _self_fence(journal, effect)
+
+
 async def _take_claim(
     effect: Effect, op: Operation, claim: Any, prepared: _Prepared, scope: CallScope
 ) -> None:
@@ -1291,7 +1298,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
                 _reach(scope, op, "C1", "claim_replayed")
                 return _receipt(effect, view.get(*key), scope, replayed=True)
             if claim_kind == "rejected":
-                if not situation.fence_ok:
+                if not await _may_move_claim(journal, effect):
                     raise LeaseError("Effect dispatch refused: no safe lease margin.")
                 # Record first: the claim and its earlier attempts move here, then the
                 # folded R(n) rows decide, so a declared lookup runs before any D2.

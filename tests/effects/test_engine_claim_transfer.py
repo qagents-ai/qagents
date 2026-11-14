@@ -16,7 +16,7 @@ from qagents.effects import Absent, Attempt, Dedupe, EffectContext, Found, Key, 
 from qagents.effects import _engine as engine
 from qagents.effects._canonical import idempotency_key
 from qagents.effects._fold import EffectView, fold_effects
-from qagents.errors import EffectRejected
+from qagents.errors import EffectRejected, LeaseError
 from qagents.models.testing import ScriptedModel, call
 from qagents.session import InMemoryStore, LeasedWriter, Session, SQLiteStore
 
@@ -44,7 +44,7 @@ class Destination:
         return [e[2] for e in self.events if e[0] == "lookup" and session in (None, e[1])]
 
 
-def declare(destination, *, replays_rejections=False, lookup=True):
+def declare(destination, *, replays_rejections=False, lookup=True, timeout_s=None):
     contract = Dedupe(
         3600, contract="fixture", concurrent="waits", replays_rejections=replays_rejections
     )
@@ -56,6 +56,7 @@ def declare(destination, *, replays_rejections=False, lookup=True):
         dedupe=contract,
         rejected_on=(Refused,),
         receipt_identity=("id",),
+        **({} if timeout_s is None else {"timeout_s": timeout_s}),
     )
     async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
         destination.events.append(("send", ctx.session_id, attempt.idempotency_key))
@@ -100,9 +101,9 @@ async def store(request, tmp_path):
 
 
 @asynccontextmanager
-async def opened(db, session, operation):
+async def opened(db, session, operation, ttl_s=30):
     writer = LeasedWriter(
-        db, session, worker="test", ttl_s=30, purpose="run", journal_acquisition=True
+        db, session, worker="test", ttl_s=ttl_s, purpose="run", journal_acquisition=True
     )
     assert await writer.open()
     try:
@@ -113,14 +114,14 @@ async def opened(db, session, operation):
         await writer.close()
 
 
-async def perform(db, send, session, operation):
-    async with opened(db, session, operation) as scope:
+async def perform(db, send, session, operation, ttl_s=30):
+    async with opened(db, session, operation, ttl_s) as scope:
         return await engine.perform(send, Request(id="R1"), scope=scope)
 
 
-async def reject_in_session_one(db, destination, send):
+async def reject_in_session_one(db, destination, send, ttl_s=30):
     with pytest.raises(EffectRejected):
-        await perform(db, send, "one", "run-1:1:call")
+        await perform(db, send, "one", "run-1:1:call", ttl_s)
     claim = await db.get_claim(*KEY)
     assert claim.session_id == "one" and claim.status == "rejected"
     return claim
@@ -238,6 +239,30 @@ async def test_retry_in_another_session_without_a_lookup_still_sends_d2(store):
     assert (await perform(db, send, "two", "run-2:1:call")).id == "refund-1"
     assert len(destination.sends("two")) == 1
     assert kinds_of(await db.load("two")) == ["effect_claimed", "effect_intent", "effect_committed"]
+
+
+async def test_a_takeover_whose_self_fence_fails_journals_nothing_and_keeps_the_claim(store):
+    """SPEC 7.1 C1: nothing is journaled if the self-fence fails (review AF-2-self-fence).
+
+    Session two's 30 s lease cannot cover timeout_s=60 plus m, so it may not send. Before
+    the fix it still moved the claim and looked up, and the owner's own retry then failed
+    with ClaimConflict.
+    """
+    db, _ = store
+    destination = Destination()
+    send = declare(destination, timeout_s=60)
+    earlier = await reject_in_session_one(db, destination, send, ttl_s=600)
+
+    destination.mode = "apply"
+    with pytest.raises(LeaseError):
+        await perform(db, send, "two", "run-2:1:call", ttl_s=30)
+
+    assert kinds_of(await db.load("two")) == []
+    assert destination.events[1:] == []  # no lookup and no send by session two
+    assert await db.get_claim(*KEY) == earlier
+    # The owner, with a lease long enough to send, retries in a new call.
+    assert (await perform(db, send, "one", "run-1:2:call", ttl_s=600)).id == "refund-1"
+    assert len(destination.applied) == 1
 
 
 async def test_within_session_retry_is_unchanged(store):
