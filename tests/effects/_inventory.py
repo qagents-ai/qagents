@@ -2842,4 +2842,6 @@ SEAMS = [
     ("M45", "qagents.effects._engine._require_claims", "O2"),
     ("M46", "qagents.session.SQLiteStore._delete", "O3"),
     ("M47", "qagents.session.Lease.sends_drained", "O3"),
+    # Added by AF-1 (interface-changes.md): the transport-level no-answer guard of SPEC 5.1.
+    ("M48", "qagents.effects._declare._no_answer", "O1"),
 ]

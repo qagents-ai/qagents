@@ -34,6 +34,7 @@ from qagents.errors import (
 from qagents.session import EFFECTS_REQUIRED, Entry, SessionStore
 
 from . import _canonical as canonical
+from . import _declare
 from . import _kinds as kinds
 from . import _ports as ports
 from . import _quiescence as quiescence
@@ -725,9 +726,16 @@ def _may_overrun(effect: Effect) -> bool:
 def _classify_send_error(
     effect: Effect, error: BaseException
 ) -> Literal["rejected", "duplicate", "unknown"]:
-    """Only explicit destination contracts classify a raised response as definite (M4)."""
+    """Only explicit destination contracts classify a raised response as definite (M4).
+
+    A transport-level no answer (a timeout, a lost connection, a cancellation, an
+    httpx transport error) is never a rejection, even when its class also derives
+    from EffectRejected or a rejected_on type (SPEC 5.1). Its outcome is unknown.
+    """
     global _TOOLERROR_WARNED
-    if isinstance(error, EffectRejected) or isinstance(error, effect.rejected_on):
+    if not _declare._no_answer(error) and (
+        isinstance(error, EffectRejected) or isinstance(error, effect.rejected_on)
+    ):
         return "rejected"
     if isinstance(effect.dedupe, Unique) and isinstance(error, effect.dedupe.on_duplicate):
         return "duplicate"

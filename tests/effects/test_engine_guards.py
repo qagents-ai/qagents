@@ -1,8 +1,10 @@
 """Boundary checks for the engine's sending conditions and destination contracts."""
 
+import asyncio
 from collections import Counter
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from pydantic import BaseModel
 
@@ -139,6 +141,47 @@ def test_destination_contract_classifies_rejection_and_unique_duplicate():
     unique = declared(dedupe=Unique(contract="destination uniqueness", on_duplicate=(KeyError,)))
     assert engine._classify_send_error(unique, KeyError()) == "duplicate"
     assert engine._classify_send_error(unique, RuntimeError()) == "unknown"
+
+
+class _Refused(Exception):
+    """A client's definite refusal type, the kind rejected_on lists."""
+
+
+@pytest.mark.parametrize(
+    "base",
+    [TimeoutError, ConnectionResetError, httpx.ReadTimeout, httpx.RemoteProtocolError],
+    ids=lambda base: base.__name__,
+)
+def test_no_answer_error_is_unknown_even_when_it_derives_from_a_declared_refusal(base):
+    send = declared(rejected_on=(_Refused,))
+    lost = type(f"Refused{base.__name__}", (_Refused, base), {})("response lost")
+    assert isinstance(lost, send.rejected_on)
+    assert engine._classify_send_error(send, lost) == "unknown"
+    assert engine._classify_send_error(send, base("response lost")) == "unknown"
+    assert engine._classify_send_error(send, _Refused("declined")) == "rejected"
+
+
+@pytest.mark.parametrize(
+    "base",
+    [TimeoutError, ConnectionResetError, httpx.ReadTimeout, httpx.RemoteProtocolError],
+    ids=lambda base: base.__name__,
+)
+def test_no_answer_error_is_unknown_even_if_rejected_on_skipped_the_declaration_check(base):
+    # The shape of the analysis probe: an effect whose rejected_on lists a base class of
+    # the transport errors. The declaration refuses it now; classification must not rely
+    # on that, because a worker leg rebuilds effects without re-declaring them.
+    send = declared()
+    send.rejected_on = (OSError, httpx.HTTPError)
+    assert engine._classify_send_error(send, base("response lost")) == "unknown"
+
+
+def test_no_answer_overrides_effect_rejected_and_cancellation_bases():
+    send = declared(rejected_on=(_Refused,))
+    lost = type("RejectedTimeout", (EffectRejected, TimeoutError), {})("response lost")
+    assert engine._classify_send_error(send, lost) == "unknown"
+    cancelled = type("RefusedCancel", (_Refused, asyncio.CancelledError), {})("stopped")
+    assert engine._classify_send_error(send, cancelled) == "unknown"
+    assert engine._classify_send_error(send, asyncio.CancelledError()) == "unknown"
 
 
 @pytest.mark.parametrize("remaining,renewed", [(4.0, 0), (3.99, 1)])

@@ -342,6 +342,13 @@ _ROWS = [
         E + "store_writer.py::test_cancel_close_twice_never_releases_before_thread_send_drains",
         nothing,
     ),
+    # M48: without the no-answer guard, a timeout that also derives from a declared
+    # refusal counts as rejected, and D2 re-sends it under a new key (AF-1).
+    (
+        E
+        + "engine_no_answer.py::test_no_answer_after_application_is_held_not_resent_under_a_new_key[memory-timeout_subclass]",
+        constant(False),
+    ),
 ]
 
 CASES = tuple(
