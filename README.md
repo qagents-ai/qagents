@@ -211,6 +211,9 @@ mode default. A denied tool does not run. An unanswered approval pauses the sess
 
 For approvals exchanged outside the process, configure an `approval_secret` and preserve the
 pending token with `Approval.for_call`. The support example uses a local terminal.
+Effects tools that ask for approval need the secret too: without it, an effect whose outcome is
+unknown is never re-sent automatically and, unless a lookup finds it, waits for an operator
+(the agent warns when it is built).
 See the [approval guide](docs/concepts/permissions.md) before exposing a remote approval endpoint.
 
 ### Sessions and recovery

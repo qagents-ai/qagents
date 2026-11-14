@@ -116,6 +116,15 @@ these carry the recorded token. A missing token or a changed signed call raises
 application: the token protects the paused call's integrity, not the reviewer's identity
 or the rest of the journal.
 
+Effects tools need the secret as well. When an effect's outcome is unknown, a tool that asks
+for approval re-sends it automatically (rules D3 and D4) only under its original decision,
+and only if that decision verifies. Without `approval_secret` no decision verifies, so such
+an effect is never re-sent automatically, in the run or after a crash: unless a declared
+lookup finds it, it is held as `APPROVAL_UNVERIFIABLE` until an operator settles it with
+`agent.settle`. The agent logs a warning when it is built (or, for a toolkit's tools, when
+a run starts). See
+[Effects tools that ask for approval](../guides/recover-effect.md#effects-tools-that-ask-for-approval).
+
 Signed JSON integers must be between `-(2**53 - 1)` and `2**53 - 1`, inclusive. Larger
 integers are refused rather than rounded. PostgreSQL JSONB can normalize an integral float
 to an integer; a large float normalized outside this range also fails verification on
