@@ -50,6 +50,7 @@ from .effects import _canonical, _engine, _kinds, _operator, _ports
 from .effects._declare import Effect
 from .effects._types import HOLD_DETAIL, MISSING, EffectRecord, HeldEffect, HoldReason, Settle
 from .errors import (
+    ApprovalConflictError,
     ApprovalTokenError,
     ConfigurationError,
     DeferToolCall,
@@ -1691,6 +1692,7 @@ class _Run:
         )
         # An approval answers an open call of the paused turn and nothing else.
         self.approvals = {key: value for key, value in self.approvals.items() if key in open_calls}
+        self._check_redelivered_approvals(state)
         self._check_tokens(state)
         self._journal_open = True
         if self._effects:
@@ -1919,6 +1921,46 @@ class _Run:
             f"results= names tool call(s) {unknown} that do not wait for a result in session "
             f"{self.session.id!r}. Calls waiting for one: {sorted(accepted) or 'none'}.{hint}"
         )
+
+    def _check_redelivered_approvals(self, state: SessionState) -> None:
+        """Compare answers for an already decided ask before running any tool."""
+        if not self._effects or not self.approvals:
+            return
+        calls = {call.id: call for call in self.history[-1].tool_calls}
+        pending = {item.tool_call_id: item for item in state.pending_approvals}
+        for call_id, approval in list(self.approvals.items()):
+            prior = self._approval_record(call_id)
+            if prior is None:
+                continue
+            call = calls[call_id]
+            fields = self._pause_fields(call, "approval")
+            # A new, explicitly journaled ask can supersede an expired or unverifiable
+            # answer. Its token differs from the token for the already decided ask.
+            if (
+                call_id in pending
+                and pending[call_id].token is not None
+                and approval.token == pending[call_id].token
+                and self.permissions.verify(approval.token, **fields)
+            ):
+                continue
+            fields["ask"] = prior.ask
+            if self.permissions.signs_pauses and not self.permissions.verify(
+                approval.token, **fields
+            ):
+                # _check_tokens supplies the standard mismatch details.
+                continue
+            args = approval.arguments if approval.arguments is not None else call.arguments
+            if (
+                approval.approved != prior.approved
+                or approval.reason != prior.reason
+                or approval.by != prior.by
+                or arguments_digest(args) != prior.arguments_digest
+            ):
+                raise ApprovalConflictError(
+                    f"Tool call {call_id!r} already has a different approval answer.",
+                    tool_call_id=call_id,
+                )
+            del self.approvals[call_id]
 
     def _check_tokens(self, state: SessionState) -> None:
         """With signed pauses, refuse answers that do not carry their pause's token.
@@ -2595,6 +2637,8 @@ class _Run:
                     self._authorizations[call.id] = _ports.Authorization("allow")
                 return "run", call
             if tool.effects and (prior := self._approval_record(call.id)) is not None:
+                if not prior.approved and self.permissions.verify_decision(prior):
+                    return "deny", prior.reason or prompts.APPROVAL_DECLINED
                 args = prior.arguments if prior.arguments_changed else call.arguments
                 if (
                     prior.approved
@@ -2602,7 +2646,7 @@ class _Run:
                     and self.permissions.verify_decision(prior)
                     and prior.tool_spec_digest == tool_spec_digest(tool)
                     and prior.arguments_digest == arguments_digest(args)
-                    and await self._writer.store_now() <= prior.expires_at
+                    and await self._writer.store_now() < prior.expires_at
                 ):
                     reused = call.model_copy(update={"arguments": args, "raw_arguments": None})
                     if (await self.permissions.decide(ctx, tool, reused)).behavior != "deny":

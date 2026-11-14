@@ -4807,7 +4807,7 @@ changes to them will be listed in release notes.
 
 ## qagents.agent.Agent (class)
 
-Source: `src/qagents/agent.py:273` | qagents 0.2.0
+Source: `src/qagents/agent.py:274` | qagents 0.2.0
 Import: `from qagents.agent import Agent`
 
 ```python
@@ -4886,7 +4886,7 @@ Details of one member: get_api("qagents.agent.Agent.<member>").
 
 ## qagents.agent.Limits (class)
 
-Source: `src/qagents/agent.py:204` | qagents 0.2.0
+Source: `src/qagents/agent.py:205` | qagents 0.2.0
 Import: `from qagents.agent import Limits`
 
 ```python
@@ -4929,7 +4929,7 @@ Details of one member: get_api("qagents.agent.Limits.<member>").
 
 ## qagents.agent.RunStream (class)
 
-Source: `src/qagents/agent.py:887` | qagents 0.2.0
+Source: `src/qagents/agent.py:888` | qagents 0.2.0
 Import: `from qagents.agent import RunStream`
 
 ```python
@@ -5587,7 +5587,7 @@ Args:
 - `async completed_steps() -> dict[str, Any]`: Names and recorded results of the steps that have finished (a copy).
 - `async effect(name: str, effect: Any, request: Any) -> Any`
 - `async step(name: str, function: Callable[[], Any], *, type: Any = None) -> Any`: Record ``function``'s result and replay completed steps.
-- `async map(name, items, function, *, concurrency, type) -> list[Any]`: Run ``function(item)`` as one durable step per item, concurrently.
+- `async map(name, items, function, *, concurrency, type, key) -> list[Any]`: Run ``function(item)`` as one durable step per item, concurrently.
 - `async run_agent(name, agent, prompt, *, approvals, results, state, on_event, **options) -> RunResult`: Run an agent as a step, in its own durable session.
 - `async send_signal(store: SessionStore, workflow_id: str, name: str, value: Any = None) -> None`: Record a signal for a workflow, from any process.
 - `async wait_for_signal(name: str, *, type: Any = None) -> Any`: Return the value of signal ``name``, or suspend the workflow until it is sent.

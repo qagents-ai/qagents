@@ -13,7 +13,7 @@ from qagents import (
     tool,
 )
 from qagents.effects import Attempt, EffectContext, Key, Settle, effect
-from qagents.errors import ConfigurationError, HeldEffectsError, SessionError
+from qagents.errors import ApprovalConflictError, ConfigurationError, HeldEffectsError, SessionError
 from qagents.messages import Message
 from qagents.models.testing import FunctionModel, call
 from qagents.permissions import Approval, Permissions
@@ -253,3 +253,34 @@ async def test_effect_tools_are_refused_outside_fenced_agent_runs():
         await route(classifier, {"refund": agent}, "Refund")
     with pytest.raises(ConfigurationError, match="fenced agent run"):
         await tool_server(agent.tools).start()
+
+
+async def test_a_redelivered_approval_cannot_replace_a_durable_answer():
+    class StopBeforeStart(InMemoryStore):
+        stopped = False
+
+        async def append_leased(self, session_id, entries, owner):
+            if not self.stopped and any(item.kind == "tool_started" for item in entries):
+                self.stopped = True
+                raise SessionError("Stop after the approval was recorded.")
+            return await super().append_leased(session_id, entries, owner)
+
+    store = StopBeforeStart()
+    destination = []
+    session = Session(store, id="test")
+    agent = make_agent(destination, approval=True)
+    paused = await agent.run("Refund", session=session)
+    (pending,) = paused.pending_approvals
+    approved = Approval.for_call(pending, by="reviewer")
+    with pytest.raises(SessionError, match="Stop after"):
+        await agent.resume(session, approvals={pending.tool_call_id: approved})
+    with pytest.raises(ApprovalConflictError):
+        await agent.resume(
+            session, approvals={pending.tool_call_id: Approval.for_call(pending, approved=False)}
+        )
+    assert not destination
+    result = await agent.resume(session, approvals={pending.tool_call_id: approved})
+    assert result.status == "completed"
+    entries = await session.entries()
+    assert sum(item.kind == "approval_decided" for item in entries) == 1
+    assert len(destination) == 1

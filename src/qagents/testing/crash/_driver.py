@@ -28,7 +28,14 @@ from qagents.session import Entry, PendingApproval, Session, derive_state
 from ._clock import ManualClock
 from ._env import BuildIsolation, CrashEnv, GatedModel
 from ._execution import Execution
-from ._explore import Point, concurrency_variants, recovery_points, reference_points, select_points
+from ._explore import (
+    Point,
+    boundary_points,
+    concurrency_variants,
+    recovery_points,
+    reference_points,
+    select_points,
+)
 from ._fakes import Fake
 from ._faults import FaultController, FaultPlan, Faults
 from ._loop import NoTerminalState, VirtualLoop
@@ -148,6 +155,9 @@ async def crash_test(
                     deeper[recovered.id] = recovered
             for variant in _model_points(point, result, chosen):
                 deeper[variant.id] = variant
+            if "advance_boundaries" in chosen.kinds and result.crash_snapshots:
+                for boundary in boundary_points(point, _recorded_boundaries(result), leg=1):
+                    deeper[boundary.id] = boundary
             if _stop_on_violation and any(
                 check.status == "violated"
                 for check in _point_checks(result, reference, user, max_legs, expect)
@@ -200,6 +210,35 @@ async def crash_test(
             supported=not (scenario or fakes or approve or answer or invariants or _mask_features),
         ),
     )
+
+
+def _recorded_boundaries(result):
+    """Recover the observed dedupe cutoff and approval bounds before an injected crash."""
+    values = {}
+    if not result.crash_snapshots:
+        return values
+    for raw in result.crash_snapshots[0].entries_json:
+        entry = Entry.model_validate_json(raw)
+        data = entry.data
+        if entry.kind == "effect_intent":
+            timing = data.get("timing", {})
+            first = data.get("first_use_at")
+            window = timing.get("window_s")
+            if first is not None and window is not None:
+                boundary = (
+                    first
+                    + window
+                    - sum(
+                        timing.get(field) or 0.0
+                        for field in ("timeout_s", "m_s", "sigma_s", "margin_s")
+                    )
+                )
+                values[f"{data['name']}/dedupe"] = boundary
+        elif entry.kind == "approval_decided" and "expires_at" in data:
+            values[f"{data['name']}/approval"] = data["expires_at"]
+        elif entry.kind == "effect_observed" and data.get("retry_after") is not None:
+            values[f"{data['name']}/retry"] = data["retry_after"]
+    return values
 
 
 def _model_points(prefix, result, faults):
@@ -412,6 +451,17 @@ def _execute_loop(
         answers = {}
         needs_recheck = False
         for number in range(max_legs):
+            clock_fault = next(
+                (
+                    plan
+                    for plan in point.plans
+                    if plan.kind == "advance_boundaries" and plan.leg == number
+                ),
+                None,
+            )
+            if clock_fault is not None and clock_fault.value > world.clock.store_time():
+                world.clock.advance(clock_fault.value - world.clock.store_time())
+                controller.hit(clock_fault)
             world.crashed.clear()
             leg = world.add_leg(number)
             backend = world.store_for_leg(

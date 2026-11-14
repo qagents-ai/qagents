@@ -235,6 +235,7 @@ class Workflow:
         if name in completed:
             return _revive(completed[name], type)
         with self._claim(name):
+            await self._journal.append("workflow_step_started", {"name": name})
             result = function()
             if inspect.isawaitable(result):
                 result = await result
@@ -252,13 +253,15 @@ class Workflow:
         *,
         concurrency: int | None = None,
         type: Any = None,
+        key: Callable[[Any], str] | None = None,
     ) -> list[Any]:
         """Run ``function(item)`` as one durable step per item, concurrently.
 
         Item ``i`` is the step ``f"{name}[{i}]"``, so on a later run of the
         same workflow id only the items that did not finish run again. The
         items must therefore be the same, in the same order, on every run:
-        results are matched by position.
+        results are matched by position. Use key= to resume by item identity
+        when the order of items can change.
 
             summaries = await wf.map("summarise", documents, summarise, concurrency=4)
 
@@ -293,6 +296,15 @@ class Workflow:
         values = list(items)
         if not values:
             return []
+        if key is None:
+            step_names = [f"{name}[{index}]" for index in range(len(values))]
+        else:
+            keys = [key(item) for item in values]
+            if any(not isinstance(item_key, str) or not item_key for item_key in keys):
+                raise ConfigurationError("Workflow.map key must return nonempty strings.")
+            if len(set(keys)) != len(keys):
+                raise ConfigurationError("Workflow.map needs unique keys for its items.")
+            step_names = [f"{name}[key={quote(item_key, safe='')}]" for item_key in keys]
         completed = await self._completed_map()
         gate = asyncio.Semaphore(concurrency) if concurrency is not None else None
 
@@ -304,14 +316,16 @@ class Workflow:
                 produced = await produced
             return produced
 
-        async def run_item(index: int, item: Any) -> Any:
-            step_name = f"{name}[{index}]"
+        async def run_item(step_name: str, item: Any) -> Any:
             if gate is None or step_name in completed:
                 return await self.step(step_name, lambda: call(item), type=type)
             async with gate:
                 return await self.step(step_name, lambda: call(item), type=type)
 
-        tasks = [asyncio.create_task(run_item(index, item)) for index, item in enumerate(values)]
+        tasks = [
+            asyncio.create_task(run_item(step_name, item))
+            for step_name, item in zip(step_names, values, strict=True)
+        ]
         try:
             outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         finally:

@@ -60,3 +60,26 @@ async def test_explorer_uses_a_fresh_writer_and_destination_after_kill(tmp_path)
     point = next(p for p in killed if p.execution.triggered and p.verdict == "safe")
     pinned = report.pin(point.id, tmp_path / "pins")
     await assert_recovers(build, pinned)
+
+
+async def test_recovery_explores_the_recorded_dedupe_boundary(tmp_path):
+    report = await crash_test(
+        build,
+        "Refund",
+        directory=tmp_path,
+        store="sqlite",
+        model=[call("refund", id="R1"), "Complete."],
+        faults=Faults.parse("kill_after,advance_boundaries"),
+        transport="fake",
+        points="effects",
+    )
+    passes = [
+        point
+        for point in report.points
+        if "advance_boundaries" in point.execution.point.kinds
+        and len(point.execution.triggered) == 2
+    ]
+    assert passes, report.explain()
+    assert any(
+        item.reason.value == "WINDOW_EXPIRED" for point in passes for item in point.execution.held
+    ), report.explain()

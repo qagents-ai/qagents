@@ -627,3 +627,31 @@ async def test_legacy_standalone_step_session_resolves_without_a_workflow_journa
         "new prompt",
         "new answer",
     ]
+
+
+async def test_map_with_stable_keys_reorders_saved_results_and_rejects_duplicates():
+    store = InMemoryStore()
+    active = Workflow(store, id="keyed")
+    items = [{"id": "a]%", "body": "first"}, {"id": "b", "body": "second"}]
+
+    def render(item):
+        return item["body"]
+
+    def get_id(item):
+        return item["id"]
+
+    assert await active.map("items", items, render, key=get_id) == ["first", "second"]
+    rebuilt = Workflow(store, id="keyed")
+
+    def unexpected(item):
+        pytest.fail("Completed work must not run again.")
+
+    assert await rebuilt.map("items", reversed(items), unexpected, key=get_id) == [
+        "second",
+        "first",
+    ]
+    with pytest.raises(ConfigurationError, match="unique keys"):
+        await rebuilt.map("items", [items[0], items[0]], unexpected, key=get_id)
+    kinds = [entry.kind for entry in await active._journal.entries()]
+    assert kinds.count("workflow_step_started") == 2
+    assert kinds.count("workflow_step") == 2
