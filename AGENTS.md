@@ -221,7 +221,7 @@ its async test functions need no marker. A sub-agent gets its own scripted model
 src/qagents/          the package: agent.py (Agent, the loop, RunStream), tools.py, permissions.py,
                       hooks.py, session.py (journal, stores), workflow.py, multi.py, events.py,
                       messages.py, results.py, errors.py, context.py, tracing.py, runtime.py,
-                      evals.py, cli.py (the qagents command: chat, run, models, docs)
+                      evals.py, cli.py (the qagents command: chat, run, models, crashtest, docs)
 src/qagents/external/ ExternalAgent: the base class for agents that run their own loop and
                       are driven over a control protocol; ScriptedExternalAgent for tests.
                       Modules: contract, permissions, turn, agent, tool, changes, scripted

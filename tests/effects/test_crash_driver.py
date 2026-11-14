@@ -2,8 +2,9 @@
 
 from qagents import Agent, RunContext, tool
 from qagents.effects import Attempt, Dedupe, EffectContext, Key, effect
-from qagents.models.testing import call
-from qagents.testing.crash import Faults, assert_recovers, crash_test
+from qagents.models.recording import RecordingModel
+from qagents.models.testing import ScriptedModel, call
+from qagents.testing.crash import Cassette, Faults, assert_recovers, crash_test
 
 from .test_engine_dispatch import Receipt, Request
 
@@ -83,3 +84,61 @@ async def test_recovery_explores_the_recorded_dedupe_boundary(tmp_path):
     assert any(
         item.reason.value == "WINDOW_EXPIRED" for point in passes for item in point.execution.held
     ), report.explain()
+
+
+async def test_pinned_cassette_keeps_its_offline_model_after_original_is_removed(tmp_path):
+    path = tmp_path / "recording.json"
+    model = RecordingModel(ScriptedModel(["Reply."]), path)
+
+    def read_only(env):
+        return Agent(env.model, name="reader")
+
+    await Agent(model, name="reader").run("Read the fixture")
+    report = await crash_test(
+        read_only,
+        "Read the fixture",
+        model=Cassette(path),
+        store="sqlite",
+        directory=tmp_path,
+        faults=Faults.parse("kill_before"),
+    )
+    point = next(
+        item for item in report.points if item.execution.triggered and item.verdict == "safe"
+    )
+    pin = report.pin(point.id, tmp_path / "pins")
+    path.unlink()
+    await assert_recovers(read_only, pin)
+
+
+async def test_worker_thawed_before_second_fence_cannot_send_on_expired_lease(tmp_path):
+    report = await crash_test(
+        build,
+        "Refund",
+        directory=tmp_path,
+        store="sqlite",
+        model=[call("refund", id="R1"), "Complete."],
+        points="effects",
+        faults=Faults.parse("freeze_before_fence2"),
+        transport="fake",
+    )
+    (point,) = report.points[1:]
+    assert point.execution.triggered, report.explain()
+    assert point.verdict == "safe", report.explain(point.id)
+    assert all(app.leg > 0 for app in point.execution.applications)
+
+
+async def test_freeze_inside_send_is_reported_outside_the_clock_assumptions(tmp_path):
+    report = await crash_test(
+        build,
+        "Refund",
+        directory=tmp_path,
+        store="sqlite",
+        model=[call("refund", id="R1"), "Complete."],
+        points="effects",
+        faults=Faults.parse("freeze_in_send"),
+        transport="fake",
+    )
+    (point,) = report.points[1:]
+    assert point.execution.outside_a3 == point.execution.triggered
+    assert point.execution.triggered
+    assert not report.strict_ok

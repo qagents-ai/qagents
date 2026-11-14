@@ -479,6 +479,10 @@ async def _dispatch(
                 tool_call_id=scope.tool_call_id,
             )
         )
+        transport = ports.TRANSPORT.get()
+        before_fence = getattr(transport, "before_second_fence", None)
+        if before_fence is not None:
+            await before_fence(effect)
         fenced = await _self_fence(journal, effect)
         current_time = await journal.store_now()
         invalid = _authorization_valid(rule, scope, current_time)

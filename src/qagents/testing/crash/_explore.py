@@ -348,7 +348,7 @@ def reference_points(
             raise ValueError(f"observed send has no effect declaration: {b.detail}")
         sends[b.leg, effect.name] += 1
         index = sends[b.leg, effect.name]
-        for kind in sorted(faults.kinds & (_EFFECT | {"freeze_before_fence2", "freeze_in_send"})):
+        for kind in sorted(faults.kinds & (_EFFECT | {"freeze_in_send"})):
             if kind == "duplicate_key" and not isinstance(effect.dedupe, Unique):
                 continue
             if kind in {"commit_late", "not_yet_visible_then_commit"} and not (
@@ -380,6 +380,17 @@ def reference_points(
                     Point(
                         identity,
                         (FaultPlan(identity, kind, index, b.leg, method=effect.name, value=value),),
+                        in_effect_window=True,
+                    )
+                )
+    if "freeze_before_fence2" in faults.kinds:
+        for b in boundaries:
+            if b.kind == "before_second_fence" and b.phase == "before":
+                label = f"leg{b.leg}:before_fence({b.index})/{b.detail}"
+                made.append(
+                    Point(
+                        label + "+freeze_before_fence2",
+                        (FaultPlan(label, "freeze_before_fence2", b.index, b.leg),),
                         in_effect_window=True,
                     )
                 )

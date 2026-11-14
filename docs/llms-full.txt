@@ -2176,6 +2176,26 @@ uses worker process termination and a separate HTTP destination. It includes
 trials with destination deduplication disabled to confirm that the benchmark
 detects duplicate credits.
 
+
+## Run the offline crash harness
+
+Build an agent with the model supplied by the harness and define its
+destination through the crash environment. Record a cassette with
+the same model requests and synthetic fixture data.
+
+```bash
+qagents crashtest my_fixture:build "Credit DEMO-1" --cassette fixture.json \
+  --store sqlite --transport fake --faults kill_after,advance_boundaries \
+  --json results.json --junit results.xml
+```
+
+The CLI exits with 1 for a violation, 2 for a usage error and 3 for
+an inconclusive report. With strict mode it exits with 4 when the
+coverage or provider evidence is incomplete. A strict run requires
+exercise through the client transport and evidence for destination
+assumptions. The in-process harness uses a virtual clock. The Gym
+benchmark measures real worker termination on the local machine.
+
 ---
 
 <!-- page: integrations/gym.md | integrations/gym/ -->

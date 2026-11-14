@@ -21,6 +21,7 @@ from ._world import World
 
 _EFFECT_FAULTS = frozenset(
     {
+        "freeze_in_send",
         "reject",
         "rejected_on",
         "fail_before_commit",
@@ -184,6 +185,13 @@ class HarnessTransport:
         if dispatch is not None and dispatch.fault is not None and not dispatch.consumed:
             dispatch.consumed = True
             assert self.controller is not None
+            if dispatch.fault.kind == "freeze_in_send":
+                self.controller.hit(dispatch.fault)
+                self.world.freeze(leg, zombie=True)
+                await self.world._check_gate(leg)
+                return await fake.send(
+                    attempt, leg=leg, key=key, key_passed=key_passed, apply=call, errors=errors
+                )
             return await fake.send_faulted(
                 attempt,
                 leg=leg,
@@ -208,6 +216,11 @@ class LegTransport:
         if self.shared.mode == "client" and not registered:
             raise ConfigurationError(f"client transport requires env.service for {effect.name}")
         return self.shared.mode != "fake" and registered
+
+    async def before_second_fence(self, effect: Effect) -> None:
+        await self.shared.world.gate(
+            self.leg, _nothing, kind="before_second_fence", detail=effect.name
+        )
 
     async def send(
         self, effect: Effect, ctx: EffectContext, attempt: Attempt, call_send: Callable
@@ -389,3 +402,7 @@ class ServiceProxy:
             detail=f"{self._effect.name}.{path}",
             mutating=mutating,
         )
+
+
+async def _nothing() -> None:
+    return None

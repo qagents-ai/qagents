@@ -200,6 +200,18 @@ class FaultController:
             self.outside_a3.append(plan.id)
 
     async def at_boundary(self, point: Boundary) -> None:
+        if point.kind == "before_second_fence" and point.phase == "before":
+            targets = [
+                plan
+                for plan in self.plans
+                if plan.id not in self.triggered
+                and plan.kind == "freeze_before_fence2"
+                and plan.leg == point.leg
+                and plan.index == point.index
+            ]
+            for plan in targets:
+                self.hit(plan)
+                self.world.freeze(point.leg, zombie=True)
         for plan in self._matches(point):
             if plan.kind in {"kill_before", "kill_after", "recovery_kill"}:
                 self.hit(plan)
