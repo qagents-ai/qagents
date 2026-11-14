@@ -102,7 +102,9 @@ from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, Literal
 
 from . import session as _session
-from .effects._types import EffectRecord, HeldEffect, Settle
+from .effects import _engine, _kinds, _operator
+from .effects._ports import Timing
+from .effects._types import MISSING, EffectRecord, HeldEffect, Settle
 from .errors import ConfigurationError, RunInterrupted, SessionError
 from .events import (
     AgentSwitched,
@@ -197,6 +199,7 @@ class RunHandle:
         self._stream: RunStream | None = None
         self._prepared: RunStream | None = None
         """A started run's stream, already journaled, until the handle drives it."""
+        self._writer: _session.LeasedWriter
         self._store: _LeasedStore | None = None
         self._cancel_reason: str | None = None
         self._stop_requested = False
@@ -204,7 +207,6 @@ class RunHandle:
         """Set by `cancel` and by a stop request: a queued run stops waiting for its slot."""
         self._lease_lost = False
         self._lease_owner = ""  # set by _new_handle immediately after acquisition
-        self._lease_deadline = asyncio.get_running_loop().time() + runtime.lease_ttl_s
         self._answers = answers
         """The run was resumed with approvals or results it has not finished using."""
         self._unsaved = set(unsaved)
@@ -316,7 +318,9 @@ class RunHandle:
         run = getattr(self._stream, "_run", None)
         if run is not None and getattr(run, "_running", None):
             return False  # a tool call journaled its start and has no result yet
-        return self._store is None or self._store.writing == 0
+        return self._writer.lease.running_sends() == 0 and (
+            self._store is None or self._store.writing == 0
+        )
 
     def _request_stop(self) -> None:
         self._stop_requested = True
@@ -419,6 +423,21 @@ class AgentRuntime:
         self.worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.lease_ttl_s = float(lease_ttl_s)
         self.heartbeat_s = float(heartbeat)
+        from .tools import Tool
+
+        for agent in self.agents.values():
+            effects_tools = [
+                item for item in agent.tools if isinstance(item, Tool) and item.effects
+            ]
+            if not effects_tools:
+                continue
+            timing = Timing.for_lease(self.lease_ttl_s, store.takeover_grace_s, effects=True)
+            for tool in effects_tools:
+                timeout = tool.timeout if tool.timeout is not None else agent.limits.tool_timeout_s
+                for warning in _engine.check_declarations(
+                    tool.effects, timing=timing, tool_timeout_s=timeout
+                ):
+                    logger.warning("%s: %s", tool.name, warning)
         self.max_concurrent = max_concurrent
         self.deps_factory = deps_factory
         self.max_failures = max_failures
@@ -434,7 +453,7 @@ class AgentRuntime:
         self._background: set[asyncio.Future[Any]] = set()
         self._skipped: set[tuple[str, str]] = set()
         """Sessions recover() already logged as skipped, with the reason."""
-        self._held_back: dict[str, tuple[str | None, int, str]] = {}
+        self._held_back: dict[str, tuple[str | None, int, str, float | None]] = {}
         """Sessions recover() leaves to a person, with the (run id, failures, status) seen,
         so later polls skip them without a lease write until their journal changes."""
 
@@ -504,7 +523,10 @@ class AgentRuntime:
         session_id = session_id or uuid.uuid4().hex
 
         def open_stream(session: Session, deps: Any, limits: Limits | None) -> RunStream:
-            return agent.stream(prompt, deps=deps, session=session, state=state, limits=limits)
+            return agent.stream(
+                prompt, deps=deps, session=session, state=state, limits=limits,
+                if_held_effects=if_held_effects,
+            )  # fmt: skip
 
         return await self._begin(session_id, agent, open_stream, deps, resumed=False, limits=limits)
 
@@ -530,10 +552,59 @@ class AgentRuntime:
         )
 
     async def settle(self, session_id: str, answer: Settle) -> EffectRecord:
-        raise NotImplementedError("Runtime settlement is pending operator integration.")
+        """Settle a held effect using the agent recorded in the journal."""
+        agent, deps = await self._operator_context(session_id, record_id=answer.record_id)
+        return await _operator.settle(
+            Session(self.store, session_id),
+            answer,
+            effects=agent._effect_map((await agent._collect_tools()).values()),
+            permissions=agent.permissions,
+            deps=deps,
+            lease_ttl_s=self.lease_ttl_s,
+            worker=self.worker_id,
+        )
 
     async def recheck(self, session_id: str) -> list[HeldEffect]:
-        raise NotImplementedError("Runtime recheck is pending operator integration.")
+        """Run lookups for the session's held effects under a fresh lease."""
+        agent, deps = await self._operator_context(session_id)
+        return await _operator.recheck(
+            Session(self.store, session_id),
+            effects=agent._effect_map((await agent._collect_tools()).values()),
+            permissions=agent.permissions,
+            deps=deps,
+            lease_ttl_s=self.lease_ttl_s,
+            worker=self.worker_id,
+        )
+
+    async def _operator_context(
+        self, session_id: str, *, record_id: str | None = None
+    ) -> tuple[Agent, Any]:
+        status = await self.store.status(session_id)
+        agent_name = status.agent
+        if record_id is not None:
+            entries = await self.store.load(session_id)
+            origin = next(
+                (
+                    entry.run_id
+                    for entry in entries
+                    if entry.kind == "effect_intent" and entry.data.get("record_id") == record_id
+                ),
+                None,
+            )
+            if origin is not None:
+                agent_name = next(
+                    (
+                        entry.data.get("agent")
+                        for entry in entries
+                        if entry.kind == "run_started" and entry.run_id == origin
+                    ),
+                    agent_name,
+                )
+        if agent_name is None:
+            raise SessionError(f"Session {session_id!r} has no journaled agent.")
+        agent = self._agent(agent_name)
+        deps = MISSING if self.deps_factory is None else await self._deps(session_id, None)
+        return agent, deps
 
     async def resume(
         self,
@@ -619,6 +690,7 @@ class AgentRuntime:
         if room <= 0:
             return []
         candidates = await self.store.list_sessions(status=_RECOVERABLE, prefix=self.session_prefix)
+        now = await self.store.now() if candidates and "now" in self.store.features else None
         listed = {candidate.session_id for candidate in candidates}
         self._skipped = {key for key in self._skipped if key[0] in listed}
         self._held_back = {key: seen for key, seen in self._held_back.items() if key in listed}
@@ -629,7 +701,13 @@ class AgentRuntime:
             session_id = candidate.session_id
             if session_id in self._handles or session_id in self._claiming:
                 continue
-            if candidate.lease_active():
+            if (
+                candidate.retry_after is not None
+                and now is not None
+                and now < candidate.retry_after
+            ):
+                continue
+            if candidate.lease_active(now):
                 continue  # another worker drives it; acquire_lease would only refuse
             if self._held_back.get(session_id) == _seen(candidate):
                 continue  # left to a person, and nothing changed since
@@ -667,7 +745,8 @@ class AgentRuntime:
         answer. Runs still going after ``timeout_s`` seconds are cancelled,
         which interrupts their model request or tool call (see the delivery
         guarantees in the module documentation). A run that `RunHandle.cancel`
-        was asked to cancel is closed as cancelled, not left open. Their
+        was asked to cancel is closed as cancelled, not left open. Admitted Effects
+        sends and their completion records drain before the lease is released. Their
         handles end with status ``"interrupted"``.
 
         Leases are released before this returns, so another worker can resume
@@ -787,10 +866,9 @@ class AgentRuntime:
 
     async def _recover_one(self, session_id: str) -> RunHandle | None:
         with self._claim(session_id):
-            owner = _session._owner_token(self.worker_id)
-            deadline = asyncio.get_running_loop().time() + self.lease_ttl_s
+            writer = self._new_writer(session_id, purpose="recovery")
             try:
-                if not await self.store.acquire_lease(session_id, owner, self.lease_ttl_s):
+                if not await self._open_writer(writer):
                     return None  # another worker is driving it, or won the race
             except Exception:
                 logger.warning(
@@ -805,23 +883,30 @@ class AgentRuntime:
                 # The run may have ended between the listing and the lease.
                 current = await self.store.status(session_id)
                 if current.status not in _RECOVERABLE or self._skip_reason(current) is not None:
-                    await self._release(session_id, owner)
+                    await self._release(writer)
                     return None
                 agent = self.agents[current.agent or ""]
-                handle = self._new_handle(
-                    session_id, agent, owner=owner, deadline=deadline, resumed=True
+                handle = self._new_handle(session_id, agent, writer=writer, resumed=True)
+                entries = await writer.load()
+                requires = next(
+                    (
+                        entry.data.get("requires", ())
+                        for entry in reversed(entries)
+                        if entry.run_id == current.open_run_id
+                        and entry.kind in {"run_started", "run_resumed"}
+                    ),
+                    (),
                 )
-                entries = await self.store.load(session_id)
+                if set(requires) - _kinds.SUPPORTED_REQUIRES:
+                    self._log_skip(session_id, f"it requires unsupported features {requires!r}")
+                    await self._back_out(handle)
+                    return None
                 limits = _journaled_limits(entries, current.open_run_id)
                 held = self._held_reason(current, entries, limits or agent.limits)
                 if held is not None:
                     reason, crash_loop = held
                     if crash_loop:
-                        await self.store.append_leased(
-                            session_id,
-                            [_crash_loop_entry(current.open_run_id, reason)],
-                            owner,
-                        )
+                        await writer.append([_crash_loop_entry(current.open_run_id, reason)])
                         current = await self.store.status(session_id)
                     self._held_back[session_id] = _seen(current)
                     self._log_skip(session_id, reason)
@@ -835,13 +920,15 @@ class AgentRuntime:
                     session_id,
                 )
                 if handle is None:
-                    await self._release(session_id, owner)
+                    await self._release(writer)
                 else:
                     await self._back_out(handle)
                 return None
             except BaseException:
-                if handle is not None and handle._heartbeat is not None:
-                    handle._heartbeat.cancel()  # the lease expires; never renew it forever
+                if handle is None:
+                    await self._release(writer)
+                else:
+                    await self._back_out(handle)
                 raise
             # No await from here to the launch, so a shutdown cannot slip in between.
             if self._closing.is_set() or handle._lease_lost:
@@ -884,9 +971,12 @@ class AgentRuntime:
                 f"runtime.get({session_id!r}) to finish before starting or resuming another."
             )
         with self._claim(session_id):
-            owner = _session._owner_token(self.worker_id)
-            deadline = asyncio.get_running_loop().time() + self.lease_ttl_s
-            if not await self.store.acquire_lease(session_id, owner, self.lease_ttl_s):
+            writer = self._new_writer(
+                session_id,
+                purpose="recovery" if resumed else "run",
+                journal_acquisition=True if agent.effects_by_name() else None,
+            )
+            if not await self._open_writer(writer):
                 holder = await self.store.status(session_id)
                 raise LeaseError(
                     f"Session {session_id!r} is being driven by worker {holder.lease_owner!r}. "
@@ -898,8 +988,7 @@ class AgentRuntime:
             handle = self._new_handle(
                 session_id,
                 agent,
-                owner=owner,
-                deadline=deadline,
+                writer=writer,
                 resumed=resumed,
                 answers=answers,
                 unsaved=unsaved,
@@ -917,12 +1006,14 @@ class AgentRuntime:
                 if not resumed:
                     # Journal the run now, under the lease: a run that waits for a slot is
                     # then open in the journal, so a shutdown or a crash does not lose it.
-                    store = _LeasedStore(self.store, handle._lease_owner)
+                    store = _LeasedStore(writer)
                     prepared = open_stream(Session(store, session_id), deps, limits)
-                    if journal is not None:  # before the run starts: it governs the whole run
+                    first = await prepared.__anext__()
+                    if journal is not None:
+                        # run_started already persists the limits. Keep the runtime's
+                        # limits entry after the start gate accepts the new run.
                         await store.append(session_id, [_limits_entry(prepared.run_id, journal)])
                         journal = None
-                    first = await prepared.__anext__()
                 if handle._lease_lost:
                     raise LeaseError(
                         f"Worker {self.worker_id!r} lost the lease of session {session_id!r} "
@@ -954,13 +1045,36 @@ class AgentRuntime:
             if not self._claiming:
                 self._claims_idle.set()
 
+    def _new_writer(
+        self,
+        session_id: str,
+        *,
+        purpose: Literal["run", "recovery"],
+        journal_acquisition: bool | None = None,
+    ) -> _session.LeasedWriter:
+        return _session.LeasedWriter(
+            self.store,
+            session_id,
+            worker=self.worker_id,
+            ttl_s=self.lease_ttl_s,
+            purpose=purpose,
+            journal_acquisition=journal_acquisition,
+        )
+
+    async def _open_writer(self, writer: _session.LeasedWriter) -> bool:
+        if not await writer.open():
+            return False
+        if not writer.leased:
+            await writer.close()
+            raise NotImplementedError(_session._unsupported(self.store, "leases"))
+        return True
+
     def _new_handle(
         self,
         session_id: str,
         agent: Agent,
         *,
-        owner: str,
-        deadline: float,
+        writer: _session.LeasedWriter,
         resumed: bool,
         answers: bool = False,
         unsaved: Iterable[str] = (),
@@ -970,8 +1084,8 @@ class AgentRuntime:
             self, session_id, agent.name, resumed=resumed, buffer=self.event_buffer,
             answers=answers, unsaved=unsaved,
         )  # fmt: skip
-        handle._lease_owner = owner
-        handle._lease_deadline = deadline
+        handle._writer = writer
+        handle._lease_owner = writer.lease.owner
         handle._heartbeat = asyncio.create_task(
             self._heartbeat(handle), name=f"qagents-lease:{session_id}"
         )
@@ -983,8 +1097,7 @@ class AgentRuntime:
         if heartbeat is not None:
             heartbeat.cancel()
             await asyncio.wait([heartbeat])  # a renewal in flight ends before the release
-        if not handle._lease_lost:
-            await self._release(handle.session_id, handle._lease_owner)
+        await self._release(handle._writer)
 
     def _launch(
         self,
@@ -1076,7 +1189,7 @@ class AgentRuntime:
                 return  # shut down while queued: nothing more has run
             handle.status = "running"
             if stream is None:
-                handle._store = _LeasedStore(self.store, handle._lease_owner)
+                handle._store = _LeasedStore(handle._writer)
                 stream = open_stream(Session(handle._store, session_id), deps, limits)
             handle._stream = stream
             if handle._cancel_reason is not None:
@@ -1170,15 +1283,18 @@ class AgentRuntime:
             with contextlib.suppress(Exception):
                 await stream.aclose()
         note = await self._interrupted(handle, why) if why is not None else None
-        if not handle._lease_lost:
-            await self._release(handle.session_id, handle._lease_owner)
+        await self._release(handle._writer)
         return note
 
     async def _heartbeat(self, handle: RunHandle) -> None:
         session_id = handle.session_id
         loop = asyncio.get_running_loop()
-        deadline = handle._lease_deadline
+        lease = handle._writer.lease
+        deadline = loop.time() + lease.remaining()
         while True:
+            if handle._writer._journal_acquisition:
+                await handle._writer.keep(on_lost=lambda _: self._lose_lease(handle))
+                return
             await asyncio.sleep(min(self.heartbeat_s, max(0, deadline - loop.time())))
             if loop.time() >= deadline:
                 self._lose_lease(handle)
@@ -1186,7 +1302,7 @@ class AgentRuntime:
             began = loop.time()
             try:
                 held = await asyncio.wait_for(
-                    self.store.renew_lease(session_id, handle._lease_owner, self.lease_ttl_s),
+                    lease.renew(),
                     timeout=min(self.heartbeat_s, deadline - began),
                 )
             except Exception as failure:
@@ -1201,7 +1317,7 @@ class AgentRuntime:
             if not held or loop.time() >= deadline:
                 self._lose_lease(handle)
                 return
-            deadline = began + self.lease_ttl_s
+            deadline = loop.time() + lease.remaining()
 
     def _lose_lease(self, handle: RunHandle) -> None:
         logger.error(
@@ -1214,18 +1330,15 @@ class AgentRuntime:
         if task is not None:
             task.cancel()
 
-    async def _release(self, session_id: str, owner: str) -> None:
-        """Release the lease; on failure it simply expires."""
+    async def _release(self, writer: _session.LeasedWriter) -> None:
+        """Drain admitted sends before releasing their fencing epoch."""
         try:
-            await asyncio.wait_for(
-                self.store.release_lease(session_id, owner),
-                timeout=min(self.lease_ttl_s, 10.0),
-            )
+            await writer.close()
         except Exception as failure:
             logger.warning(
                 "Worker %s could not release its lease on session %r (%s); it expires in %g s",
                 self.worker_id,
-                session_id,
+                writer.session_id,
                 type(failure).__name__,
                 self.lease_ttl_s,
             )
@@ -1295,8 +1408,8 @@ def _interrupted_text(
     return RunInterrupted(text)
 
 
-def _seen(status: SessionStatus) -> tuple[str | None, int, str]:
-    return status.open_run_id, status.failures, status.status
+def _seen(status: SessionStatus) -> tuple[str | None, int, str, float | None]:
+    return status.open_run_id, status.failures, status.status, status.retry_after
 
 
 def _limits_entry(run_id: str, limits: Limits) -> Entry:
@@ -1339,20 +1452,30 @@ class _LeasedStore(SessionStore):
     ``writing`` counts the writes in flight, so a stop never lands in the middle of one.
     """
 
-    def __init__(self, store: SessionStore, owner: str) -> None:
-        self._store = store
-        self.wrapped = store
-        self.writer = None
-        self._owner = owner
+    def __init__(self, writer: _session.LeasedWriter) -> None:
+        self._store = self.wrapped = writer.store
+        self.writer = writer
+        self.takeover_grace_s = self._store.takeover_grace_s
         self.writing = 0
 
-    async def append(self, session_id: str, entries: list[Entry]) -> None:
-        await self.append_leased(session_id, entries, self._owner)
+    @property
+    def features(self) -> frozenset[str]:
+        return self._store.features
 
-    async def append_leased(self, session_id: str, entries: list[Entry], owner: str) -> None:
+    async def now(self) -> float:
+        return await self._store.now()
+
+    async def append(self, session_id: str, entries: list[Entry]) -> list[int] | None:
+        return await self.append_leased(session_id, entries, self.writer.lease.owner)
+
+    async def append_leased(
+        self, session_id: str, entries: list[Entry], owner: str
+    ) -> list[int] | None:
+        if session_id != self.writer.session_id or owner != self.writer.lease.owner:
+            raise LeaseError("This writer holds a different session or acquisition.")
         self.writing += 1
         try:
-            await self._store.append_leased(session_id, entries, owner)
+            return await self.writer.append(entries)
         finally:
             self.writing -= 1
 

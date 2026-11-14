@@ -202,6 +202,7 @@ class MCPTool(Tool):
             idempotent=idempotent,
             timeout=timeout,
         )
+        self.origin = "mcp"
         self.toolkit = toolkit
         """The toolkit that calls the server."""
         self.mcp_name = definition.name

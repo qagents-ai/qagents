@@ -1163,11 +1163,11 @@ class CountingStore(InMemoryStore):
         self.acquired: list[str] = []
         self.broken = broken
 
-    async def acquire_lease(self, session_id, owner, ttl_s):
+    async def acquire_lease_grant(self, session_id, owner, ttl_s):
         self.acquired.append(session_id)
         if session_id == self.broken:
             raise ConnectionError("database is locked")
-        return await super().acquire_lease(session_id, owner, ttl_s)
+        return await super().acquire_lease_grant(session_id, owner, ttl_s)
 
 
 async def test_recover_passes_over_live_leases_and_survives_a_failing_candidate():

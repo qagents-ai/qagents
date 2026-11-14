@@ -99,7 +99,7 @@ def _build_tool(
         text = prompts.EXTERNAL_AGENT_DESCRIPTION_WITH_HINT.format(
             description=text, hint=prompts.EXTERNAL_AGENT_CONTINUE_HINT
         )
-    return Tool(
+    built = Tool(
         call_external,
         name=label,
         description=text,
@@ -110,6 +110,8 @@ def _build_tool(
         idempotent=repeatable,
         timeout=timeout + margin if timeout is not None else None,
     )
+    built.origin = "external"
+    return built
 
 
 async def _call(

@@ -172,6 +172,8 @@ async def collect_tools(items: Iterable[Any]) -> list[Tool]:
     for tool in found:
         if tool.name in names:
             raise ConfigurationError(prompts.TOOL_SERVER_DUPLICATE_NAME.format(name=tool.name))
+        if tool.effects:
+            raise ConfigurationError(f"Effects tool {tool.name!r} needs a fenced agent run.")
         if tool.deferred:
             raise ConfigurationError(prompts.TOOL_SERVER_DEFERRED_TOOL.format(name=tool.name))
         names[tool.name] = tool

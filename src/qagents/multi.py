@@ -44,6 +44,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
+from . import agent as _agent_module
 from . import prompts
 from .agent import Agent, Prompt
 from .errors import ConfigurationError, MaxDepthExceeded, OutputValidationError
@@ -123,6 +124,8 @@ def fan_out(
         raise ConfigurationError(
             f"fan_out(max_tasks=...) must be None or at least 1, not {max_tasks}."
         )
+    if refusal := _agent_module._effects_child_refusal(agent, durable_session=False):
+        raise ConfigurationError(refusal)
     tool_name = name or f"{_tool_safe(agent.name)}_parallel"
 
     async def run_tasks(ctx: RunContext[Any], tasks: list[str]) -> list[dict[str, Any]]:
@@ -281,6 +284,15 @@ async def route(
             there is no ``default``.
     """
     _check_routes(classifier, routes, default)
+    if refusal := _agent_module._effects_child_refusal(
+        classifier, durable_session=classifier_session is not None and parent is None
+    ):
+        raise ConfigurationError(refusal)
+    for target in routes.values():
+        if refusal := _agent_module._effects_child_refusal(
+            target, durable_session=session is not None and parent is None
+        ):
+            raise ConfigurationError(refusal)
     classification = await classifier.run(
         prompt, deps=deps, session=classifier_session, parent=parent
     )

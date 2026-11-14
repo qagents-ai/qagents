@@ -4566,7 +4566,7 @@ Details of one member: get_api("qagents.agent.Limits.<member>").
 
 ## qagents.agent.RunStream (class)
 
-Source: `src/qagents/agent.py:881` | qagents 0.2.0
+Source: `src/qagents/agent.py:887` | qagents 0.2.0
 Import: `from qagents.agent import RunStream`
 
 ```python

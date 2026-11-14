@@ -466,12 +466,18 @@ class Agent:
                     )
         return declarations
 
-    def _check_effect_tools(self, tools: Iterable[Tool], *, limits: Limits | None = None) -> None:
+    def _check_effect_tools(
+        self,
+        tools: Iterable[Tool],
+        *,
+        limits: Limits | None = None,
+        timing: _ports.Timing | None = None,
+    ) -> None:
         limits = limits or self.limits
+        timing = timing or _ports.Timing.for_lease(self.lease_ttl_s, 1.0, effects=True)
         for tool in tools:
             if not tool.effects:
                 continue
-            timing = _ports.Timing.for_lease(self.lease_ttl_s, 1.0, effects=True)
             timeout = tool.timeout if tool.timeout is not None else limits.tool_timeout_s
             for warning in _engine.check_declarations(
                 tool.effects,
@@ -1661,7 +1667,7 @@ class _Run:
             raise ConfigurationError(
                 f"This run requires unsupported features: {sorted(unsupported)}."
             )
-        if _kinds.REQUIRES_EFFECTS in requires and self._writer is None:
+        if _kinds.REQUIRES_EFFECTS in requires and not (self._writer and self._writer.leased):
             raise ConfigurationError("Resuming Effects requires a fenced journal writer.")
         self._ordinal = state.run_messages
         paused = bool(state.pending_approvals or state.pending_inputs)
@@ -1752,13 +1758,13 @@ class _Run:
                 raise ConfigurationError("Effects tools require an explicit, separate session.")
             if self._writer is None or not self._writer.leased:
                 raise ConfigurationError("Effects tools require a fenced session writer.")
-            self.agent._check_effect_tools(self.tools.values(), limits=self.limits)
-            self._writer._journal_acquisition = True
             timing = _ports.Timing.for_lease(
                 self._writer.lease.ttl_s,
                 self._writer.store.takeover_grace_s,
                 effects=True,
             )
+            self.agent._check_effect_tools(self.tools.values(), limits=self.limits, timing=timing)
+            self._writer._journal_acquisition = True
             self._writer.timing = self._writer.lease.timing = timing
             await _engine.check_run_start(
                 list(self._effects.values()),
