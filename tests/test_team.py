@@ -5,9 +5,9 @@ import json
 
 import pytest
 
-from qagents import Agent, RunContext, tool
+from qagents import Agent, Hooks, RunContext, Session, SQLiteStore, tool
 from qagents.errors import ConfigurationError, ToolError
-from qagents.models.testing import FunctionModel, call
+from qagents.models.testing import FunctionModel, ScriptedModel, call
 from qagents.team import TeamMailbox
 
 
@@ -106,3 +106,143 @@ async def test_many_agents_exchange_messages_without_crossing_team_boundaries():
         worker: worker for worker in workers
     }
     assert await other_lead.receive() == []
+
+
+async def test_sqlite_mailbox_reopens_with_unread_messages_and_the_same_sequence(tmp_path):
+    path = tmp_path / "team.db"
+    first = TeamMailbox(["lead", "worker"], db_path=path, capacity=2)
+    lead = first.endpoint("lead")
+    sent = await lead.send("worker", "first")
+
+    reopened = TeamMailbox(["worker", "lead"], db_path=path, capacity=2)
+    worker = reopened.endpoint("worker")
+    assert await worker.receive() == [sent]
+    assert await first.endpoint("worker").receive() == []
+    answer = await worker.send("lead", "reply")
+
+    fresh = TeamMailbox(["lead", "worker"], db_path=path, capacity=2)
+    assert await fresh.endpoint("lead").receive() == [answer]
+    assert answer.sequence == sent.sequence + 1
+    with pytest.raises(ConfigurationError, match="configuration"):
+        TeamMailbox(["lead", "worker"], db_path=path, capacity=1)
+
+
+@pytest.mark.parametrize("name", ["send_message", "receive_messages"])
+async def test_interrupted_mailbox_tool_replays_its_recorded_result(tmp_path, name):
+    class Interrupted(Exception):
+        pass
+
+    class InterruptAfterTool(Hooks):
+        async def after_tool(self, ctx, call, result):
+            assert not result.is_error
+            raise Interrupted
+
+    db_path = tmp_path / "team.db"
+    members = ["lead", "worker"]
+    mailbox = TeamMailbox(members, db_path=db_path)
+    lead, worker = (mailbox.endpoint(member) for member in members)
+    if name == "send_message":
+        original = call(name, recipient="worker", text="first")
+        active = lead
+    else:
+        await lead.send("worker", "first")
+        original = call(name)
+        active = worker
+    async with SQLiteStore(tmp_path / "run.db") as store:
+        session = Session(store, id="resume")
+        first = Agent(
+            ScriptedModel([original]),
+            name=active.member,
+            tools=active.tools(),
+            hooks=[InterruptAfterTool()],
+        )
+        with pytest.raises(Interrupted):
+            await first.run("Use the mailbox", session=session)
+
+        # Consume the original send before retrying, or append a new message
+        # after the successful receive. A retry must not touch the new inbox.
+        if name == "send_message":
+            (delivered,) = await worker.receive()
+        else:
+            await lead.send("worker", "second")
+
+        reopened = TeamMailbox(members, db_path=db_path)
+        resumed = Agent(
+            ScriptedModel(["Finished"]),
+            name=active.member,
+            tools=reopened.endpoint(active.member).tools(),
+        )
+        result = await resumed.resume(session)
+        assert result.completed
+        (reply,) = [
+            part
+            for message in result.messages
+            for part in message.tool_results
+            if part.name == name
+        ]
+        assert not reply.is_error
+        saved = json.loads(reply.content)
+        if name == "send_message":
+            assert saved["text"] == "first" and saved["sequence"] == delivered.sequence
+            assert await worker.receive() == []
+        else:
+            assert [message["text"] for message in saved] == ["first"]
+            assert [message.text for message in await worker.receive()] == ["second"]
+
+
+async def test_sqlite_mailbox_arbitrates_capacity_and_concurrent_reads(tmp_path):
+    members = ["lead", "worker"]
+    first = TeamMailbox(members, db_path=tmp_path / "team.db", capacity=4)
+    second = TeamMailbox(members, db_path=tmp_path / "team.db", capacity=4)
+    leads = [first.endpoint("lead"), second.endpoint("lead")]
+    sent = await asyncio.gather(
+        *(leads[i % 2].send("worker", f"message {i}") for i in range(10)),
+        return_exceptions=True,
+    )
+    full = [item for item in sent if isinstance(item, ToolError)]
+    assert len(full) == 6 and all("full" in str(error) for error in full)
+    queued = [item for item in sent if not isinstance(item, BaseException)]
+    workers = [mailbox.endpoint("worker") for mailbox in (first, second)]
+    batches = await asyncio.gather(*(worker.receive(limit=2) for worker in workers))
+    assert [len(batch) for batch in batches] == [2, 2]
+    assert all(batch[0].sequence < batch[1].sequence for batch in batches)
+    assert sorted(batches[0] + batches[1], key=lambda item: item.sequence) == sorted(
+        queued, key=lambda item: item.sequence
+    )
+    assert await first.endpoint("worker").receive() == []
+
+
+async def test_resume_returns_recorded_empty_receive_without_waiting_again(tmp_path):
+    class Interrupted(Exception):
+        pass
+
+    class InterruptAfterTool(Hooks):
+        async def after_tool(self, ctx, call, result):
+            assert not result.is_error and json.loads(result.content) == []
+            raise Interrupted
+
+    class UseLongWaitOnResume(Hooks):
+        async def before_tool(self, ctx, call):
+            return call.model_copy(update={"arguments": {"wait_s": 30}})
+
+    members = ["lead", "worker"]
+    db_path = tmp_path / "team.db"
+    box = TeamMailbox(members, db_path=db_path)
+    async with SQLiteStore(tmp_path / "run.db") as store:
+        session = Session(store, id="empty")
+        first = Agent(
+            ScriptedModel([call("receive_messages")]),
+            tools=box.endpoint("worker").tools(),
+            hooks=[InterruptAfterTool()],
+        )
+        with pytest.raises(Interrupted):
+            await first.run("Check your inbox", session=session)
+        reopened = TeamMailbox(members, db_path=db_path)
+        resumed = Agent(
+            ScriptedModel(["Finished"]),
+            tools=reopened.endpoint("worker").tools(),
+            hooks=[UseLongWaitOnResume()],
+        )
+        result = await asyncio.wait_for(resumed.resume(session), 5)
+        (empty,) = [part for message in result.messages for part in message.tool_results]
+        assert not empty.is_error and json.loads(empty.content) == []

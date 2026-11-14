@@ -157,5 +157,42 @@ runs use `parent=ctx` to share the coordinator's run limits.
 
 Each inbox holds up to 64 messages by default. A full inbox returns a
 tool error. A receive takes messages in arrival order and can wait for up
-to 30 seconds. Use one mailbox per team execution. Messages live in
-process memory and expire when the application discards that mailbox.
+to 30 seconds. A mailbox created without a database lives in process
+memory.
+
+### Share a mailbox between processes
+
+Pass the same local SQLite path, member names and inbox limits in
+every process. Use a separate file for each team and give each agent
+only the tools bound to its own endpoint.
+
+```python
+from pathlib import Path
+
+from qagents import Agent, TeamMailbox
+
+
+def build_worker(name, model, workdir: Path):
+    mailbox = TeamMailbox(
+        ["coordinator", "researcher", "reviewer"],
+        db_path=workdir / "team.db",
+    )
+    return Agent(model, name=name, tools=mailbox.endpoint(name).tools())
+```
+
+Unread messages and their sequence numbers survive a restart. Processes
+on the same host can wait for messages, and each receive removes its
+batch from the inbox in one SQLite transaction.
+
+Give a worker a durable QAgents session and resume that same session
+after a restart. The mailbox records the result of each
+`send_message` and `receive_messages` call with the change to the inbox.
+If a worker stops before it journals the tool result, the repeated call
+returns the recorded result. It never enqueues another copy or consumes
+a different batch. Direct Python calls to `endpoint.receive()` consume
+messages on return from the database transaction, so use the agent tools
+and a durable session for resumable handling.
+
+The database holds unread messages and saved tool results, including
+message text. Keep it on a local filesystem shared by trusted
+processes and retain it for as long as their sessions can be resumed.

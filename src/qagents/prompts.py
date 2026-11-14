@@ -255,6 +255,9 @@ TEAM_INBOX_FULL = "Inbox for {member!r} is full."
 TEAM_RECEIVE_LIMIT = "Use wait_s between 0 and 30 and a limit between 1 and 64."
 """Sent back when an inbox request exceeds the supported wait or batch size."""
 
+TEAM_REPLAY_CONFLICT = "This team message call already has a different recorded operation."
+"""Sent back when saved mailbox evidence conflicts with a repeated tool call."""
+
 FAN_OUT_DESCRIPTION = (
     "{description}\n\n"
     "Give {name} several independent tasks at once; they are worked on in parallel. Each task "
