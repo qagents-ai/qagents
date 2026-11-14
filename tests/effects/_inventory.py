@@ -2929,4 +2929,8 @@ SEAMS = [
     ("M63", "qagents.effects._operator._take_back_cancel", "O5"),
     # Added by the AF-1 re-fix, round 2: httpx2 and httpcore in the no-answer set (as M54).
     ("M64", "qagents.effects._declare._no_answer_types", "O1"),
+    # Added by the AF-2 re-fix, round 2: a rejected record takes back a never-sent claim
+    # (seam as M56), and D2 keeps a key that was never sent (seam as M33).
+    ("M65", "qagents.effects._engine._claim_kind", "O2"),
+    ("M66", "qagents.effects._engine._d2_plan", "O2"),
 ]

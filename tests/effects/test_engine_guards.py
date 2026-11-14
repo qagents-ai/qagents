@@ -439,5 +439,44 @@ def test_d5_requires_settlement_identity_and_d2_changes_only_replayed_rejection_
     assert engine._authorization_valid("D5", scope, 0) is None
     original = declared(dedupe=Dedupe(1000, "contract", replays_rejections=False))
     replayed = declared(dedupe=Dedupe(1000, "contract", replays_rejections=True))
-    assert engine._d2_plan(original, SimpleNamespace(generation=2)) == (False, 2)
-    assert engine._d2_plan(replayed, SimpleNamespace(generation=2)) == (False, 3)
+    bare = SimpleNamespace(generation=2, attempts=[], claimed=None)
+    assert engine._d2_plan(original, bare) == (False, 2)
+    assert engine._d2_plan(replayed, bare) == (False, 3)
+
+
+def _attempt(generation, outcome):
+    return SimpleNamespace(generation=generation, terminal=outcome, outcome=outcome)
+
+
+@pytest.mark.parametrize(
+    ("own", "carried", "expected"),
+    [
+        ([("rejected", 2)], [], 3),
+        ([("not_sent", 2), ("rejected", 2)], [], 3),
+        ([("rejected", 1)], [("not_sent", 2)], 2),
+        ([("rejected", 1)], [("rejected", 1), ("not_sent", 2)], 2),
+        ([("not_sent", 2)], [("not_sent", 2)], 2),
+        ([("rejected", 1)], [("unknown", 2)], 3),
+        ([("rejected", 1)], [(None, 2)], 3),
+    ],
+    ids=[
+        "own_rejection",
+        "own_rejection_after_not_sent",
+        "carried_not_sent",
+        "carried_history",
+        "both_not_sent",
+        "carried_unknown",
+        "carried_without_outcome",
+    ],
+)
+def test_d2_keeps_a_key_that_was_never_sent_under_replayed_rejections(own, carried, expected):
+    """AF-2 recheck: a generation whose attempts were all definitely not sent keeps its key."""
+    replayed = declared(dedupe=Dedupe(1000, "contract", replays_rejections=True))
+    op = SimpleNamespace(
+        generation=2,
+        attempts=[_attempt(g, outcome) for outcome, g in own],
+        claimed=SimpleNamespace(attempts=[_attempt(g, outcome) for outcome, g in carried])
+        if carried
+        else None,
+    )
+    assert engine._d2_plan(replayed, op) == (False, expected)

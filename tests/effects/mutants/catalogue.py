@@ -244,6 +244,22 @@ def _rejected_reads_no_claim(original, op, claim, prepared, session_id):
     return "own" if op.state == "R" else original(op, claim, prepared, session_id)
 
 
+def _unsent_claim_held_elsewhere(original, op, claim, prepared, session_id):
+    # AF-2 recheck: a rejected record held a claim the other owner never sent, so after a
+    # taker's D2 ended not_sent the owner's retry was held CLAIMED_ELSEWHERE for good.
+    kind = original(op, claim, prepared, session_id)
+    return "held_elsewhere" if kind == "not_sent" and op.state == "R" else kind
+
+
+def _every_replayed_rejection_changes_key(original, effect, op):
+    # AF-2 recheck: under replays_rejections D2 always took generation + 1, also when no
+    # attempt at the current generation had been sent.
+    from qagents.effects import Dedupe
+
+    changes = isinstance(effect.dedupe, Dedupe) and effect.dedupe.replays_rejections
+    return effect.lookup_fn is not None, op.generation + int(changes)
+
+
 def _folded_state(original, permissions, session_id, op, answer):
     # AF-3 review: the operator path checked a resend against the folded state, so a forged
     # resend that reopened a closed record let a real one through.
@@ -510,6 +526,20 @@ _ROWS = [
         E
         + "engine_no_answer.py::test_no_answer_after_application_is_held_not_resent_under_a_new_key[memory-httpx2_wrapped_from]",
         _without_httpx2,
+    ),
+    # M65: a rejected record holds a claim whose last owner never sent its D2, so the
+    # owner's retry holds CLAIMED_ELSEWHERE on every call, also after a delete (AF-2 recheck).
+    (
+        E
+        + "engine_claim_transfer.py::test_the_owner_takes_back_a_claim_whose_taker_never_sent_its_d2[memory-True-lookup-kept]",
+        _unsent_claim_held_elsewhere,
+    ),
+    # M66: D2 after taking back a never-sent claim skips the key the other owner chose and
+    # never sent, so the sessions retrying one business key use two keys (AF-2 recheck).
+    (
+        E
+        + "engine_claim_transfer.py::test_the_owner_takes_back_a_claim_whose_taker_never_sent_its_d2[memory-True-no_lookup-kept]",
+        _every_replayed_rejection_changes_key,
     ),
 ]
 

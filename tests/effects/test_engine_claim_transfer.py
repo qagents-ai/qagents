@@ -759,3 +759,213 @@ async def test_agent_run_paused_by_an_inconclusive_lookup_resumes_and_finds_it(b
     ]
     assert len(destination.applied) == 1
     assert [(r.status, r.via) for r in records] == [("committed", "lookup")]
+
+
+# A record in R(n) also takes back a claim whose last owner's D2 was never sent (SPEC 7.1 C1,
+# 7.10). Review AF-2-old-owner-blocked (recheck): the taker looked up, journaled its D2 intent,
+# and its second self-fence failed, so the claim was not_sent; the earlier owner's retry then
+# held CLAIMED_ELSEWHERE on every call, also after the taker's session was deleted.
+
+
+def unsent_d2_fence(session):
+    """A self-fence that fails in `session` once its D2 intent is journaled (rule E7)."""
+    original = engine._self_fence
+
+    async def fence(journal, effect):
+        op = journal.view().get(*KEY)
+        if journal.session_id == session and any(
+            a.intent.rule == "D2" and a.terminal is None for a in (op.attempts if op else [])
+        ):
+            return False
+        return await original(journal, effect)
+
+    return fence
+
+
+async def taker_d2_not_sent(db, send, monkeypatch, session="two"):
+    """The session takes the rejected claim, and its D2 ends not_sent: nothing goes out.
+
+    Under replays_rejections=True that D2 was at generation + 1, so the taker's record is
+    N there and the claim not_sent. Otherwise it was at the claimed generation, which the
+    transfer made a rejection, so the record stays R(n) and the claim rejected."""
+    replays = send.dedupe.replays_rejections
+    with monkeypatch.context() as patch:
+        patch.setattr(engine, "_self_fence", unsent_d2_fence(session))
+        held = await outcome_of(perform(db, send, session, f"run-{session}:1:call"))
+    assert isinstance(held, EffectHeld) and held.held.reason == HoldReason.LEASE, held
+    entries = await db.load(session)
+    assert [e.data["why"] for e in entries if e.kind == "effect_failed"] == ["not_sent"]
+    assert fold_effects(entries).get(*KEY).state == ("N" if replays else "R")
+    claim = await db.get_claim(*KEY)
+    assert (claim.session_id, claim.status) == (session, "not_sent" if replays else "rejected")
+    return claim
+
+
+@pytest.mark.parametrize("deleted", [False, True], ids=["kept", "deleted"])
+@pytest.mark.parametrize("lookup", [True, False], ids=["lookup", "no_lookup"])
+@pytest.mark.parametrize("replays_rejections", [False, True])
+async def test_the_owner_takes_back_a_claim_whose_taker_never_sent_its_d2(
+    store, monkeypatch, replays_rejections, lookup, deleted
+):
+    db, _ = store
+    destination = Destination()
+    send = declare(destination, replays_rejections=replays_rejections, lookup=lookup)
+    await reject_in_session_one(db, destination, send)
+    [first_key] = destination.sends("one")
+    destination.mode = "apply"
+    taken = await taker_d2_not_sent(db, send, monkeypatch)
+    generation = int(replays_rejections)
+    unsent = taken.attempts[-1]
+    assert (unsent.session_id, unsent.number, unsent.generation, unsent.outcome) == (
+        "two",
+        2,
+        generation,
+        "not_sent",
+    )
+    assert destination.sends("two") == []
+    seen = len(destination.events)
+    if deleted:
+        await db.delete("two", force=True)
+
+    receipt = await outcome_of(perform(db, send, "one", "run-1:2:call"))
+
+    assert isinstance(receipt, Receipt), receipt
+    assert receipt.id == "refund-1" and len(destination.applied) == 1
+    retry = destination.events[seen:]
+    assert [e[:2] for e in retry] == [*([("lookup", "one")] * lookup), ("send", "one")]
+    if lookup:  # it asks about every key, the never-sent one included
+        [inquiry] = destination.lookups("one")
+        assert inquiry.idempotency_keys == tuple(dict.fromkeys([first_key, unsent.idempotency_key]))
+        assert [(a.number, a.generation, a.outcome) for a in inquiry.attempts] == [
+            (1, 0, "rejected"),
+            (2, generation, "not_sent"),
+        ]
+    entries = await db.load("one")
+    assert kinds_of(entries) == [
+        "effect_intent",
+        "effect_failed",
+        "effect_claimed",
+        *(["effect_observed"] * lookup),
+        "effect_intent",
+        "effect_committed",
+    ]
+    [back] = [e for e in entries if e.kind == "effect_claimed"]
+    assert back.data["status"] == taken.status
+    assert back.data["previous_owner"]["session_id"] == "two"
+    assert back.data["attempts"] == [a.model_dump(mode="json") for a in taken.attempts]
+    intent = [e for e in entries if e.kind == "effect_intent"][-1]
+    assert (intent.data["rule"], intent.data["attempt"]) == ("D2", 3)
+    # D2 uses the key two chose and never sent: nothing at that generation reached the
+    # destination, so there is no rejection for it to replay.
+    assert intent.data["generation"] == generation
+    assert intent.data["idempotency_key"] == unsent.idempotency_key == destination.sends("one")[-1]
+    assert intent.seq > back.seq  # record first, act second
+    claim = await db.get_claim(*KEY)
+    assert (claim.session_id, claim.status) == ("one", "committed")
+    assert [(a.session_id, a.number, a.outcome) for a in claim.attempts] == [
+        ("one", 1, "rejected"),
+        ("two", 2, "not_sent"),
+        ("one", 3, "committed"),
+    ]
+    final = fold_effects(entries).get(*KEY)
+    assert final.state == "C" and not final.findings
+    if not deleted:  # the taker, recovered later, replays the commit without a send
+        assert (await perform(db, send, "two", "run-two:2:call")).id == "refund-1"
+        assert len(destination.events) == seen + len(retry)
+        assert (await db.load("two"))[-1].data["via"] == "claim"
+
+
+@pytest.mark.parametrize("found", [True, False], ids=["found", "absent"])
+@pytest.mark.parametrize("step", STEPS, ids=[f"{phase}-{n}" for n, phase in STEPS])
+async def test_a_crash_at_every_step_of_taking_back_a_never_sent_claim_recovers(
+    store, monkeypatch, found, step
+):
+    """Session one's batches: claimed, observed, committed (found) or claimed, observed,
+    intent, committed (absent). A kill before or after each, then a recovery of the call."""
+    db, now = store
+    destination = Destination()
+    send = declare(destination, replays_rejections=True)
+    await reject_in_session_one(db, destination, send)
+    destination.mode = "apply"
+    taken = await taker_d2_not_sent(db, send, monkeypatch)
+    if found:  # an application the destination shows only now
+        tag = engine.canonical.operation_tag(
+            *KEY, engine.canonical.freeze(send, Request(id="R1")).digest
+        )
+        destination.applied.append(("elsewhere", tag, Receipt(id="found-1")))
+    seen = len(destination.events)
+
+    restore = crash_at(db, "one", *step)
+    try:
+        receipt = await perform(db, send, "one", "run-1:2:call")
+    except Crash:
+        receipt = None
+    finally:
+        restore()
+    entries = await db.load("one")
+    view = EffectView()
+    for index, item in enumerate(entries):
+        view.apply(item)
+        assert view.records("one") == fold_effects(entries[: index + 1]).records("one")
+    assert (receipt is None) is (step[0] <= (3 if found else 4))  # the worker died there
+    if receipt is None:
+        now[0] += 120
+        receipt = await perform(db, send, "one", "run-1:2:call")
+
+    assert receipt.id == ("found-1" if found else "refund-1")
+    assert len(destination.applied) == 1
+    retry = destination.events[seen:]
+    assert retry and retry[0][:2] == ("lookup", "one") and {e[1] for e in retry} == {"one"}
+    sends = {e[2] for e in retry if e[0] == "send"}
+    assert sends == (set() if found else {taken.attempts[-1].idempotency_key})
+    final = fold_effects(await db.load("one")).get(*KEY)
+    assert final.state == "C" and not final.findings
+    claim = await db.get_claim(*KEY)
+    assert claim.session_id == "one" and claim.status == "committed"
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_agent_owner_retries_after_a_taker_whose_d2_was_not_sent(
+    backend, tmp_path, monkeypatch
+):
+    """Review probe Q1 at agent level: the D2 of s2 was never sent, then s1 retries."""
+    destination = Destination()
+    send = declare(destination, replays_rejections=True)
+
+    @tool(effects=[send])
+    async def refund(ctx: RunContext, id: str) -> str:
+        """Refund the order."""
+        try:
+            return (await ctx.perform(send, Request(id=id))).id
+        except EffectRejected:
+            return "rejected"
+
+    def agent(*script):
+        return Agent(ScriptedModel(list(script)), tools=[refund])
+
+    db = InMemoryStore() if backend == "memory" else SQLiteStore(tmp_path / "agent.sqlite")
+    async with db:
+        await agent(call("refund", id="R1"), "Done.").run("Refund", session=Session(db, id="s1"))
+        destination.mode = "apply"
+        with monkeypatch.context() as patch:
+            patch.setattr(engine, "_self_fence", unsent_d2_fence("s2"))
+            paused = await agent(call("refund", id="R1"), "Done.").run(
+                "Refund", session=Session(db, id="s2")
+            )
+        assert (await db.get_claim(*KEY)).status == "not_sent"
+        again = await agent(call("refund", id="R1"), "Done.").run(
+            "Refund again", session=Session(db, id="s1")
+        )
+        resumed = await agent("Done.").resume(Session(db, id="s2"))
+        records = await Session(db, id="s1").effects()
+        taker = await Session(db, id="s2").effects()
+    assert (paused.status, again.status, resumed.status) == ("paused", "completed", "completed")
+    assert [(kind, session) for kind, session, _ in destination.events] == [
+        ("send", "s1"),
+        ("lookup", "s2"),
+        ("lookup", "s1"),
+        ("send", "s1"),
+    ]
+    assert len(destination.applied) == 1
+    assert [(r.status, r.via) for r in records] == [("committed", "direct")]
+    assert [(r.status, r.via) for r in taker] == [("committed", "claim")]

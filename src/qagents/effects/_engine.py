@@ -832,8 +832,18 @@ def _resend_verified(permissions: Permissions | None, session_id: str, op: Opera
 
 
 def _d2_plan(effect: Effect, op: Operation) -> tuple[bool, int]:
-    """Look up a rejection before retrying; only replayed rejections advance generation (M33)."""
-    changes_key = isinstance(effect.dedupe, Dedupe) and effect.dedupe.replays_rejections
+    """Look up a rejection before retrying; only replayed rejections advance generation (M33).
+
+    A generation whose attempts were all definitely not sent has no rejection to replay,
+    so D2 keeps its key. That is the claim a record takes back after the other owner's D2
+    was not sent: D2 then uses the key that owner had chosen and never sent (SPEC 4.4 D2,
+    7.10; M66). A generation with no recorded attempt still changes the key.
+    """
+    replays = isinstance(effect.dedupe, Dedupe) and effect.dedupe.replays_rejections
+    outcomes = [a.terminal for a in op.attempts if a.generation == op.generation]
+    outcomes += [a.outcome for a in _claimed_attempts(op) if a.generation == op.generation]
+    never_sent = bool(outcomes) and all(outcome == "not_sent" for outcome in outcomes)
+    changes_key = replays and not never_sent
     return effect.lookup_fn is not None, op.generation + int(changes_key)
 
 
@@ -857,12 +867,13 @@ def _claim_kind(
 ) -> Literal[
     "none", "own", "committed_same", "held_elsewhere", "other_descriptor", "rejected", "not_sent"
 ]:
-    """How rule C1 reads the claim before deciding (SPEC 7.1 C1, 7.10; M56).
+    """How rule C1 reads the claim before deciding (SPEC 7.1 C1, 7.10; M56, M65).
 
     A record in N reads any claim. A record in R(n) reads only a claim that another
     session took over after this record was rejected: its own claim leaves the R(n) rows
-    to decide. There a claim the other owner has not sent counts as held, because only a
-    rejected claim can be transferred, so this record could not journal its lookup.
+    to decide. A claim the other owner rejected or never sent moves back by
+    ``effect_claimed`` (in N a never-sent one moves with the D1 intent); only a claim
+    that may still be sent or applied elsewhere is held.
     """
     if claim is None:
         return "none"
@@ -872,13 +883,13 @@ def _claim_kind(
         return "other_descriptor"
     if claim.status == "committed":
         return "committed_same"
-    if claim.status == "rejected" or (claim.status == "not_sent" and op.state == "N"):
+    if claim.status in ("rejected", "not_sent"):
         return claim.status
     return "held_elsewhere"
 
 
 async def _may_move_claim(journal: EffectJournal, effect: Effect) -> bool:
-    """A rejected claim moves to this record only if this worker could send next: the
+    """A claim moves to this record only if this worker could send next: the
     self-fence must pass, else nothing is journaled (SPEC 7.1 C1, F1; M55). A worker
     that cannot send would otherwise take the claim from its owner and strand it."""
     return await _self_fence(journal, effect)
@@ -887,8 +898,9 @@ async def _may_move_claim(journal: EffectJournal, effect: Effect) -> bool:
 async def _take_claim(
     effect: Effect, op: Operation, claim: Any, prepared: _Prepared, scope: CallScope
 ) -> None:
-    """Journal the move of a rejected claim, with its attempt history, before any
-    lookup or send (SPEC 7.10). The claim index refuses it if the claim changed."""
+    """Journal the move of a rejected or never-sent claim, with its attempt history,
+    before any lookup or send (SPEC 7.10). The claim index refuses it if the claim,
+    its status included, changed since it was read."""
     journal = scope.journal
     payload = kinds.EffectClaimedData(
         **_reference(op),
@@ -909,7 +921,7 @@ async def _take_claim(
             "incarnation": claim.incarnation,
             "record_id": claim.record_id,
         },
-        status="rejected",
+        status=claim.status,
         generation=claim.generation,
         first_use_at=claim.first_use_at,
         attempts=claim.attempts,
@@ -1343,11 +1355,12 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
                 )
                 _reach(scope, op, "C1", "claim_replayed")
                 return _receipt(effect, view.get(*key), scope, replayed=True)
-            if claim_kind == "rejected":
+            if claim_kind == "rejected" or (claim_kind == "not_sent" and op.state == "R"):
                 if not await _may_move_claim(journal, effect):
                     raise LeaseError("Effect dispatch refused: no safe lease margin.")
                 # Record first: the claim and its earlier attempts move here, then the
-                # folded R(n) rows decide, so a declared lookup runs before any D2.
+                # folded R(n) rows decide, so a declared lookup runs before any D2. A
+                # claim whose last owner never sent its attempt comes back the same way.
                 await _take_claim(effect, op, claim, prepared, scope)
                 claim_kind = "none"
                 lookup = _lookup_state(effect, journal.view().get(*key))

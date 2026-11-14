@@ -65,7 +65,7 @@ def test_c1_precedes_first_send_for_foreign_claims(claim):
 
 
 @pytest.mark.parametrize(
-    "claim", ["committed_same", "held_elsewhere", "other_descriptor", "rejected"]
+    "claim", ["committed_same", "held_elsewhere", "other_descriptor", "rejected", "not_sent"]
 )
 def test_c1_reads_a_claim_another_session_took_from_a_rejected_record(claim):
     """SPEC 7.1 C1, 7.10: before L2 or D2, but after the call's own rejection (P3r)."""
