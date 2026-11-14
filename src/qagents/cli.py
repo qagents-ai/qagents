@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import importlib
 import json
 import os
 import sys
@@ -107,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     """The argument parser of the ``qagents`` command.
 
     Returns:
-        A parser with the ``chat``, ``run``, ``models`` and ``docs`` subcommands.
+        The command's argument parser.
     """
     parser = argparse.ArgumentParser(
         prog="qagents",
@@ -203,6 +204,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     models.set_defaults(handler=_models)
 
+    crash = commands.add_parser("crashtest", help="explore crash recovery with an offline model")
+    crash.add_argument("build", metavar="MODULE:FUNCTION")
+    crash.add_argument("prompt")
+    crash.add_argument("--cassette", type=Path, required=True)
+    crash.add_argument("--store", choices=("memory", "sqlite"), default="sqlite")
+    crash.add_argument("--faults", default="quick")
+    crash.add_argument("--points", choices=("all", "all-raw", "effects", "recovery"), default="all")
+    crash.add_argument("--budget", type=int)
+    crash.add_argument("--seed", type=int, default=0)
+    crash.add_argument("--mode", choices=("freeze", "exception"), default="freeze")
+    crash.add_argument("--transport", choices=("auto", "fake", "client"), default="auto")
+    crash.add_argument("--json", type=Path)
+    crash.add_argument("--junit", type=Path)
+    crash.add_argument("--pin", type=Path)
+    crash.add_argument("--strict", action="store_true")
+    crash.add_argument("--allow-held", action="append", default=[])
+    crash.add_argument("--allow-undeclared", action="append", default=[])
+    crash.set_defaults(handler=_crashtest)
+
     docs = commands.add_parser(
         "docs",
         add_help=False,
@@ -287,6 +307,55 @@ def _docs(argv: list[str], console: _Console) -> int:
 
 
 # --- the commands ---------------------------------------------------------------------------
+
+
+async def _crashtest(args: argparse.Namespace, console: _Console) -> int:
+    from .testing.crash import Cassette, Faults, crash_test
+
+    module, separator, function = args.build.partition(":")
+    if not separator or not module or not function.isidentifier():
+        raise UsageError("Provide the build function as MODULE:FUNCTION.")
+    try:
+        build = getattr(importlib.import_module(module), function)
+        faults = Faults.parse(args.faults)
+    except (ImportError, AttributeError, ValueError) as error:
+        raise UsageError(str(error)) from error
+    if not callable(build) or not args.cassette.is_file():
+        raise UsageError("Provide a callable build function and a readable offline cassette.")
+    if args.budget is not None and args.budget < 1:
+        raise UsageError("--budget must be a positive integer.")
+    report = await crash_test(
+        build,
+        args.prompt,
+        model=Cassette(args.cassette),
+        store=args.store,
+        faults=faults,
+        points=args.points,
+        budget=args.budget,
+        seed=args.seed,
+        mode=args.mode,
+        transport=args.transport,
+        strict=args.strict,
+        allow_held=args.allow_held,
+        allow_undeclared=args.allow_undeclared,
+    )
+    console.text(report.explain() + "\n")
+    try:
+        for path, serialize in ((args.json, report.to_json), (args.junit, report.to_junit)):
+            if path is not None:
+                with path.open("x", encoding="utf-8") as stream:
+                    stream.write(serialize())
+        if args.pin is not None:
+            point = next((item for item in report.points if item.verdict == "violated"), None)
+            if point is not None:
+                report.pin(point.id, args.pin)
+    except OSError as error:
+        raise UsageError(f"Could not write crash report: {error}") from error
+    if any(finding.status == "violated" for finding in report.failures):
+        return 1
+    if args.strict:
+        return 0 if report.strict_ok else 4
+    return 0 if report.ok else 3
 
 
 async def _chat(args: argparse.Namespace, console: _Console) -> int:

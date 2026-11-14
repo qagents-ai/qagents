@@ -770,3 +770,63 @@ async def test_docs_with_no_command_serves_mcp_over_stdio():
         result = await client.call_tool("get_api", {"symbol": "Agent.resume"})
         assert not result.is_error
         assert result.content[0].text.startswith("# qagents.Agent.resume (method)")
+
+
+def test_crash_cli_rejects_an_invalid_builder_and_missing_cassette(tmp_path):
+    output, error = io.StringIO(), io.StringIO()
+    argv = ["crashtest", "not-a-build", "Prompt", "--cassette", str(tmp_path / "none.json")]
+    assert main(argv, stdout=output, stderr=error) == 2
+    assert "MODULE:FUNCTION" in error.getvalue()
+
+
+def test_crash_cli_writes_reports_and_returns_strict_gap(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from qagents.testing import crash
+
+    class Report:
+        strict_ok = False
+        ok = True
+        failures = []
+        points = []
+
+        def explain(self):
+            return "A safe point with incomplete strict coverage."
+
+        def to_json(self):
+            return '{"ok":true}'
+
+        def to_junit(self):
+            return "<testsuite />"
+
+    async def simulate(build, prompt, **kwargs):
+        assert build is not None and prompt == "Prompt"
+        assert kwargs["strict"] is True
+        assert kwargs["model"].path == cassette
+        return Report()
+
+    monkeypatch.setattr(crash, "crash_test", simulate)
+    monkeypatch.setitem(sys.modules, "crash_sample", SimpleNamespace(build=lambda env: env.model))
+    cassette = tmp_path / "fixture.json"
+    cassette.write_text("{}", encoding="utf-8")
+    report, junit = tmp_path / "report.json", tmp_path / "report.xml"
+    status = main(
+        [
+            "crashtest",
+            "crash_sample:build",
+            "Prompt",
+            "--cassette",
+            str(cassette),
+            "--strict",
+            "--json",
+            str(report),
+            "--junit",
+            str(junit),
+        ],
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert status == 4
+    assert json.loads(report.read_text()) == {"ok": True}
+    assert junit.read_text() == "<testsuite />"

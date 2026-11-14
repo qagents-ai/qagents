@@ -196,7 +196,8 @@ async def crash_test(
         rerun=rerun,
         mode=mode,
         store=store,
-        reproduction=_reproduction(
+        reproduction=await asyncio.to_thread(
+            _reproduction,
             model,
             prompt,
             store,
@@ -274,18 +275,24 @@ def _reproduction(
     *,
     supported,
 ):
-    if not supported or isinstance(model, Cassette):
+    if not supported:
         return None
-    script = ScriptedModel([])
-    replies = []
-    for reply in model:
-        try:
-            response = script._as_response(reply)
-        except TypeError:
-            return None
-        replies.append(response.model_dump(mode="json"))
+    if isinstance(model, Cassette):
+        # Copy the offline recording into the pin. Replaying a pin must not
+        # depend on the original cassette's path or modification time.
+        model_source = {"cassette": json.loads(model.path.read_text(encoding="utf-8"))}
+    else:
+        script = ScriptedModel([])
+        replies = []
+        for reply in model:
+            try:
+                response = script._as_response(reply)
+            except TypeError:
+                return None
+            replies.append(response.model_dump(mode="json"))
+        model_source = {"replies": replies}
     return {
-        "replies": replies,
+        **model_source,
         "prompt": prompt,
         "store": store,
         "faults": sorted(faults.kinds),
@@ -317,12 +324,21 @@ async def assert_recovers(build: Callable[[CrashEnv], Any], path: str | os.PathL
         saved["recovery"],
         tuple(sorted(saved["variant"].items())),
     )
-    model = tuple(ModelResponse.model_validate(item) for item in config["replies"])
     faults = Faults(kinds=config["faults"], adapters=config["adapters"], stall_s=config["stall_s"])
     if config["store"] not in {"memory", "sqlite"} or config["mode"] not in {"freeze", "exception"}:
         raise ConfigurationError("Unsupported store or mode in the replay configuration.")
 
     def replay():
+        with TemporaryDirectory(prefix="qagents-crash-source-") as temp:
+            if "cassette" in config:
+                cassette = Path(temp) / "model.json"
+                cassette.write_text(json.dumps(config["cassette"]), encoding="utf-8")
+                model = Cassette(cassette)
+            else:
+                model = tuple(ModelResponse.model_validate(item) for item in config["replies"])
+            return replay_with(model)
+
+    def replay_with(model):
         options = {
             "build": build,
             "prompt": config["prompt"],
@@ -344,7 +360,7 @@ async def assert_recovers(build: Callable[[CrashEnv], Any], path: str | os.PathL
         return result, _point_checks(result, reference, user, config["max_legs"], None)
 
     result, checks = await asyncio.to_thread(replay)
-    failures = [finding.detail for check in checks for finding in check.findings]
+    failures = [finding.message for check in checks for finding in check.findings]
     failures.extend(result.inconclusive_reasons)
     if point.plans and set(result.triggered) != {plan.id for plan in point.plans}:
         failures.append("One or more pinned faults did not trigger.")
