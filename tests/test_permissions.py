@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from qagents import Agent, Approval, Permissions, RunContext, Session, tool
@@ -112,6 +114,18 @@ def test_callback_may_ask_for_any_call_no_deny_rule_refuses_first():
     callback = Permissions(can_use_tool=lambda *args: "allow", deny=["send_*"])
     assert [callback._callback_may_ask(item) for item in make_tools([])] == [True, True, False]
     assert not Permissions(mode="ask_all")._callback_may_ask(refund_order)  # no callback
+
+
+def test_approval_secret_doc_says_a_lookup_still_resolves_and_when_the_agent_warns():
+    """The API reference renders this text. A declared lookup (in the run or through
+    agent.recheck) still resolves an effect in doubt without the secret, and a toolkit's
+    tools are warned about at run start, not at build (AF-5 review)."""
+    doc = inspect.getdoc(Permissions.__init__)
+    text = " ".join(doc.split("approval_secret:", 1)[1].split("approval_ttl_s:", 1)[0].split())
+    assert "until a declared lookup finds it" in text and "agent.recheck" in text
+    assert "or an operator settles it" in text
+    assert "or at run start for a toolkit's tools" in text
+    assert "can_use_tool" in text  # it may ask, so its tools are named too
 
 
 async def test_denied_calls_are_reported_to_the_model():
