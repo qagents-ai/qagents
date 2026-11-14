@@ -358,7 +358,10 @@ APPROVAL_MAC_FIELDS = (
 def settlement_mac_fields(session_id: str, kind: str, data: dict[str, Any]) -> dict[str, Any]:
     """What an operator answer's MAC signs (SPEC 5.3): the session id, the entry kind
     (``effect_settled``, or ``effect_committed`` for ``via=operator``) and every journaled
-    data field except ``mac``. The operator signs these fields; the engine verifies them."""
+    data field except ``mac``. The operator signs these fields. With approval_secret, a
+    pending ``resend`` is verified against them before a run sends and before the operator
+    path accepts another resend; the other answers authorize no send and are not checked
+    when they are used."""
     return {
         "session_id": session_id,
         "kind": kind,
