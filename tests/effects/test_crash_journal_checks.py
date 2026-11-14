@@ -11,7 +11,7 @@ from qagents.testing.crash._journal_checks import (
     check_terminal,
 )
 
-from ._samples import committed, intent
+from ._samples import claimed, committed, intent
 
 
 @pytest.fixture
@@ -35,6 +35,20 @@ def test_receipt_identity_must_match_earlier_intent(journal):
     assert check_receipts(journal).findings[0].code == "receipt_identity_mismatch"
     journal[1].data["intent_seq"] = 999
     assert check_receipts(journal).findings[0].code == "commit_without_intent"
+
+
+def test_lookup_commit_after_a_claim_transfer_binds_to_the_transfer():
+    transfer = Entry(id="taken", seq=1, kind="effect_claimed", data=claimed())
+    found = Entry(
+        id="found",
+        seq=2,
+        kind="effect_committed",
+        data=committed(attempt=None, intent_seq=None, via="lookup", found_tag="op1_refund"),
+    )
+    assert check_receipts([transfer, found]).status == "safe"
+    assert check_receipts([found]).findings[0].code == "commit_without_intent"
+    found.data["found_tag"] = "op1_another"
+    assert check_receipts([transfer, found]).findings[0].code == "lookup_binding_mismatch"
 
 
 def test_late_replay_cannot_write_another_patch(journal):

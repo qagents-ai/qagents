@@ -170,6 +170,7 @@ def check_receipts(entries: Sequence[Entry]) -> Check:
     """I11: receipts bind to the intent and lookup evidence they cite."""
     intents = {}
     first_by_record = {}
+    transfers = {}
     findings = []
     for entry in entries:
         data = entry.data
@@ -177,6 +178,10 @@ def check_receipts(entries: Sequence[Entry]) -> Check:
         if entry.kind == "effect_intent":
             intents[entry.seq] = entry
             first_by_record.setdefault(record, entry)
+            continue
+        if entry.kind == "effect_claimed":
+            # A claim transfer carries the request, tag and identity fields a find binds to.
+            transfers.setdefault(record, entry)
             continue
         if entry.kind != "effect_committed":
             continue
@@ -200,6 +205,8 @@ def check_receipts(entries: Sequence[Entry]) -> Check:
         target = (
             first_by_record.get(record)
             if via == "operator"
+            else transfers.get(record)
+            if via == "lookup" and data.get("intent_seq") is None and data.get("attempt") is None
             else intents.get(data.get("intent_seq"))
         )
         if (
