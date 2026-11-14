@@ -1,9 +1,10 @@
 """Public crash exploration over a real Agent and destination observations."""
 
 from qagents import Agent, RunContext, tool
-from qagents.effects import Attempt, Dedupe, EffectContext, Key, effect
+from qagents.effects import Attempt, Dedupe, EffectContext, Key, Settle, effect
 from qagents.models.recording import RecordingModel
 from qagents.models.testing import ScriptedModel, call
+from qagents.session import Entry
 from qagents.testing.crash import Cassette, FakeStripeRefunds, Faults, assert_recovers, crash_test
 
 from .test_engine_dispatch import Receipt, Request
@@ -172,6 +173,14 @@ async def test_swallowed_pause_remains_held_and_appears_in_harness_report(tmp_pa
     )
     (point,) = report.points[1:]
     assert point.execution.held
+    assert point.outcome == "paused_awaiting_operator"
+    assert point.execution.final_snapshot is not None
+    entries = [
+        Entry.model_validate_json(raw) for raw in point.execution.final_snapshot.entries_json
+    ]
+    assert not any(
+        entry.kind == "tool_result" and not entry.data["result"]["is_error"] for entry in entries
+    )
     assert any(item.code == "swallowed_hold" for item in report.failures), report.explain()
 
 
@@ -216,3 +225,42 @@ async def test_client_transport_runs_send_body_and_preserves_destination_key(tmp
         for point in report.points
         for application in point.execution.applications
     )
+
+
+async def test_held_effect_refuses_a_competing_run_resume_and_settlement(tmp_path):
+    def opaque(env):
+        @effect("refund", key=Key("request", "id"))
+        async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+            raise AssertionError("The fixture transport owns the destination.")
+
+        @tool(effects=[send])
+        async def refund(ctx: RunContext, id: str) -> str:
+            """Refund the fixture order."""
+            return (await ctx.perform(send, Request(id=id))).id
+
+        return Agent(env.model, tools=[refund])
+
+    def settle(item):
+        return Settle.committed(item, receipt=Receipt(id="R1"), by="qa", evidence="ledger")
+
+    report = await crash_test(
+        opaque,
+        "Refund",
+        directory=tmp_path,
+        store="sqlite",
+        model=[call("refund", id="R1"), "Complete."],
+        answer=settle,
+        points="effects",
+        faults=Faults.parse(
+            "commit_then_lose_response,new_run_on_held,double_resume,operator_race"
+        ),
+        transport="fake",
+    )
+    for kind in ("new_run_on_held", "double_resume", "operator_race"):
+        matching = [p for p in report.points if kind in p.execution.point.kinds]
+        assert len(matching) == 1, report.explain()
+        (point,) = matching
+        assert len(point.execution.triggered) == 2, report.explain(point.id)
+        assert point.verdict == "safe", report.explain(point.id)
+        assert point.outcome == "completed_as_reference", report.explain(point.id)
+        assert len(point.execution.applications) == 1

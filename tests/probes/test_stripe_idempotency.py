@@ -2,16 +2,18 @@
 
 No test implies that offline evidence validates Stripe. Live requests are disabled
 unless QAGENTS_RUN_STRIPE_PROBES=1 and STRIPE_TEST_SECRET_KEY starts with sk_test_.
-All remote operations create sandbox objects. Execution-time 500 replay and full
-24-hour retention cannot be asserted from an ordinary short successful refund test;
-the live artifact preserves those as unobserved, never passed.
-Sources: https://docs.stripe.com/api/idempotent_requests and /api/refunds/create.
+All remote operations create sandbox objects. Retention measures a configurable
+interval strictly inside the documented 24-hour window. Execution-time 500 replay
+remains unobserved unless the sandbox returns and replays a real HTTP 500.
+Sources: https://docs.stripe.com/api/idempotent_requests,
+https://docs.stripe.com/api/refunds/create, and https://docs.stripe.com/error-low-level.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
 import uuid
@@ -183,11 +185,39 @@ def test_probe_gate_refuses_non_test_credentials(monkeypatch):
         _live_key()
 
 
+def _observe_replay(first, second, *, status, code=None):
+    if first[0] != status:
+        return None
+    if code is not None and first[1].get("error", {}).get("code") != code:
+        return None
+    return "passed" if first[:2] == second[:2] and second[2] else "failed"
+
+
+@pytest.mark.parametrize("status,code", [(400, "charge_already_refunded"), (500, None)])
+def test_identical_errors_require_stripe_replay_confirmation(status, code):
+    body = {"error": {"code": code}}
+    assert (
+        _observe_replay((status, body, False), (status, body, True), status=status, code=code)
+        == "passed"
+    )
+    assert (
+        _observe_replay((status, body, False), (status, body, False), status=status, code=code)
+        == "failed"
+    )
+    assert _observe_replay((429, body, False), (429, body, True), status=status, code=code) is None
+
+
 @pytest.mark.network
 def test_live_stripe_api_v1_observations(tmp_path):
-    """Write observed evidence; missing error/retention evidence remains explicit."""
+    """Write replay evidence, including the length of the observed retention window."""
     key = _live_key()
     directory = Path(os.environ.get("QAGENTS_STRIPE_PROBE_DIR", str(tmp_path)))
+    try:
+        retention_minutes = float(os.environ.get("QAGENTS_STRIPE_RETENTION_MINUTES", "1"))
+    except ValueError:
+        retention_minutes = math.nan
+    if not 1 <= retention_minutes <= 1439:
+        pytest.fail("Stripe retention delay must be 1 to 1439 minutes", pytrace=False)
 
     async def run():
         nonce = uuid.uuid4().hex
@@ -195,12 +225,11 @@ def test_live_stripe_api_v1_observations(tmp_path):
             "schema": 1,
             "scope": "stripe_sandbox",
             "api_version": "2026-10-28.endive",
-            "contract": "Stripe API v1 idempotency, docs checked 2026-11-13",
+            "contract": "Stripe API v1 idempotency, docs checked 2026-11-14",
             "claims": {},
-            "unobserved": ["replay_errors", "replay_rejections", "retention_window"],
-            "all_required_claims_observed": False,
         }
-        # No credential/headers/request repr is ever written into an artifact.
+        claims = evidence["claims"]
+        # No credential, header dictionary, or response body is saved to an artifact.
         async with httpx.AsyncClient(
             base_url="https://api.stripe.com/v1",
             auth=(key, ""),
@@ -212,61 +241,107 @@ def test_live_stripe_api_v1_observations(tmp_path):
 
             async def post(endpoint, data, identity):
                 response = await client.post(
-                    endpoint, data=data, headers={"Idempotency-Key": identity}
+                    endpoint, data=data, headers={"Idempotency-Key": nonce + identity}
                 )
                 try:
                     body = response.json()
                 except ValueError:
                     pytest.fail("Stripe returned a non-JSON response", pytrace=False)
-                return response.status_code, body
+                replayed = response.headers.get("Idempotent-Replayed", "").lower() == "true"
+                return response.status_code, body, replayed
 
-            status, charge = await post(
-                "/charges",
-                {"amount": "10000", "currency": "eur", "source": "tok_visa"},
-                nonce + "charge",
-            )
-            if status != 200 or charge.get("livemode") is not False:
-                pytest.fail(f"Sandbox charge setup failed with HTTP {status}", pytrace=False)
+            async def new_charge(identity):
+                status, charge, _ = await post(
+                    "/charges",
+                    {"amount": "10000", "currency": "eur", "source": "tok_visa"},
+                    identity,
+                )
+                if status != 200 or charge.get("livemode") is not False:
+                    pytest.fail(f"Sandbox charge setup returned HTTP {status}", pytrace=False)
+                return charge
+
+            charge = await new_charge("charge")
             request = {"charge": charge["id"], "amount": "10"}
+            refund_key = "refund"
+            first = await post("/refunds", request, refund_key)
             started = time.monotonic()
-            status, first = await post("/refunds", request, nonce + "refund")
-            second_status, second = await post("/refunds", request, nonce + "refund")
-            evidence["claims"]["same_key_response_replay"] = (
-                "passed" if status == second_status == 200 and first == second else "failed"
+            second = await post("/refunds", request, refund_key)
+            error_replay = _observe_replay(first, second, status=500)
+            if error_replay is not None:
+                claims["replay_errors"] = error_replay
+                charge = await new_charge("independent-charge")
+                request = {"charge": charge["id"], "amount": "10"}
+                refund_key = "independent-refund"
+                first = await post("/refunds", request, refund_key)
+                started = time.monotonic()
+                second = await post("/refunds", request, refund_key)
+            claims["same_key_response_replay"] = (
+                _observe_replay(first, second, status=200) or "failed"
             )
-            evidence["retention_observed_minutes"] = (time.monotonic() - started) / 60
-            status, _ = await post("/refunds", {**request, "amount": "11"}, nonce + "refund")
-            evidence["claims"]["binds_params"] = "passed" if status == 400 else "failed"
-            invalid_status, _ = await post(
-                "/refunds", {**request, "amount": "-1"}, nonce + "validation"
+
+            status, body, _ = await post("/refunds", {**request, "amount": "11"}, refund_key)
+            claims["binds_params"] = (
+                "passed"
+                if status == 400 and body.get("error", {}).get("type") == "idempotency_error"
+                else "failed"
             )
-            valid_status, _ = await post("/refunds", request, nonce + "validation")
-            evidence["claims"]["validation_not_cached"] = (
+            invalid_status, _, _ = await post("/refunds", {**request, "amount": "-1"}, "validation")
+            valid_status, _, _ = await post("/refunds", request, "validation")
+            claims["validation_not_cached"] = (
                 "passed" if invalid_status == 400 and valid_status == 200 else "failed"
             )
-            long_status, _ = await post("/refunds", request, nonce + "k" * (255 - len(nonce)))
-            too_long_status, _ = await post("/refunds", request, nonce + "k" * (256 - len(nonce)))
-            evidence["claims"]["key_length_255"] = (
+            long_status, _, _ = await post("/refunds", request, "k" * (255 - len(nonce)))
+            too_long_status, _, _ = await post("/refunds", request, "k" * (256 - len(nonce)))
+            claims["key_length_255"] = (
                 "passed" if long_status == 200 and too_long_status == 400 else "failed"
             )
             replies = await asyncio.gather(
-                *(post("/refunds", request, nonce + "concurrent") for _ in range(8))
+                *(post("/refunds", request, "concurrent") for _ in range(8))
             )
-            conflicts = [body for status, body in replies if status == 409]
-            successes = [body for status, body in replies if status == 200]
+            conflicts = [
+                body
+                for status, body, _ in replies
+                if status == 409 and body.get("error", {}).get("code") == "idempotency_key_in_use"
+            ]
+            successes = [body for status, body, _ in replies if status == 200]
             if conflicts and successes:
-                final_status, final = await post("/refunds", request, nonce + "concurrent")
-                evidence["claims"]["concurrent_rejection"] = (
+                final = await post("/refunds", request, "concurrent")
+                claims["concurrent_rejection"] = (
                     "passed"
-                    if final_status == 200 and final["id"] == successes[0]["id"]
+                    if final[0] == 200
+                    and final[2]
+                    and all(body["id"] == final[1]["id"] for body in successes)
                     else "failed"
                 )
-            else:
-                evidence["unobserved"].append("concurrent_rejection")
+
+            if claims["same_key_response_replay"] == "passed":
+                await asyncio.sleep(max(0, retention_minutes * 60 - (time.monotonic() - started)))
+                elapsed = time.monotonic() - started
+                evidence["retention_observed_minutes"] = elapsed / 60
+                if elapsed < 23 * 3600 + 59 * 60 + 30:
+                    delayed = await post("/refunds", request, refund_key)
+                    claims["retention_window"] = (
+                        _observe_replay(first, delayed, status=200) or "failed"
+                    )
+
+            # Exhaust the charge to exercise a refusal inside the actual refund operation.
+            status, _, _ = await post("/refunds", {"charge": charge["id"]}, "refund-remainder")
+            if status == 200:
+                rejected = await post("/refunds", request, "rejection")
+                replay = await post("/refunds", request, "rejection")
+                observed = _observe_replay(
+                    rejected, replay, status=400, code="charge_already_refunded"
+                )
+                if observed is not None:
+                    claims["replay_rejections"] = observed
+
+        evidence["unobserved"] = sorted(_REQUIRED - claims.keys())
         path, _ = _write_evidence(directory, evidence)
-        assert "failed" not in evidence["claims"].values(), f"Probe failed; evidence: {path}"
-        pytest.skip(
-            f"Partial sandbox observations saved at {path}; unobserved claims cannot pass the release gate"
-        )
+        assert "failed" not in claims.values(), f"Probe failed; evidence: {path}"
+        if evidence["unobserved"]:
+            pytest.skip(
+                f"Partial sandbox observations at {path}; missing "
+                + ", ".join(evidence["unobserved"])
+            )
 
     asyncio.run(run())

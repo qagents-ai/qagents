@@ -16,7 +16,16 @@ from qagents.session import Entry
 from ._faults import FaultPlan, Faults
 from ._world import Boundary
 
-_CRASHES = frozenset({"kill_before", "kill_after", "recovery_kill", "commit_then_crash"})
+_CRASHES = frozenset(
+    {
+        "kill_before",
+        "kill_after",
+        "recovery_kill",
+        "commit_then_crash",
+        "approval_redelivered",
+        "stale_answer",
+    }
+)
 _ZOMBIES = frozenset({"freeze_after_intent", "freeze_before_fence2", "freeze_in_send"})
 _MODEL = frozenset({"fresh_ids", "retry_effect", "retry_changed", "permuted", "abandon"})
 _EFFECT = frozenset(
@@ -274,6 +283,9 @@ def reference_points(
                 point = _plan_point(b, kind, phase=phase, inside=window)
                 lookup[b.leg, b.index] = point
                 made.append(point)
+        if any(kind == "approval_decided" for kind, *_ in parts):
+            for kind in sorted(faults.kinds & {"approval_redelivered", "stale_answer"}):
+                made.append(_plan_point(b, kind, phase="after", inside=True))
         for kind in sorted(faults.kinds & {"ack_lost_committed", "ack_lost_uncommitted"}):
             made.append(_plan_point(b, kind, inside=window))
         if any(kind == "effect_intent" or kind in _OUTCOME for kind, *_ in parts):

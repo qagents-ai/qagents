@@ -93,6 +93,16 @@ def _point_checks(raw, reference, user, max_legs, expect):
     for encoded in raw.diagnostics_json:
         diagnostic = json.loads(encoded)
         kind = diagnostic.get("kind")
+        if kind == "stale_approval_accepted":
+            values.append(
+                Check(
+                    "I5",
+                    "violated",
+                    (Finding("I5", kind, "A conflicting approval answer was accepted."),),
+                )
+            )
+        if kind == "unsafe_held_delivery":
+            values.append(Check("I12", "violated", (Finding("I12", kind, diagnostic["detail"]),)))
         if kind in {"a2_violation", "post_seal_mutation", "shared_between_legs", "swallowed_hold"}:
             values.append(
                 Check(

@@ -143,6 +143,8 @@ class FaultPlan:
             "kill_before": "before",
             "kill_after": "after",
             "freeze_after_intent": "after",
+            "approval_redelivered": "after",
+            "stale_answer": "after",
         }.get(self.kind)
         if required_phase is not None and self.phase != required_phase:
             raise ValueError(f"{self.kind} must target its {required_phase} boundary")
@@ -213,7 +215,13 @@ class FaultController:
                 self.hit(plan)
                 self.world.freeze(point.leg, zombie=True)
         for plan in self._matches(point):
-            if plan.kind in {"kill_before", "kill_after", "recovery_kill"}:
+            if plan.kind in {
+                "kill_before",
+                "kill_after",
+                "recovery_kill",
+                "approval_redelivered",
+                "stale_answer",
+            }:
                 self.hit(plan)
                 self.world.freeze(point.leg)
             elif plan.kind == "freeze_after_intent" and "effect_intent" in point.detail:

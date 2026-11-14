@@ -48,3 +48,46 @@ coverage or provider evidence is incomplete. A strict run requires
 exercise through the client transport and evidence for destination
 assumptions. The in-process harness uses a virtual clock. The Gym
 benchmark measures real worker termination on the local machine.
+
+## Test the recovery boundaries
+
+Run the Effects process tests from the development checkout. The test
+controller kills its own worker just before or after an SQLite journal
+write, or after a destination application and before the worker receives
+a response. Every recovery starts a new interpreter and checks the
+journal prefix and the destination ledger. The in-process explorer
+also tests a conflicting approval delivery and competing attempts to
+run, resume, or settle while an effect is held.
+
+```powershell
+$env:QAGENTS_RUN_PROCESS_TESTS = "1"
+python -m pytest -q -m process tests/process
+$env:QAGENTS_RUN_MUTATIONS = "1"
+python -m pytest -q -m mutants tests/effects/mutants
+```
+
+Each of the 47 mutations runs in an isolated interpreter with an
+unmodified baseline. The test requires an exercised fault and an
+assertion that detects it. The suite covers runtime, store and report
+checks, including whether a reference run applied an effect.
+
+## Run the Stripe sandbox probes
+
+Load `STRIPE_TEST_SECRET_KEY` from your sandbox's secret store and run
+the probe from the development checkout.
+
+```powershell
+$env:QAGENTS_RUN_STRIPE_PROBES = "1"
+$env:QAGENTS_STRIPE_PROBE_DIR = "work/stripe-probes"
+python -m pytest -q -rs tests/probes/test_stripe_idempotency.py
+```
+
+The probe writes an evidence file and a mapping for
+`crash_test(probes=...)`. The evidence file records the observed
+retention interval in minutes. Set `QAGENTS_STRIPE_RETENTION_MINUTES`
+to test a longer interval up to 1439 minutes. A partial run leaves the
+provider assurance pending. For cached server errors, the probe requires
+an actual HTTP 500 and a matching replay from Stripe.
+
+See [Stripe API v1 idempotency](https://docs.stripe.com/api/idempotent_requests)
+and [Stripe replay headers](https://docs.stripe.com/error-low-level#sending-idempotency-keys).

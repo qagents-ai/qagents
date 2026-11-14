@@ -5,6 +5,7 @@ import pytest
 from qagents import (
     Agent,
     AgentRuntime,
+    Hooks,
     InMemoryStore,
     Limits,
     RunContext,
@@ -284,3 +285,105 @@ async def test_a_redelivered_approval_cannot_replace_a_durable_answer():
     entries = await session.entries()
     assert sum(item.kind == "approval_decided" for item in entries) == 1
     assert len(destination) == 1
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+async def test_hook_edit_requires_a_new_policy_decision(opt_in):
+    class StopBeforeStart(InMemoryStore):
+        stopped = False
+
+        async def append_leased(self, session_id, entries, owner):
+            if not self.stopped and any(item.kind == "tool_started" for item in entries):
+                self.stopped = True
+                raise SessionError("worker stopped before the edited call ran")
+            return await super().append_leased(session_id, entries, owner)
+
+    seen = []
+    checks = []
+
+    class Edit(Hooks):
+        may_change_approved_arguments = opt_in
+
+        async def before_tool(self, ctx, call):
+            return call.model_copy(update={"arguments": {"id": "EDIT"}})
+
+    def policy(ctx, tool, call):
+        checks.append(call.arguments["id"])
+        if call.arguments["id"] == "EDIT":
+            return True
+        return None
+
+    @effect("refund", key=Key("request", "id"))
+    async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+        seen.append(attempt.request.id)
+        return Receipt(id=attempt.request.id)
+
+    @tool(effects=[send], requires_approval=True)
+    async def refund(ctx: RunContext, id: str) -> str:
+        """Refund the reviewed item."""
+        return (await ctx.perform(send, Request(id=id))).id
+
+    agent = Agent(
+        FunctionModel(
+            lambda request: (
+                "Done" if request.messages[-1].role == "tool" else call("refund", id="R1")
+            )
+        ),
+        tools=[refund],
+        hooks=[Edit()],
+        permissions=Permissions(approval_secret="fixture-approval-key", can_use_tool=policy),
+    )
+    session = Session(StopBeforeStart() if opt_in else InMemoryStore())
+    result = await agent.run("Refund", session=session)
+    (pending,) = result.pending_approvals
+    answers = {pending.tool_call_id: Approval.for_call(pending)}
+    if opt_in:
+        with pytest.raises(SessionError, match="worker stopped"):
+            await agent.resume(session, approvals=answers)
+        with pytest.raises(ApprovalConflictError):
+            await agent.resume(
+                session,
+                approvals={pending.tool_call_id: Approval.for_call(pending, approved=False)},
+            )
+    await agent.resume(session, approvals=answers)
+    assert seen == (["EDIT"] if opt_in else [])
+    assert ("EDIT" in checks) is opt_in
+    changes = [
+        entry
+        for entry in await session.entries()
+        if entry.kind == "approval_decided" and entry.data.get("arguments_changed_by")
+    ]
+    assert len(changes) == int(opt_in)
+    if changes:
+        assert changes[0].data["arguments"] == {"id": "EDIT"}
+
+
+async def test_timed_out_effect_tool_cannot_close_an_unresolved_intent(caplog):
+    from qagents.tools import ToolTimeout
+
+    @effect("refund", key=Key("request", "id"))
+    async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+        raise ConnectionError("the destination may have applied it")
+
+    @tool(effects=[send])
+    async def refund(ctx: RunContext, id: str) -> str:
+        """Simulate a framework timeout after the effect is held."""
+        try:
+            await ctx.perform(send, Request(id=id))
+        except Exception as error:
+            raise ToolTimeout(60, started=True, running=False) from error
+        return "unexpected"
+
+    agent = Agent(
+        FunctionModel(
+            lambda request: (
+                "Done" if request.messages[-1].role == "tool" else call("refund", id="R1")
+            )
+        ),
+        tools=[refund],
+    )
+    session = Session()
+    result = await agent.run("Refund", session=session)
+    assert result.held_effects and result.status == "paused"
+    assert not any(entry.kind == "tool_result" for entry in await session.entries())
+    assert "returned while an effect remained held" not in caplog.text

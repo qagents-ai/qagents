@@ -19,7 +19,15 @@ from qagents.effects import Effect, HeldEffect, Settle, _engine, _ports
 from qagents.effects._canonical import jcs
 from qagents.effects._declare import ReachPoint
 from qagents.effects._kinds import APPROVAL_MAC_FIELDS
-from qagents.errors import ConfigurationError, HeldEffectsError, JournalOutcomeUnknown, LeaseError
+from qagents.errors import (
+    ApprovalConflictError,
+    ConfigurationError,
+    HeldEffectsError,
+    JournalOutcomeUnknown,
+    LeaseError,
+    SessionError,
+    SettlementConflict,
+)
 from qagents.models.base import ModelResponse
 from qagents.models.testing import ScriptedModel
 from qagents.permissions import Approval
@@ -155,6 +163,9 @@ async def crash_test(
                     deeper[recovered.id] = recovered
             for variant in _model_points(point, result, chosen):
                 deeper[variant.id] = variant
+            if scenario is None:
+                for variant in _held_delivery_points(point, result, chosen, answer):
+                    deeper[variant.id] = variant
             if "advance_boundaries" in chosen.kinds and result.crash_snapshots:
                 for boundary in boundary_points(point, _recorded_boundaries(result), leg=1):
                     deeper[boundary.id] = boundary
@@ -259,6 +270,72 @@ def _model_points(prefix, result, faults):
             recovery=True,
             variant=prefix.variant,
         )
+
+
+def _held_delivery_points(prefix, result, faults, answer):
+    """Exercise a competing caller only after a scenario actually hit a hold."""
+    if not result.triggered:
+        return
+    kinds = {"new_run_on_held", "double_resume"}
+    if answer is not None:
+        kinds.add("operator_race")
+    held_leg = next(
+        (event.leg for event in result.boundaries if event.kind == "held_delivery"), None
+    )
+    if held_leg is None:
+        return
+    for kind in sorted(faults.kinds & kinds):
+        identity = f"{prefix.id}+leg{held_leg}:{kind}"
+        yield Point(
+            identity,
+            (*prefix.plans, FaultPlan(identity, kind, 1, held_leg)),
+            in_effect_window=True,
+            recovery=True,
+            variant=prefix.variant,
+        )
+
+
+async def _deliver_while_held(agent, session, deps, answer, held, plan, controller):
+    """Try a competing action, then return control to the normal recovery legs."""
+    world = controller.world
+
+    def unexpected(detail):
+        world.findings.append({"kind": "unsafe_held_delivery", "detail": detail, "leg": plan.leg})
+
+    if plan.kind == "new_run_on_held":
+        controller.hit(plan)
+        try:
+            await agent.run("Competing run during recovery", session=session, deps=deps)
+        except HeldEffectsError:
+            return
+        unexpected("A newly submitted run took over a held call.")
+        return
+
+    owner = f"harness-recovery-owner-{plan.leg}"
+    acquired = await session.store.acquire_lease(session.id, owner, agent.lease_ttl_s)
+    if not acquired:
+        raise LeaseError("The harness could not obtain the competing recovery lease.")
+    try:
+        if plan.kind == "double_resume":
+            controller.hit(plan)
+            try:
+                await agent.resume(session, deps=deps)
+            except SessionError as error:
+                if "in progress elsewhere" in str(error):
+                    return
+                raise
+            unexpected("A competing resume ran while another worker held the lease.")
+        elif (decision := answer(held[0])) is not None:
+            controller.hit(plan)
+            try:
+                await agent.settle(session, decision, deps=deps)
+            except SettlementConflict as error:
+                if error.reason == "session_busy":
+                    return
+                raise
+            unexpected("An operator settlement ran while another worker held the lease.")
+    finally:
+        await session.store.release_lease(session.id, owner)
 
 
 def _reproduction(
@@ -461,6 +538,7 @@ def _execute_loop(
     approval_keys = {}
     usage_limits = {}
     perturbation = next((p for p in point.plans if p.kind in PERTURBATIONS), None)
+    stale = next((p for p in point.plans if p.kind == "stale_answer"), None)
 
     async def run():
         nonlocal output, held
@@ -514,6 +592,7 @@ def _execute_loop(
                 model=model,
                 needs_recheck=needs_recheck,
                 answers=answers,
+                previous_holds=held,
             ):
                 token = _ports.TRANSPORT.set(destination.for_leg(number))
                 observer = _ports.REACH_OBSERVER.set(reached.append)
@@ -549,6 +628,21 @@ def _execute_loop(
                         if not tool.read_only and not tool.effects
                     )
                     if needs_recheck:
+                        world.observe(number, "held_delivery")
+                        delivery = next(
+                            (
+                                plan
+                                for plan in point.plans
+                                if plan.leg == number
+                                and plan.kind
+                                in {"new_run_on_held", "double_resume", "operator_race"}
+                            ),
+                            None,
+                        )
+                        if delivery is not None:
+                            await _deliver_while_held(
+                                agent, session, deps, answer, previous_holds, delivery, controller
+                            )
                         pending = await agent.recheck(session, deps=deps)
                         if pending and answer is not None:
                             for item in pending:
@@ -565,6 +659,25 @@ def _execute_loop(
                     if scenario is not None:
                         return await scenario(env, agent, deps)
                     if (await session.state()).open_run_id is not None:
+                        if (
+                            stale is not None
+                            and number == stale.leg + 1
+                            and stale.id in controller.triggered
+                            and answers
+                        ):
+                            changed = {
+                                key: value.model_copy(update={"approved": not value.approved})
+                                for key, value in answers.items()
+                            }
+                            try:
+                                result = await agent.resume(session, deps=deps, approvals=changed)
+                            except ApprovalConflictError:
+                                pass
+                            else:
+                                world.findings.append(
+                                    {"kind": "stale_approval_accepted", "leg": number}
+                                )
+                                return result
                         return await agent.resume(session, deps=deps, approvals=answers)
                     return await agent.run(prompt, session=session, deps=deps, state=state)
                 finally:

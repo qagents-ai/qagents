@@ -30,7 +30,11 @@ async def test_ids_precede_lease_and_partial_overlap_is_atomic(store):
     assert await db.append_leased("s", batch, "old") == [1, 2]
     await db.release_lease("s", "old")
     assert await db.acquire_lease("s", "new", 10)
-    assert await db.append_leased("s", batch, "old") == [1, 2]
+    try:
+        seqs = await db.append_leased("s", batch, "old")
+    except LeaseError as error:
+        raise AssertionError("A recorded batch must replay after lease turnover") from error
+    assert seqs == [1, 2]
     with pytest.raises(EntryConflict):
         await db.append_leased("s", [batch[0], Entry(kind="custom")], "old")
     with pytest.raises(LeaseError):

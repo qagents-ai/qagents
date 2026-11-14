@@ -1692,7 +1692,7 @@ class _Run:
         )
         # An approval answers an open call of the paused turn and nothing else.
         self.approvals = {key: value for key, value in self.approvals.items() if key in open_calls}
-        self._check_redelivered_approvals(state)
+        await self._check_redelivered_approvals(state)
         self._check_tokens(state)
         self._journal_open = True
         if self._effects:
@@ -1922,7 +1922,7 @@ class _Run:
             f"{self.session.id!r}. Calls waiting for one: {sorted(accepted) or 'none'}.{hint}"
         )
 
-    def _check_redelivered_approvals(self, state: SessionState) -> None:
+    async def _check_redelivered_approvals(self, state: SessionState) -> None:
         """Compare answers for an already decided ask before running any tool."""
         if not self._effects or not self.approvals:
             return
@@ -1943,24 +1943,49 @@ class _Run:
                 and self.permissions.verify(approval.token, **fields)
             ):
                 continue
+            if prior.arguments_changed_by is not None:
+                # A hook may have recorded a second decision after the human answered.
+                # Redelivery still refers to the human's signed ask.
+                entries = await self.session.entries()
+                for entry in reversed(entries):
+                    if (
+                        entry.kind != "approval_decided"
+                        or entry.data.get("operation_id") != prior.operation_id
+                        or entry.data.get("arguments_changed_by") is not None
+                    ):
+                        continue
+                    candidate = _kinds.ApprovalRecord.model_validate(entry.data)
+                    fields["ask"] = candidate.ask
+                    if self.permissions.signs_pauses and not self.permissions.verify(
+                        approval.token, **fields
+                    ):
+                        continue
+                    prior = candidate
+                    break
             fields["ask"] = prior.ask
             if self.permissions.signs_pauses and not self.permissions.verify(
                 approval.token, **fields
             ):
                 # _check_tokens supplies the standard mismatch details.
                 continue
-            args = approval.arguments if approval.arguments is not None else call.arguments
-            if (
-                approval.approved != prior.approved
-                or approval.reason != prior.reason
-                or approval.by != prior.by
-                or arguments_digest(args) != prior.arguments_digest
-            ):
-                raise ApprovalConflictError(
-                    f"Tool call {call_id!r} already has a different approval answer.",
-                    tool_call_id=call_id,
-                )
+            self._merge_answer(call, prior, approval)
             del self.approvals[call_id]
+
+    def _merge_answer(
+        self, call: ToolCallPart, existing: _kinds.ApprovalRecord, new: Approval
+    ) -> _kinds.ApprovalRecord:
+        args = new.arguments if new.arguments is not None else call.arguments
+        if (
+            new.approved != existing.approved
+            or new.reason != existing.reason
+            or new.by != existing.by
+            or arguments_digest(args) != existing.arguments_digest
+        ):
+            raise ApprovalConflictError(
+                f"Tool call {call.id!r} already has a different approval answer.",
+                tool_call_id=call.id,
+            )
+        return existing
 
     def _check_tokens(self, state: SessionState) -> None:
         """With signed pauses, refuse answers that do not carry their pause's token.
@@ -2510,7 +2535,7 @@ class _Run:
                 elif (invalid := _invalid_arguments(tool, call)) is not None:
                     refusal = invalid  # before anyone is asked to approve the call
                 else:
-                    if tool.effects and self._has_intent(call.id):
+                    if tool.effects and not self._needs_decision(call):
                         held = self._held_calls.get(call.id)
                         if held is not None and _engine.send_running(
                             self._writer.store, self.session.id, held.id
@@ -2636,22 +2661,15 @@ class _Run:
                 if tool.effects:
                     self._authorizations[call.id] = _ports.Authorization("allow")
                 return "run", call
-            if tool.effects and (prior := self._approval_record(call.id)) is not None:
-                if not prior.approved and self.permissions.verify_decision(prior):
+            prior = await self._reusable_decision(call, tool) if tool.effects else None
+            if prior is not None:
+                if not prior.approved:
                     return "deny", prior.reason or prompts.APPROVAL_DECLINED
                 args = prior.arguments if prior.arguments_changed else call.arguments
-                if (
-                    prior.approved
-                    and args is not None
-                    and self.permissions.verify_decision(prior)
-                    and prior.tool_spec_digest == tool_spec_digest(tool)
-                    and prior.arguments_digest == arguments_digest(args)
-                    and await self._writer.store_now() < prior.expires_at
-                ):
-                    reused = call.model_copy(update={"arguments": args, "raw_arguments": None})
-                    if (await self.permissions.decide(ctx, tool, reused)).behavior != "deny":
-                        self._authorizations[call.id] = self._approval_auth(prior)
-                        return "run", reused
+                reused = call.model_copy(update={"arguments": args, "raw_arguments": None})
+                if (await self.permissions.decide(ctx, tool, reused)).behavior != "deny":
+                    self._authorizations[call.id] = self._approval_auth(prior)
+                    return "run", reused
             if self.permissions.on_ask is None:
                 if not can_pause:
                     return "deny", prompts.TOOL_SERVER_NO_APPROVER
@@ -2881,6 +2899,28 @@ class _Run:
             self._operation_id(call_id) in self._writer.view().operations_with_intent
         )
 
+    def _needs_decision(self, call: ToolCallPart) -> bool:
+        """An existing intent has already consumed this call's decision."""
+        return not self._has_intent(call.id)
+
+    async def _reusable_decision(
+        self, call: ToolCallPart, tool: Tool
+    ) -> _kinds.ApprovalRecord | None:
+        prior = self._approval_record(call.id)
+        if prior is None or not self.permissions.verify_decision(prior):
+            return None
+        if not prior.approved:
+            return prior
+        args = prior.arguments if prior.arguments_changed else call.arguments
+        if (
+            args is not None
+            and prior.tool_spec_digest == tool_spec_digest(tool)
+            and prior.arguments_digest == arguments_digest(args)
+            and await self._writer.store_now() < prior.expires_at
+        ):
+            return prior
+        return None
+
     def _approval_record(self, call_id: str) -> _kinds.ApprovalRecord | None:
         data = self._replay_state.decisions.get(self._operation_id(call_id))
         if data is None:
@@ -3033,6 +3073,61 @@ class _Run:
             raise HeldEffectsError(held, retry_after=held[0].retry_after)
         await self._defer_hold(call, held[0])
 
+    async def _hook_edit_allowed(
+        self,
+        ctx: RunContext[Any],
+        approved: ToolCallPart,
+        tool: Tool,
+        changed: ToolCallPart,
+        changed_by: str | None,
+        auth: _ports.Authorization | None,
+    ) -> bool:
+        if _invalid_arguments(tool, changed) is not None:
+            return False
+        if auth is None or auth.decision != "ask":
+            return (await self.permissions.decide(ctx, tool, changed)).behavior == "allow"
+        editors = [
+            hook
+            for hook in self.hooks.hooks
+            if f"{type(hook).__module__}.{type(hook).__qualname__}" == changed_by
+        ]
+        if not editors or not all(hook.may_change_approved_arguments for hook in editors):
+            return False
+        decision = await self.permissions.decide(ctx, tool, changed)
+        if decision.behavior == "deny":
+            return False
+        if decision.behavior == "ask":
+            if self.permissions.on_ask is None:
+                return False
+            approval = await self.permissions.request_approval(ctx, tool, changed, decision.reason)
+            if not approval.approved or approval.arguments not in (None, changed.arguments):
+                return False
+            by = approval.by
+        else:
+            by = changed_by
+        operation = self._operation_id(approved.id)
+        signed = self.permissions.decision_record(
+            session_id=self.session.id,
+            run_id=self.run_id,
+            operation_id=operation,
+            ask=1 + self._replay_state.decision_counts.get(operation, 0),
+            tool=tool,
+            call=changed,
+            approved=True,
+            reason=decision.reason,
+            by=by,
+            decided_at=await self._writer.store_now(),
+            arguments_changed=True,
+            arguments_changed_by=changed_by,
+        )
+        record = signed.model_dump(mode="json")
+        await self._journal("approval_decided", record)
+        self._replay_state.decisions[operation] = record
+        self._replay_state.decision_counts[operation] = signed.ask
+        self._authorizations[approved.id] = self._approval_auth(signed)
+        self._edited.add(approved.id)
+        return True
+
     async def _execute_effect_call(
         self,
         call: ToolCallPart,
@@ -3060,14 +3155,8 @@ class _Run:
             return
         auth = self._authorizations.get(call.id)
         if digest != original_digest and isinstance(hooked, ToolCallPart):
-            if not self._has_intent(call.id) and auth is not None and auth.decision == "ask":
-                result = _error_result(call, prompts.APPROVAL_SCOPE_CHANGED)
-                await self._record(result)
-                queue.put_nowait(ToolCallFinished(call=call, result=result, agent=self.agent.name))
-                return
-            elif (
-                not self._has_intent(call.id)
-                and (await self.permissions.decide(ctx, tool, hooked)).behavior != "allow"
+            if not self._has_intent(call.id) and not await self._hook_edit_allowed(
+                ctx, call, tool, hooked, changed_by, auth
             ):
                 result = _error_result(call, prompts.APPROVAL_SCOPE_CHANGED)
                 await self._record(result)
@@ -3179,6 +3268,28 @@ class _Run:
         result.metadata["timeout"] = limit
         return result
 
+    def _timeout_result(
+        self, tool: Tool, call: ToolCallPart, timeout: ToolTimeout, scope: _ports.CallScope | None
+    ) -> ToolResultPart | None:
+        if scope is None:
+            return None
+        held = scope.held or self._unresolved_for(scope.operation_id)
+        if held:
+            if any(effect.on_unknown == "fail_run" for effect in tool.effects):
+                raise HeldEffectsError(held, retry_after=held[0].retry_after) from None
+            raise EffectHeld(held[0]) from None
+        content = (
+            prompts.EFFECT_TOOL_TIMEOUT.format(
+                seconds=timeout.seconds,
+                committed=", ".join(f"{name} {key}" for name, key in scope.committed),
+            )
+            if scope.committed
+            else prompts.EFFECT_TOOL_TIMEOUT_NONE.format(
+                seconds=timeout.seconds,
+            )
+        )
+        return _error_result(call, content)
+
     async def _invoke(
         self,
         ctx: RunContext[Any],
@@ -3238,23 +3349,8 @@ class _Run:
             if scope is not None and scope.held and metadata.get("effect_outcome_unknown") is True:
                 self._unknown_results.add(call.id)
         except ToolTimeout as timeout:
-            if scope is not None:
-                held = scope.held or self._unresolved_for(scope.operation_id)
-                if held:
-                    if any(effect.on_unknown == "fail_run" for effect in tool.effects):
-                        raise HeldEffectsError(held, retry_after=held[0].retry_after) from None
-                    raise EffectHeld(held[0]) from None
-                content = (
-                    prompts.EFFECT_TOOL_TIMEOUT.format(
-                        seconds=timeout.seconds,
-                        committed=", ".join(f"{name} {key}" for name, key in scope.committed),
-                    )
-                    if scope.committed
-                    else prompts.EFFECT_TOOL_TIMEOUT_NONE.format(
-                        seconds=timeout.seconds,
-                    )
-                )
-                return _error_result(call, content)
+            if result := self._timeout_result(tool, call, timeout, scope):
+                return result
             # Only the framework's own timeout: a TimeoutError of the tool's code is a failure.
             if not timeout.started:
                 template = prompts.TOOL_NOT_STARTED
@@ -3838,18 +3934,19 @@ class _Run:
                 await self._writer.append(entries)
             else:
                 await self.session.append_entries(entries)
-        except LeaseError:  # the store contract guarantees that nothing was written
-            self._unwritten(entries)
+        except BaseException as error:
+            # A lease refusal guarantees no write. Other failures can follow a commit.
+            self._unwritten(entries, definite=isinstance(error, LeaseError))
             raise
-        # Other exceptions, including cancellation, do not establish whether the
-        # append committed. Do not attach that usage again to a later entry.
         for entry in entries:  # written: the journal holds this usage of these calls now
             for operation_id, usage in _usage_loads(entry.data).items():
                 held = self.journaled_usage.get(operation_id, Usage())
                 self.journaled_usage[operation_id] = held.add(usage)
 
-    def _unwritten(self, entries: list[Entry]) -> None:
-        """Keep the added usage of entries that were not written for the next entry."""
+    def _unwritten(self, entries: list[Entry], definite: bool = True) -> None:
+        """Keep added usage only when the entries definitely did not commit."""
+        if not definite:
+            return
         for entry in entries:
             if "added_usage" in entry.data:
                 added = Usage.model_validate(entry.data["added_usage"])
