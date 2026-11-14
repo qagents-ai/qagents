@@ -185,6 +185,16 @@ def test_probe_gate_refuses_non_test_credentials(monkeypatch):
         _live_key()
 
 
+async def _post(client, endpoint, data, key):
+    response = await client.post(endpoint, data=data, headers={"Idempotency-Key": key})
+    try:
+        body = response.json()
+    except ValueError:
+        pytest.fail("Stripe probe returned a non-JSON response", pytrace=False)
+    replayed = response.headers.get("Idempotent-Replayed", "").lower() == "true"
+    return response.status_code, body, replayed
+
+
 def _observe_replay(first, second, *, status, code=None):
     if first[0] != status:
         return None
@@ -240,15 +250,7 @@ def test_live_stripe_api_v1_observations(tmp_path):
         ) as client:
 
             async def post(endpoint, data, identity):
-                response = await client.post(
-                    endpoint, data=data, headers={"Idempotency-Key": nonce + identity}
-                )
-                try:
-                    body = response.json()
-                except ValueError:
-                    pytest.fail("Stripe returned a non-JSON response", pytrace=False)
-                replayed = response.headers.get("Idempotent-Replayed", "").lower() == "true"
-                return response.status_code, body, replayed
+                return await _post(client, endpoint, data, nonce + identity)
 
             async def new_charge(identity):
                 status, charge, _ = await post(

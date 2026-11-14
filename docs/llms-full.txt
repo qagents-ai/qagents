@@ -2218,7 +2218,27 @@ unmodified baseline. The test requires an exercised fault and an
 assertion that detects it. The suite covers runtime, store and report
 checks, including whether a reference run applied an effect.
 
-## Run the Stripe sandbox probes
+## Run the refund probes without credentials
+
+The local sandbox runs a stateful refund endpoint on a random loopback
+port. Its clock can jump to the simulated 24-hour boundary and its
+fault controls can return cached rejections or HTTP 500 responses,
+hold an in-flight request, and drop a response after recording a refund.
+
+```bash
+python -m pytest -q -m "not network" tests/probes
+```
+
+The recovery test reopens an SQLite journal after the response is lost,
+finds the receipt through the simulated provider's list endpoint and
+resumes the agent. It checks that the provider received one refund POST.
+
+Set `QAGENTS_LOCAL_STRIPE_PROBE_DIR` to keep the JSON observations.
+The evidence has scope `local_http_simulation`. Only the provider's
+sandbox probe can write a passing provider mapping for
+`crash_test(probes=...)`.
+
+## Run the optional Stripe provider probes
 
 Load `STRIPE_TEST_SECRET_KEY` from your sandbox's secret store and run
 the probe from the development checkout.
