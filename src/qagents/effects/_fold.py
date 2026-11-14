@@ -145,7 +145,8 @@ def _status_of(op: Operation) -> State:
 
 
 def _claimed_rejection(op: Operation) -> bool:
-    """A claim taken over as rejected is the rejection of its generation (SPEC 7.10)."""
+    """A claim taken over is the rejection of its generation (SPEC 7.10): rejected, or
+    taken back by a rejected record after the other owner's attempt was never sent."""
     return op.claimed is not None and op.claimed.generation == op.generation
 
 

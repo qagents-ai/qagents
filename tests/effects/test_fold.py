@@ -9,7 +9,7 @@ import pytest
 from qagents.effects._fold import EffectView, fold_effects
 from qagents.effects._types import HoldReason
 
-from ._samples import claimed, committed, failed, intent, reference
+from ._samples import claim_attempt, claimed, committed, failed, intent, reference
 
 
 def entry(seq, kind, data=None, *, run="run", identity=None, ts=90000.0):
@@ -511,6 +511,30 @@ def test_claim_transfer_folds_to_the_rejection_it_carries():
 def test_transferred_rejection_counts_only_for_its_generation(later, state):
     op = operation([entry(2, "effect_claimed", claimed()), *later])
     assert op.state == state and not op.findings
+
+
+def test_a_claim_taken_back_after_an_unsent_d2_folds_to_a_rejection_of_its_generation():
+    """AF-2 recheck: a rejected record takes back a claim whose last owner never sent its D2
+    (generation 1), so its fold is R(1), with every earlier attempt for the lookup."""
+    history = [
+        claim_attempt(session_id="one", number=1, generation=0),
+        claim_attempt(session_id="two", number=2, generation=1, outcome="not_sent"),
+    ]
+    back = claimed(status="not_sent", generation=1, attempts=history)
+    entries = [
+        entry(1, "effect_intent", intent()),
+        entry(2, "effect_failed", failed(why="rejected")),
+        entry(3, "effect_claimed", back),
+    ]
+    op = operation(entries)
+    assert (op.state, op.generation, op.revision) == ("R", 1, 3) and not op.findings
+    assert op.claimed.status == "not_sent"
+    assert [(a.number, a.outcome) for a in op.claimed.attempts] == [
+        (1, "rejected"),
+        (2, "not_sent"),
+    ]
+    [record] = fold_effects(entries).records("session")
+    assert record.status == "rejected"
 
 
 def test_lookup_commit_without_an_attempt_needs_a_claim_transfer():

@@ -1,6 +1,7 @@
 import inspect
 
-from pydantic import BaseModel
+import pytest
+from pydantic import BaseModel, ValidationError
 
 from qagents.effects import _kinds as kinds
 from qagents.effects._canonical import digest
@@ -35,6 +36,15 @@ def test_journal_payloads_round_trip_and_preserve_semantics():
         assert cls.model_validate_json(parsed.model_dump_json()) == parsed
     assert kinds.EffectFailedData.model_validate(failed()).committed is None
     assert kinds.EffectFailedData.model_validate(failed(why="rejected")).committed is False
+
+
+def test_a_claim_transfer_names_the_status_it_read():
+    # AF-2 recheck: a record in R(n) also takes back a claim its last owner never sent.
+    for status in ("rejected", "not_sent"):
+        parsed = kinds.EffectClaimedData.model_validate(claimed(status=status))
+        assert parsed.status == status
+    with pytest.raises(ValidationError):
+        kinds.EffectClaimedData.model_validate(claimed(status="held"))
 
 
 def test_legacy_additions_default_without_shared_mutable_values():

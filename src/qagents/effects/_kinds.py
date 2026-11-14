@@ -24,7 +24,7 @@ KIND_EFFECT_SEND_ENDED = "effect_send_ended"
 KIND_EFFECT_OBSERVED = "effect_observed"
 KIND_EFFECT_SETTLED = "effect_settled"
 KIND_EFFECT_CONFLICT = "effect_conflict"
-KIND_EFFECT_CLAIMED = "effect_claimed"  # [additive] a rejected claim moved to this session
+KIND_EFFECT_CLAIMED = "effect_claimed"  # [additive] a claim moved to this session (7.10)
 KIND_MEMO_RECORDED = "memo_recorded"
 KIND_RUN_RESUMED = "run_resumed"
 KIND_WORKFLOW_STEP_STARTED = "workflow_step_started"
@@ -237,8 +237,9 @@ class EffectClaimedData(EffectRefData):
 
     It carries what the lookup must ask the destination about: the frozen request and its
     operation tag, and every earlier attempt with its idempotency key. The claim index
-    accepts it only while the claim still matches ``previous_owner``, ``generation`` and
-    ``attempts`` exactly.
+    accepts it only while the claim still matches ``previous_owner``, ``status``,
+    ``generation`` and ``attempts`` exactly. ``status`` is ``"not_sent"`` when a record
+    in R(n) takes back a claim whose last owner's attempt was never sent.
     """
 
     version: str
@@ -250,7 +251,7 @@ class EffectClaimedData(EffectRefData):
     operation_id: str  # the call that took the claim; it is not one of the record's own attempts
     tool_call_id: str | None
     previous_owner: dict[str, str]  # {session_id, incarnation, record_id}
-    status: Literal["rejected"]
+    status: Literal["rejected", "not_sent"]  # the claim's status when it was read
     generation: int
     first_use_at: float
     attempts: list[ClaimAttemptData]
