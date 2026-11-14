@@ -2905,4 +2905,6 @@ SEAMS = [
     ("M51", "qagents.permissions.Permissions._asks_by_rule", "O4b"),
     # Added by the AF-1 re-fix (interface-changes.md): the no-answer guard reads the chain.
     ("M52", "qagents.effects._declare._error_links", "O1"),
+    # Added by the AF-1 re-fix: an error after the engine's deadline cancel is the timeout.
+    ("M53", "qagents.effects._engine._cancelled_at_deadline", "O2"),
 ]

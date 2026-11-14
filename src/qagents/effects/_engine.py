@@ -606,6 +606,7 @@ async def _dispatch(
                     rule,
                     result=result,
                     error=error,
+                    timeout=_cancelled_at_deadline(effect, True, error),
                     overran=True,
                 )
                 await _append_outcome(
@@ -652,7 +653,7 @@ async def _dispatch(
             rule,
             result=result,
             error=error,
-            timeout=timed_out and isinstance(error, asyncio.CancelledError),
+            timeout=_cancelled_at_deadline(effect, timed_out, error),
         )
     finally:
         if slot is not None:
@@ -727,6 +728,19 @@ def _request_for_send(effect: Effect, frozen: canonical.Frozen, original: Any) -
 def _may_overrun(effect: Effect) -> bool:
     """A synchronous send cannot be stopped by cancelling its asyncio wrapper (M35)."""
     return not effect.is_async
+
+
+def _cancelled_at_deadline(effect: Effect, timed_out: bool, error: BaseException | None) -> bool:
+    """Whether a send's error is the engine's own timeout (SPEC 7.1 E5, E5o; mutant seam M53).
+
+    Past the deadline the engine cancels an async send. The cancellation, not an
+    answer from the destination, ends it then, so any error it raises, within m or
+    later, is that timeout and its outcome is unknown: also a ``rejected_on`` type
+    that the send raises in reaction (``except CancelledError: ... raise
+    PaymentsError()``). A sync send is never cancelled; its late error is classified
+    as it was raised.
+    """
+    return timed_out and error is not None and effect.is_async
 
 
 def _classify_send_error(

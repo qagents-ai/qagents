@@ -216,6 +216,13 @@ def _raised_error_only(original, error):
     return iter((error,))
 
 
+def _cancellation_only(original, effect, timed_out, error):
+    # AF-1 review: the old rule, where only a CancelledError after the deadline is the timeout.
+    import asyncio
+
+    return timed_out and isinstance(error, asyncio.CancelledError)
+
+
 E = "tests/effects/test_"
 M = "tests/effects/mutants/test_scenarios.py::"
 
@@ -385,6 +392,13 @@ _ROWS = [
         E
         + "engine_no_answer.py::test_no_answer_after_application_is_held_not_resent_under_a_new_key[memory-wrapped_from]",
         _raised_error_only,
+    ),
+    # M53: a declared refusal type that an async send raises after the engine cancelled it
+    # at its deadline counts as rejected, and D2 re-sends it under a new key (AF-1 review).
+    (
+        E
+        + "engine_no_answer.py::test_refusal_raised_after_the_engine_cancelled_the_send_is_its_timeout[memory-after]",
+        _cancellation_only,
     ),
 ]
 

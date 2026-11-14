@@ -174,3 +174,66 @@ async def test_no_answer_after_application_is_looked_up_not_resent(store, case):
     assert len(looked) == 1
     # The first call is answered from the lookup, never reported to the model as refused.
     assert scripted.requests[1].messages[-1].tool_results[0].content == "O1"
+
+
+class Stalled:
+    """A destination that applies the first charge and never answers it in time."""
+
+    def __init__(self, style: str) -> None:
+        self.style = style
+        self.keys: list[str] = []
+        self.applied: dict[str, str] = {}
+
+    async def charge(self, attempt: Attempt[Charge]) -> ChargeReceipt:
+        self.keys.append(attempt.idempotency_key)
+        first = not self.applied
+        self.applied.setdefault(attempt.idempotency_key, attempt.operation_tag)
+        if not first:
+            return ChargeReceipt(order=attempt.request.order)
+        aborted = False
+        try:
+            await asyncio.sleep(30)  # the response does not arrive before timeout_s
+        except asyncio.CancelledError as error:
+            # A client that turns the engine's cancellation into its own error type.
+            if self.style == "from":
+                raise PaymentsError("request aborted") from error
+            if self.style == "context":
+                raise PaymentsError("request aborted")  # noqa: B904
+            aborted = True
+        if aborted:
+            raise PaymentsError("request aborted")  # after the handler: no chain to read
+        return ChargeReceipt(order=attempt.request.order)
+
+
+@pytest.mark.parametrize("style", ["from", "context", "after"])
+async def test_refusal_raised_after_the_engine_cancelled_the_send_is_its_timeout(store, style):
+    # AF-1 review: SPEC 7.1 E5 cancels an async send at its deadline, "Then E4". A
+    # declared refusal type the send raises in reaction is that timeout, not E3.
+    destination = Stalled(style)
+
+    @effect(
+        "shop.charge",
+        key=Key("charge", "order"),
+        namespace="shop",
+        timeout_s=0.3,
+        rejected_on=(PaymentsError,),
+        dedupe=STRIPE_IDEMPOTENCY_V1,
+    )
+    async def charge(ctx: EffectContext, attempt: Attempt[Charge]) -> ChargeReceipt:
+        return await destination.charge(attempt)
+
+    @tool(effects=[charge])
+    async def pay(ctx: RunContext, order: str) -> str:
+        """Charge the order."""
+        try:
+            return (await ctx.perform(charge, Charge(order=order))).order
+        except EffectRejected:
+            return "rejected"
+
+    await Agent(model(), tools=[pay]).run("pay", session=Session(store, id="s"))
+    assert len(destination.applied) == 1, destination.keys
+    assert len(set(destination.keys)) == 1, destination.keys
+    failed = [entry.data for entry in await store.load("s") if entry.kind == "effect_failed"]
+    assert [(data["why"], data["error_kind"], data["committed"]) for data in failed] == [
+        ("unknown", "timeout", None)
+    ]
