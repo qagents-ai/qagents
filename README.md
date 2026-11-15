@@ -613,12 +613,20 @@ seeded mutations (21 new, 68 in all):
 - `crash_test` with `Faults.default()` reports violations on correct fixtures (about 40 of 364
   points; 4 of 35 with `Faults.quick()`), and the guide's `qagents crashtest` command fails on
   correct agents. `budget=` drops depth-2 points without saying so.
-- The fixes have not run on Python 3.11 locally; CI's 3.11 job is the check.
 
 Effects is an exercised preview with real-kill evidence for the cases it tests. It is not a
 released guarantee.
 
 ## How qagents compares
+
+qagents focuses on long-running teams whose work must survive worker restarts, human
+review and ambiguous responses from external systems. Run journals retain decisions and
+tool results, the SQLite team mailbox keeps handoffs across process restarts, and the
+Effects preview can hold an uncertain write for operator review. The
+[recovery comparison](docs/comparison.md#recovery-for-long-running-agent-teams) covers
+the matched LangGraph benchmark, the KA220 backup-and-restore rehearsal, CrewAI
+checkpointing and Azure's distinction between Microsoft Agent Framework and the managed
+Foundry Agent Service.
 
 Checked on 2026-11-14 against each project's own documentation, package index and repository.
 Versions: LangGraph 1.2.22 (langchain 1.5.0), CrewAI 1.15.41, Microsoft Agent Framework 1.26.0
@@ -634,14 +642,14 @@ Pydantic AI 2.68.0. For qagents: the 0.2.0 release; *unreleased* and *preview* m
 | Stable release | — 0.2.0 alpha; no tag, not on PyPI | ✅ 1.x | ✅ 1.x | ✅ 1.x | 🟡 0.x | ✅ 2.x | ✅ 2.x |
 | Model providers | 🟡 3 adapters, OpenAI-compatible | ✅ many packages | ✅ native SDKs | ✅ many, some beta | 🟡 OpenAI first | 🟡 Gemini first | ✅ many native |
 | MCP, A2A | 🟡 MCP client; server unreleased; no A2A | 🟡 MCP client beta; server, A2A in Agent Server | 🟡 MCP client, A2A; no MCP server | 🟡 MCP client, server; A2A beta | 🟡 MCP client; no A2A | ✅ MCP client, server, A2A | 🟡 MCP client; A2A separate |
-| Multi-agent | 🟡 sub-agents, handoffs, fan-out; no group chat | ✅ subagents, handoffs, router | ✅ crews, LLM manager | ✅ incl. group chat | ✅ handoffs, agents as tools | ✅ sub-agents, graphs | ✅ delegation, graphs |
+| Multi-agent | 🟡 sub-agents, handoffs, fan-out, SQLite team mailbox (preview) | ✅ subagents, handoffs, router | ✅ crews, LLM manager | ✅ incl. group chat | ✅ handoffs, agents as tools | ✅ sub-agents, graphs | ✅ delegation, graphs |
 | Approval pause, resume elsewhere | ✅ signed tokens | ✅ interrupt() | ✅ Flows | ✅ in checkpoints | ✅ RunState JSON | 🟡 not with DB sessions | ✅ deferred tools |
 | Durable runs, crash recovery | ✅ SQLite, Postgres, leases, recover() | ✅ checkpointers; leases in Agent Server | 🟡 JSON, SQLite; manual resume | 🟡 manual; automatic via Durable Task | 🔌 Dapr, Temporal, Restate, DBOS | 🟡 manual; automatic via Temporal plugin (experimental) | 🔌 Temporal, DBOS, others |
 | Side effects after a crash | ✅ finished calls never re-run; interrupted writes reported as unknown, not repeated; Effects preview | — at-least-once, documented | — not documented | — left to the app | — left to the app | — at-least-once | 🔌 Harness ledger |
 | Crash and fault-injection tests | 🟡 preview | — | — | — | 🟡 scripted errors | 🟡 simulated tool errors | — |
 | Test models, evals | ✅ scripted, cassettes, evals | ✅ fake models, evals | 🟡 LLM judge only | 🟡 local evaluators | 🟡 fakes; no evals | ✅ eval suite | ✅ test models, evals |
 | Realtime voice | — | 🟡 tutorial | — | 🔌 Azure Voice Live | ✅ | 🟡 Gemini Live, experimental | ✅ |
-| Managed hosting | — self-hosted | 🔌 LangSmith | 🔌 CrewAI AMP | 🔌 Foundry | — | 🔌 Google Cloud | — |
+| Managed hosting | — self-hosted | 🔌 LangSmith | 🔌 CrewAI AMP | 🔌 Foundry Agent Service / Azure Functions | — | 🔌 Google Cloud | — |
 
 **Where the others are stronger.** Each of the other six is published on PyPI under an
 open-source license, ships releases often, and has a large user base: from about 15,000 GitHub

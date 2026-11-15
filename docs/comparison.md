@@ -3,7 +3,8 @@
 This page compares qagents with six other Python agent frameworks on the points that decide a
 choice for long-running agents: durable runs, human approvals, what happens to external
 writes after a crash, and how much of the surrounding product each one provides. It was
-checked on 2026-11-14.
+checked on 2026-11-14. The recovery section also covers Microsoft Foundry Agent Service,
+with vendor sources checked on 2026-11-16.
 
 ## How the comparison was made
 
@@ -13,10 +14,9 @@ checked on 2026-11-14.
 - **Ratings.** ✅ built in · 🟡 partial · 🔌 via an integration or a separate product, often
   paid · — not provided · ? unverified. A cell shows — only where the research found the
   feature absent with high or medium confidence.
-- **qagents.** The cells describe this repository at `b87e30d`: `main` at `dd74a3d` (the 0.2.0
-  release and the unreleased work on `main`) plus the review fixes of branch
-  `effects/safety-edges`, which are not on `main` yet. Unreleased and preview features are marked as such and are not
-  rated as built in.
+- **qagents.** The cells cover the 0.2.0 release and the development snapshot
+  `ecd114d`, which includes the Effects review fixes and persistent team messaging.
+  Unreleased and preview features are marked as such and are not rated as built in.
 - **Adoption.** Star and download counts are approximate (GitHub API and pypistats on
   2026-11-14). Download counts fluctuate and include CI installs.
 - **Not compared.** AutoGen's README declares the project archived and unmaintained, and
@@ -27,7 +27,7 @@ checked on 2026-11-14.
 
 | Framework | Package | Version | Released |
 |---|---|---|---|
-| qagents | `qagents` (not on PyPI) | 0.2.0, and `main` at `dd74a3d` with the `effects/safety-edges` fixes (`b87e30d`) | 2026-11-11; `main` 2026-11-14 |
+| qagents | `qagents` (not on PyPI) | 0.2.0 and development snapshot `ecd114d` | 2026-11-11 (0.2.0) |
 | LangGraph | `langgraph`, with `langchain` and `langchain-core` | 1.2.22 (langchain 1.5.0, langchain-core 1.8.0, langgraph-api 0.18.0) | 2026-11-14 |
 | CrewAI | `crewai` | 1.15.41 | 2026-11-12 |
 | Microsoft Agent Framework | `agent-framework` (Python), `Microsoft.Agents.AI` (.NET) | Python 1.26.0, .NET 1.28.0, Go v0.3.1 prerelease | 2026-11-12 (Python), 2026-11-06 (.NET) |
@@ -45,7 +45,7 @@ checked on 2026-11-14.
 | Model providers | 🟡 3 adapters, OpenAI-compatible | ✅ many packages | ✅ native SDKs | ✅ many, some beta | 🟡 OpenAI first | 🟡 Gemini first | ✅ many native |
 | Typed tools, structured output | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | MCP, A2A | 🟡 MCP client; server unreleased; no A2A | 🟡 MCP client beta; server, A2A in Agent Server | 🟡 MCP client, A2A; no MCP server | 🟡 MCP client, server; A2A beta | 🟡 MCP client; no A2A | ✅ MCP client, server, A2A | 🟡 MCP client; A2A separate |
-| Multi-agent | 🟡 sub-agents, handoffs, fan-out; no group chat | ✅ subagents, handoffs, router | ✅ crews, LLM manager | ✅ incl. group chat | ✅ handoffs, agents as tools | ✅ sub-agents, graphs | ✅ delegation, graphs |
+| Multi-agent | 🟡 sub-agents, handoffs, fan-out, SQLite team mailbox (preview) | ✅ subagents, handoffs, router | ✅ crews, LLM manager | ✅ incl. group chat | ✅ handoffs, agents as tools | ✅ sub-agents, graphs | ✅ delegation, graphs |
 | Approval pause, resume elsewhere | ✅ signed tokens | ✅ interrupt() | ✅ Flows | ✅ in checkpoints | ✅ RunState JSON | 🟡 not with DB sessions | ✅ deferred tools |
 | Durable runs, crash recovery | ✅ SQLite, Postgres, leases | ✅ checkpointers; leases in Agent Server | 🟡 JSON, SQLite; manual resume | 🟡 manual; automatic via Durable Task | 🔌 Dapr, Temporal, Restate, DBOS | 🟡 manual; automatic via Temporal plugin (experimental) | 🔌 Temporal, DBOS, others |
 | Side effects after a crash | ✅ finished calls never re-run; interrupted writes reported as unknown, not repeated; Effects preview | — at-least-once, documented | — not documented | — left to the app | — left to the app | — at-least-once | 🔌 Harness ledger |
@@ -56,7 +56,7 @@ checked on 2026-11-14.
 | Test models, evals | ✅ scripted, cassettes, evals | ✅ fake models, evals | 🟡 LLM judge only | 🟡 local evaluators | 🟡 fakes; no evals | ✅ eval suite | ✅ test models, evals |
 | Memory | 🟡 journal, state, notes | ✅ stores with search | ✅ memory with vector recall | ✅ context providers | 🟡 sessions | ✅ memory service | 🔌 long-term in Harness |
 | Coding agents | 🟡 unreleased: ACP client, docs server | 🟡 docs for agents | 🟡 docs for agents | ✅ drives coding SDKs | 🟡 experimental tool | 🟡 docs for agents | 🟡 docs, ACP experimental |
-| Managed hosting | — self-hosted | 🔌 LangSmith | 🔌 CrewAI AMP | 🔌 Foundry | — | 🔌 Google Cloud | — |
+| Managed hosting | — self-hosted | 🔌 LangSmith | 🔌 CrewAI AMP | 🔌 Foundry Agent Service / Azure Functions | — | 🔌 Google Cloud | — |
 | Adoption | — alpha, no public users | ✅ ~45k stars | ✅ ~61k stars | ✅ ~15k stars | ✅ ~31k stars | ✅ ~22k stars | ✅ ~21k stars |
 
 ## Choosing a framework
@@ -84,11 +84,60 @@ checked on 2026-11-14.
   sessions, AG-UI and Vercel AI adapters, and durable execution through an engine you already
   run.
 
+## Recovery for long-running agent teams
+
+The main reason to evaluate qagents is a workflow that spans workers and handoffs, pauses
+for review, and makes changes in external systems. Keep the approval and tool results in
+the run journal, keep inter-agent messages in a persistent mailbox, and rehearse the
+points where a worker can stop. Effects 0.3 adds a preview for recording external
+operations before they are sent, checking an ambiguous result and holding it for an
+operator when the available evidence cannot support an automatic decision.
+[Team messaging](concepts/multi-agent.md) · [Recover an external action](guides/recover-effect.md)
+
+| Platform | What it already provides for this workload |
+|---|---|
+| LangGraph | Explicit graph checkpoints, interrupts and resume. Its fault-tolerance guide describes stable idempotency keys and how to handle a missing acknowledgement. [Persistence](https://docs.langchain.com/oss/python/langgraph/persistence) · [Fault tolerance](https://docs.langchain.com/oss/python/langgraph/fault-tolerance) |
+| CrewAI | Role-based Crews and event-driven Flows. Agents, Crews and Flows support JSON or SQLite checkpoints and explicit restore; automatic checkpoint writes are best-effort. [Crews](https://docs.crewai.com/en/concepts/crews) · [Checkpointing](https://docs.crewai.com/en/concepts/checkpointing) |
+| Microsoft Agent Framework | Workflow graph checkpoints and built-in orchestrations. The Durable Extension adds persistent sessions and distributed recovery for Python and .NET on Azure Functions or self-hosted workers backed by Durable Task. [Workflows](https://learn.microsoft.com/en-us/agent-framework/concepts/workflows/) · [Durable Extension](https://learn.microsoft.com/en-us/agent-framework/hosting/durable-extension) |
+| Microsoft Foundry Agent Service | Managed endpoints, scaling, Entra identity, session persistence and observability. Hosted Agents can run a container built with another framework. [Foundry Agent Service](https://learn.microsoft.com/en-us/azure/foundry/agents/overview?view=foundry) |
+
+The matched Gym experiment gives qagents and LangGraph the same credit workflow and a
+separate destination ledger. A rerun at `ecd114d` passed all 40 positive trials and detected
+the deliberately duplicated credit in all 10 negative controls with destination deduplication
+disabled. Across the three enabled-deduplication crash cases, median kill-to-result time
+ranged from 7.07 to 7.13 seconds for Effects and 1.25 to 1.34 seconds for LangGraph on one
+Windows host. The Effects setup used a 6.1-second worker lease. The single-worker LangGraph
+setup used no equivalent lease. [Gym benchmark and reproduction steps](https://github.com/mpvasilis/qagent-gym/blob/main/docs/recovery-benchmark.md#effects-development-snapshot-november-14)
+
+An operator path is covered by a separate runnable example. After the simulated
+destination commits a credit and loses its response, a fresh worker records the
+operator's verified receipt and resumes the agent. The example verifies one credit in the
+destination ledger. [Operator recovery example](guides/recover-effect.md)
+
+The fictional KA220 rehearsal tests a different boundary. Three agents run in separate
+processes, and the writer is terminated after SQLite commits a draft message and before its
+agent journal records the tool result. Both restart and restoration from backup delivered
+the same draft sequence, completed all 75 consistency checks and produced matching final
+proposal hashes. Six evidence warnings remained for a human reviewer. The rehearsal uses
+scripted models and compares two qagents recovery paths.
+[KA220 pilot](https://github.com/mpvasilis/qagent-gym/blob/main/docs/erasmus-example.md#rehearse-worker-restart-and-backup-restore)
+
+### What to verify before an organizational rollout
+
+1. Fix false positives in the default crash harness, then require it to pass on known-good
+   fixtures and detect seeded faults. A violated invariant should identify the run,
+   operation and exact fault point.
+2. Test the Effects journal and team mailbox with workers on separate hosts. Rehearse
+   failover after send and receive commits, stale-worker fencing and consistent restoration.
+   The Effects preview and persistent mailbox currently use SQLite for durable storage.
+3. Document how operators inspect a held effect, verify a provider receipt and record who
+   settled it. Run the same commit-before-ack workload in each framework with equivalent
+   retries, provider contracts and worker coordination. Compare duplicate writes, lost
+   messages, recovery time and manual interventions.
+
 ## Notes and sources
 
 ### qagents
-
-The evidence is in this repository at `b87e30d`: `main` at `dd74a3d` with the review fixes of branch `effects/safety-edges`.
 
 | Dimension | Rating | Note | Evidence |
 |---|---|---|---|
@@ -98,7 +147,7 @@ The evidence is in this repository at `b87e30d`: `main` at `dd74a3d` with the re
 | Model providers | 🟡 | QCloud, OpenAI Chat Completions and Anthropic adapters, any OpenAI-compatible endpoint, and custom providers. No Gemini, Bedrock, Azure, Mistral or OpenAI Responses adapter. | [Model providers](providers.md) |
 | Typed tools, structured output | ✅ | `@tool` schemas from type hints, arguments validated before anything runs; `output_type` in three modes, validators and guardrails. | [Tools](concepts/tools.md), [Structured output](concepts/structured-output.md) |
 | MCP, A2A | 🟡 | MCP client toolkit (released). MCP tool server bound to a run or over stdio (unreleased). No A2A. | [Ready-made tools](toolkits.md), [Serving tools over MCP](integrations/mcp-server.md) |
-| Multi-agent | 🟡 | Sub-agents with shared live budgets, handoffs, `fan_out`, `route`, durable workflows. Team messaging is unreleased and experimental. No crews, group chat or LLM manager, by design. | [Several agents](concepts/multi-agent.md) |
+| Multi-agent | 🟡 | Sub-agents with shared live budgets, handoffs, `fan_out`, `route` and durable workflows. An experimental SQLite `TeamMailbox` persists messages across restarts and serves processes on the same host. | [Several agents](concepts/multi-agent.md) |
 | Approval pause, resume elsewhere | ✅ | An unanswered approval pauses the run; any process can resume it from the journal. With `Permissions(approval_secret=...)`, pause tokens are HMAC-SHA256 signed; without a secret, pauses are not signed. A writer with store access can replay an answered signed pause inside an open run. | [Permissions](concepts/permissions.md) |
 | Durable runs, crash recovery | ✅ | Memory, SQLite or Postgres journals; resume at the exact tool call; leases, heartbeats and `recover()` in `AgentRuntime`. Effects run on memory and SQLite only. | [Sessions](concepts/sessions.md), [Serving](serving.md) |
 | Side effects after a crash | ✅ | Released: a call with a recorded result never runs again, an interrupted non-idempotent call is not repeated, and `operation_id` is a stable key. Exactly-once is not claimed. Effects (preview) adds durable intents, contracts, lookups and holds. | [What is guaranteed](concepts/sessions.md#what-is-guaranteed), [Recover an external action](guides/recover-effect.md) |
@@ -148,7 +197,7 @@ The evidence is in this repository at `b87e30d`: `main` at `dd74a3d` with the re
 | MCP, A2A | 🟡 | Built-in MCP client and A2A client and server (the `crewai[a2a]` extra). No MCP server in the library. | [a2a-agent-delegation](https://docs.crewai.com/en/learn/a2a-agent-delegation) |
 | Multi-agent | ✅ | Sequential or hierarchical crews with an LLM manager, delegation tools, remote delegation over A2A. | [collaboration](https://docs.crewai.com/en/concepts/collaboration) |
 | Approval pause, resume elsewhere | ✅ | `@human_feedback` pauses a Flow and resumes later, also in another process. Per-tool approval only through a blocking hook. | [human-feedback-in-flows](https://docs.crewai.com/en/learn/human-feedback-in-flows) |
-| Durable runs, crash recovery | 🟡 | JSON or SQLite checkpoints; manual resume; no worker leases; automatic checkpoint writes are best-effort. | [checkpointing](https://docs.crewai.com/en/concepts/checkpointing) |
+| Durable runs, crash recovery | 🟡 | Agents, Crews and Flows support JSON or SQLite snapshots and explicit restoration. Automatic checkpoint writes are best-effort. | [checkpointing](https://docs.crewai.com/en/concepts/checkpointing) |
 | Side effects after a crash | — | Restore skips completed tasks; nothing documented about idempotency or unfinished work (medium confidence). | [checkpointing](https://docs.crewai.com/en/concepts/checkpointing) |
 | Crash and fault-injection tests | — | None documented (medium confidence). | [checkpointing](https://docs.crewai.com/en/concepts/checkpointing) |
 | Streaming to a UI | ✅ | Streaming for Flows, model calls and Crews; AG-UI through a separate package. | [streaming](https://docs.crewai.com/en/concepts/streaming) |
@@ -173,7 +222,7 @@ The evidence is in this repository at `b87e30d`: `main` at `dd74a3d` with the re
 | Multi-agent | ✅ | Sequential, concurrent, handoff, group chat and Magentic orchestrations; agents as tools; sub-workflows. | [orchestrations](https://learn.microsoft.com/en-us/agent-framework/workflows/orchestrations/) |
 | Approval pause, resume elsewhere | ✅ | Pending approvals are held in the `AgentSession` and, in workflows, in checkpoints that a new workflow instance can restore; a response authorizes a call only when it matches a pending request in the same session. No signed tokens. | [tool-approval](https://learn.microsoft.com/en-us/agent-framework/agents/tools/tool-approval), [checkpoints](https://learn.microsoft.com/en-us/agent-framework/workflows/checkpoints) |
 | Durable runs, crash recovery | 🟡 | Checkpoints to memory, file, Cosmos DB (beta) or Foundry; manual resume. Leases and automatic recovery through the Durable Task extension. | [checkpoints](https://learn.microsoft.com/en-us/agent-framework/workflows/checkpoints) |
-| Side effects after a crash | — | The durable docs say checkpointing does not make tools exactly-once and tell you to make side effects idempotent. No idempotency keys. | [durable-extension](https://learn.microsoft.com/en-us/agent-framework/hosting/durable-extension) |
+| Side effects after a crash | — | The Durable Extension docs assign tool idempotency to the application because tools can execute again after retries or recovery. | [durable-extension](https://learn.microsoft.com/en-us/agent-framework/hosting/durable-extension) |
 | Crash and fault-injection tests | — | None documented; mock clients are internal test fixtures (medium confidence). | [repository](https://github.com/microsoft/agent-framework) |
 | Streaming to a UI | ✅ | Streaming updates and workflow events; a stable AG-UI adapter in Python. | [ag-ui](https://learn.microsoft.com/en-us/agent-framework/integrations/by-component/ui/ag-ui/) |
 | Realtime voice | 🔌 | No voice API in the framework; hosted-agent docs point to Azure Speech Voice Live (medium confidence). | [foundry-hosted-agent](https://learn.microsoft.com/en-us/agent-framework/hosting/foundry-hosted-agent) |
@@ -181,7 +230,7 @@ The evidence is in this repository at `b87e30d`: `main` at `dd74a3d` with the re
 | Test models, evals | 🟡 | Local evaluators in core; LLM-judge evaluators through Foundry; no public fake model (medium confidence). | [evaluation](https://learn.microsoft.com/en-us/agent-framework/agents/evaluation) |
 | Memory | ✅ | Sessions with pluggable history and context providers; a built-in `FileMemoryProvider` keeps memory across sessions (on by default in the Harness agent); long-term stores through Mem0 (beta), Redis, Foundry and others. | [context-providers](https://learn.microsoft.com/en-us/agent-framework/concepts/agents/conversations/context-providers) |
 | Coding agents | ✅ | Agent wrappers for the GitHub Copilot SDK and the Claude Agent SDK (beta), and builder skills. No ACP (medium confidence). | [build-with-coding-agents](https://learn.microsoft.com/en-us/agent-framework/get-started/build-with-coding-agents) |
-| Managed hosting | 🔌 | Microsoft Foundry Hosted Agents (paid Azure); Durable Functions hosting; self-hosting allowed. | [hosting](https://learn.microsoft.com/en-us/agent-framework/hosting/) |
+| Managed hosting | 🔌 | Foundry Hosted Agents provide managed endpoints, scaling and identity. The Durable Extension supports Azure Functions and self-hosted workers. | [Foundry Agent Service](https://learn.microsoft.com/en-us/azure/foundry/agents/overview?view=foundry), [Durable Extension](https://learn.microsoft.com/en-us/agent-framework/hosting/durable-extension) |
 | Adoption | ✅ | About 15,000 stars and 1.6 million downloads of the core package in the last month; breaking changes still ship within 1.x. | [releases](https://github.com/microsoft/agent-framework/releases) |
 
 ### OpenAI Agents SDK
