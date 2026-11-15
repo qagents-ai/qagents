@@ -1,9 +1,13 @@
 """Public effect declarations and the errors tool authors may handle."""
 
 import asyncio
+import concurrent.futures
+import http.client
+import ssl
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from pydantic import BaseModel
 
@@ -313,6 +317,175 @@ def test_rejected_on_refuses_cancellation_but_accepts_explicit_refusal():
         ValueError,
         EffectRejected,
     )
+
+
+class _PaymentsTimeout(TimeoutError):
+    """A client's own timeout type: still a transport-level no answer."""
+
+
+@pytest.mark.parametrize(
+    "kind,relation,member",
+    [
+        (OSError, "is a base class of", "TimeoutError"),
+        (ConnectionError, "is", "ConnectionError"),
+        (ConnectionRefusedError, "derives from", "ConnectionError"),
+        (ConnectionResetError, "derives from", "ConnectionError"),
+        (_PaymentsTimeout, "derives from", "TimeoutError"),
+        (httpx.HTTPError, "is a base class of", "httpx.TransportError"),
+        (httpx.RequestError, "is a base class of", "httpx.TransportError"),
+        (httpx.TransportError, "is", "httpx.TransportError"),
+        (httpx.ConnectError, "derives from", "httpx.TransportError"),
+        (httpx.ReadTimeout, "derives from", "httpx.TransportError"),
+        (httpx.RemoteProtocolError, "derives from", "httpx.TransportError"),
+        (concurrent.futures.CancelledError, "is", "concurrent.futures._base.CancelledError"),
+    ],
+    ids=lambda value: value.__qualname__ if isinstance(value, type) else None,
+)
+def test_rejected_on_refuses_transport_no_answer_types_and_their_bases(kind, relation, member):
+    with pytest.raises(ConfigurationError) as refused:
+        declare(rejected_on=(ValueError, kind))
+    message = str(refused.value)
+    assert message.startswith("rejected_on must not list ")
+    assert kind.__qualname__ in message
+    assert f"it {relation} {member}," in message
+    assert "no answer came back" in message and "unknown" in message
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        EOFError,
+        asyncio.IncompleteReadError,
+        http.client.HTTPException,
+        http.client.IncompleteRead,
+        http.client.BadStatusLine,
+        ssl.SSLError,
+        ssl.SSLEOFError,
+        ssl.SSLZeroReturnError,
+        ssl.SSLSyscallError,
+    ],
+    ids=lambda kind: kind.__qualname__,
+)
+def test_rejected_on_refuses_standard_library_responses_cut_short_and_their_bases(kind):
+    # AF-1 review: a stream read cut short, an incomplete HTTP body, no status line
+    # and a TLS connection closed mid-response all mean that no answer came back.
+    with pytest.raises(ConfigurationError) as refused:
+        declare(rejected_on=(kind,))
+    assert "no answer came back" in str(refused.value)
+
+
+def _client_types(module: str, *names: str) -> list[type[BaseException]]:
+    loaded = pytest.importorskip(module)
+    return [getattr(loaded, name) for name in names]
+
+
+_HTTPCORE_REFUSED = (
+    "TimeoutException",
+    "ReadTimeout",
+    "NetworkError",
+    "ConnectError",
+    "ProtocolError",
+    "RemoteProtocolError",
+    "ProxyError",
+    "UnsupportedProtocol",
+)
+
+
+@pytest.mark.parametrize(
+    "module,refused,accepted",
+    [
+        # AF-1 review: httpx2 (anthropic>=2.8, mcp>=2.3) shares no class with httpx, so
+        # its HTTPError and TransportError were accepted.
+        (
+            "httpx2",
+            (
+                "HTTPError",
+                "RequestError",
+                "TransportError",
+                "RemoteProtocolError",
+                "ReadTimeout",
+                "ConnectError",
+            ),
+            ("HTTPStatusError",),
+        ),
+        ("httpcore", _HTTPCORE_REFUSED, ()),
+        ("httpcore2", _HTTPCORE_REFUSED, ()),
+        (
+            "requests.exceptions",
+            ("RequestException", "ConnectionError", "Timeout", "ReadTimeout", "ConnectTimeout"),
+            ("HTTPError",),
+        ),
+        ("urllib3.exceptions", ("HTTPError", "ReadTimeoutError", "ProtocolError"), ()),
+        (
+            "aiohttp",
+            ("ClientError", "ClientConnectionError", "ServerDisconnectedError", "ClientOSError"),
+            ("ClientResponseError",),
+        ),
+    ],
+)
+def test_rejected_on_refuses_loaded_client_library_transport_types(module, refused, accepted):
+    # Read from sys.modules: a client library's types once the user's code loaded it.
+    for kind in _client_types(module, *refused):
+        with pytest.raises(ConfigurationError, match="no answer came back"):
+            declare(rejected_on=(kind,))
+    received = tuple(_client_types(module, *accepted))
+    assert declare(rejected_on=received).rejected_on == received
+
+
+def test_rejected_on_names_the_httpx2_transport_error_it_overlaps():
+    httpx2 = pytest.importorskip("httpx2")
+    with pytest.raises(ConfigurationError) as refused:
+        declare(rejected_on=(httpx2.HTTPError,))
+    assert str(refused.value).startswith(
+        "rejected_on must not list httpx2.HTTPError: it is a base class of httpx2.TransportError,"
+    )
+
+
+def test_client_library_types_are_read_only_from_loaded_modules():
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "from qagents.effects import _declare\n"
+        "found = {kind.__module__.split('.')[0] for kind in _declare._no_answer_types()}\n"
+        "names = ('httpx2', 'httpcore2', 'requests', 'urllib3', 'aiohttp')\n"
+        "print(sorted(name for name in names if name in sys.modules or name in found))\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "[]"
+
+
+class _PaymentsErrors(ExceptionGroup):
+    """A client's own exception group: it can still hold a transport error."""
+
+
+@pytest.mark.parametrize(
+    "kind", [ExceptionGroup, BaseExceptionGroup, _PaymentsErrors], ids=lambda kind: kind.__name__
+)
+def test_rejected_on_refuses_exception_groups(kind):
+    with pytest.raises(ConfigurationError) as refused:
+        declare(rejected_on=(ValueError, kind))
+    message = str(refused.value)
+    assert message.startswith("rejected_on must not list ")
+    assert f"{kind.__qualname__}: it is an exception group" in message
+    assert "too broad" in message
+
+
+def test_rejected_on_accepts_own_refusals_and_received_http_status_errors():
+    class InvalidRequest(Exception):
+        """A 4xx validation refusal the client received."""
+
+    declared = declare(rejected_on=(InvalidRequest, httpx.HTTPStatusError))
+    assert declared.rejected_on == (InvalidRequest, httpx.HTTPStatusError)
+
+
+def test_rejected_on_names_a_non_type_entry():
+    with pytest.raises(ConfigurationError, match="exception types; got 'error'"):
+        declare(rejected_on=("error",))
 
 
 @pytest.mark.parametrize(

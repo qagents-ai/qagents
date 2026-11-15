@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from qagents import Agent, Approval, Permissions, RunContext, Session, tool
@@ -75,6 +77,55 @@ async def test_callback_decides_and_fails_closed():
     assert (
         await decide(Permissions(can_use_tool=lambda *a: "maybe"), read_order)
     ).behavior == "deny"
+
+
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        Permissions(),
+        Permissions(mode="allow_all"),
+        Permissions(mode="ask_all"),
+        Permissions(mode="read_only"),
+        Permissions(ask=["send_*"]),
+        Permissions(allow=["refund_*"]),
+        Permissions(ask=["refund_*"], allow=["refund_*"]),
+        Permissions(mode="ask_all", allow=["read_*"]),
+        Permissions(mode="ask_all", deny=["send_*"]),
+        Permissions(ask=["*"], deny=["refund_order"]),
+    ],
+)
+async def test_asks_by_rule_agrees_with_decide_without_a_callback(permissions):
+    """The agent's build-time check (an approval no secret signs) uses the same rule order."""
+    for target in make_tools([]):
+        asks = (await decide(permissions, target, order="A", amount=1)).behavior == "ask"
+        assert permissions._asks_by_rule(target) is asks, target.name
+
+
+def test_asks_by_rule_leaves_out_can_use_tool():
+    _, refund_order, send_email = make_tools([])
+    permissions = Permissions(can_use_tool=lambda *args: "allow")
+    assert permissions._asks_by_rule(refund_order) is True  # requires_approval, by the rules
+    assert Permissions(can_use_tool=lambda *args: "ask")._asks_by_rule(send_email) is False
+
+
+def test_callback_may_ask_for_any_call_no_deny_rule_refuses_first():
+    """can_use_tool decides per call, so the build check counts every call it may see."""
+    _, refund_order, _ = make_tools([])
+    callback = Permissions(can_use_tool=lambda *args: "allow", deny=["send_*"])
+    assert [callback._callback_may_ask(item) for item in make_tools([])] == [True, True, False]
+    assert not Permissions(mode="ask_all")._callback_may_ask(refund_order)  # no callback
+
+
+def test_approval_secret_doc_says_a_lookup_still_resolves_and_when_the_agent_warns():
+    """The API reference renders this text. A declared lookup (in the run or through
+    agent.recheck) still resolves an effect in doubt without the secret, and a toolkit's
+    tools are warned about at run start, not at build (AF-5 review)."""
+    doc = inspect.getdoc(Permissions.__init__)
+    text = " ".join(doc.split("approval_secret:", 1)[1].split("approval_ttl_s:", 1)[0].split())
+    assert "until a declared lookup finds it" in text and "agent.recheck" in text
+    assert "or an operator settles it" in text
+    assert "or at run start for a toolkit's tools" in text
+    assert "can_use_tool" in text  # it may ask, so its tools are named too
 
 
 async def test_denied_calls_are_reported_to_the_model():

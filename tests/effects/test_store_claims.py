@@ -5,7 +5,7 @@ import pytest
 from qagents.errors import ClaimConflict, SessionError
 from qagents.session import Entry, InMemoryStore, SQLiteStore
 
-from ._samples import committed, failed, intent
+from ._samples import claimed, committed, failed, intent, reference
 
 
 @pytest.fixture(params=["memory", "sqlite"])
@@ -109,3 +109,126 @@ async def test_invalid_or_oversized_terminal_leaves_claim_and_journal_unchanged(
             await write(db, "a", "effect_committed", data)
         assert await db.get_claim("shop", "refund", "R1") == before
         assert len(await db.load("a")) == 1
+
+
+async def transfer_of(db, **changes):
+    """The effect_claimed payload for the current claim, as the engine journals it."""
+    claim = await db.get_claim("shop", "refund", "R1")
+    return claimed(
+        previous_owner={
+            "session_id": claim.session_id,
+            "incarnation": claim.incarnation,
+            "record_id": claim.record_id,
+        },
+        generation=claim.generation,
+        first_use_at=claim.first_use_at,
+        attempts=[item.model_dump(mode="json") for item in claim.attempts],
+        **changes,
+    )
+
+
+async def test_claim_keeps_every_attempt_and_outcome_across_owners(db):
+    await write(db, "a", "effect_intent", intent(first_use_at=77))
+    await write(db, "a", "effect_failed", failed(why="rejected"))
+    claim = await db.get_claim("shop", "refund", "R1")
+    assert [(a.session_id, a.number, a.idempotency_key, a.outcome) for a in claim.attempts] == [
+        ("a", 1, "q1_0", "rejected")
+    ]
+    await write(db, "b", "effect_claimed", await transfer_of(db))
+    moved = await db.get_claim("shop", "refund", "R1")
+    assert (moved.session_id, moved.status, moved.generation, moved.first_use_at) == (
+        "b",
+        "rejected",
+        0,
+        77,
+    )
+    assert moved.attempts == claim.attempts
+    await write(db, "b", "effect_intent", intent(attempt=2, rule="D2", first_use_at=77))
+    await write(db, "b", "effect_committed", committed(attempt=2, intent_seq=2))
+    final = await db.get_claim("shop", "refund", "R1")
+    assert [(a.session_id, a.number, a.outcome) for a in final.attempts] == [
+        ("a", 1, "rejected"),
+        ("b", 2, "committed"),
+    ]
+    assert final.status == "committed" and final.first_use_at == 77
+
+
+async def test_only_the_new_owner_writes_after_the_claim_moved(db):
+    await write(db, "a", "effect_intent", intent())
+    await write(db, "a", "effect_failed", failed(why="rejected"))
+    stale = await transfer_of(db)
+    await write(db, "b", "effect_claimed", stale)
+    observed = {**reference(), "attempts": [], "verdict": "absent", "reason": "LOOKUP_INCONCLUSIVE"}
+    with pytest.raises(ClaimConflict):
+        await write(db, "a", "effect_observed", observed)
+    assert await db.acquire_lease("c", "c", 30)
+    with pytest.raises(ClaimConflict):  # a transfer naming the old owner is now stale
+        await write(db, "c", "effect_claimed", stale)
+    await write(db, "b", "effect_observed", observed)
+    claim = await db.get_claim("shop", "refund", "R1")
+    assert (claim.session_id, claim.status) == ("b", "rejected")  # reconciled from b's fold
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"previous_owner": {"session_id": "other", "incarnation": "x", "record_id": "y"}},
+        {"generation": 1},
+        {"first_use_at": 5.0},
+        {"attempts": []},
+        {"request_digest": "different"},
+    ],
+    ids=["owner", "generation", "first_use", "attempts", "descriptor"],
+)
+async def test_a_claim_moves_only_while_it_matches_what_the_new_owner_read(db, change):
+    await write(db, "a", "effect_intent", intent())
+    await write(db, "a", "effect_failed", failed(why="rejected"))
+    before = await db.get_claim("shop", "refund", "R1")
+    stale = {**await transfer_of(db), **change}
+    with pytest.raises(ClaimConflict):
+        await db.append_leased(
+            "b", [Entry(kind="custom"), Entry(kind="effect_claimed", data=stale)], "b"
+        )
+    assert await db.load("b") == []  # the whole batch is refused
+    assert await db.get_claim("shop", "refund", "R1") == before
+
+
+@pytest.mark.parametrize("why", [None, "unknown", "committed"])
+async def test_only_a_rejected_or_never_sent_claim_can_be_taken_over(db, why):
+    if why is not None:
+        await write(db, "a", "effect_intent", intent())
+        if why == "committed":
+            await write(db, "a", "effect_committed", committed())
+        else:
+            await write(db, "a", "effect_failed", failed(why=why))
+        payload = await transfer_of(db)
+    else:
+        payload = claimed()
+    with pytest.raises(ClaimConflict):
+        await write(db, "b", "effect_claimed", payload)
+    assert await db.load("b") == []
+
+
+@pytest.mark.parametrize("why", ["rejected", "not_sent"])
+async def test_a_transfer_moves_a_claim_only_under_the_status_it_read(db, why):
+    """AF-2 recheck: a claim whose last attempt was never sent moves too, so a record in
+    R(n) can take it back; the status it names is compared like the rest of the claim."""
+    await write(db, "a", "effect_intent", intent(first_use_at=77))
+    await write(db, "a", "effect_failed", failed(why=why))
+    before = await db.get_claim("shop", "refund", "R1")
+    assert before.status == why
+    other = "not_sent" if why == "rejected" else "rejected"
+    with pytest.raises(ClaimConflict):
+        await write(db, "b", "effect_claimed", await transfer_of(db, status=other))
+    assert await db.load("b") == []
+    assert await db.get_claim("shop", "refund", "R1") == before
+
+    await write(db, "b", "effect_claimed", await transfer_of(db, status=why))
+    moved = await db.get_claim("shop", "refund", "R1")
+    assert (moved.session_id, moved.generation, moved.first_use_at) == ("b", 0, 77)
+    assert moved.attempts == before.attempts
+    assert moved.status == "rejected"  # reconciled from b's fold, R(n): a lookup runs first
+    observed = {**reference(), "attempts": [], "verdict": "absent", "reason": "LOOKUP_INCONCLUSIVE"}
+    with pytest.raises(ClaimConflict):  # only the new owner journals its lookup now
+        await write(db, "a", "effect_observed", observed)
+    await write(db, "b", "effect_observed", observed)

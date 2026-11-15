@@ -778,6 +778,45 @@ INTERFACES = [
     ),
     (
         "qagents.effects._kinds",
+        "ClaimAttemptData",
+        "O1",
+        "fields",
+        [
+            ("session_id", None),
+            ("number", None),
+            ("generation", None),
+            ("idempotency_key", None),
+            ("epoch", None),
+            ("store_ts", None),
+            ("outcome", "None"),
+        ],
+        False,
+    ),
+    (
+        "qagents.effects._kinds",
+        "EffectClaimedData",
+        "O1",
+        "fields",
+        [
+            ("version", None),
+            ("request_digest", None),
+            ("destination_digest", None),
+            ("request", None),
+            ("operation_tag", None),
+            ("receipt_identity", None),
+            ("operation_id", None),
+            ("tool_call_id", None),
+            ("previous_owner", None),
+            ("status", None),
+            ("generation", None),
+            ("first_use_at", None),
+            ("attempts", None),
+            ("store_ts", None),
+        ],
+        False,
+    ),
+    (
+        "qagents.effects._kinds",
         "MemoRecordedData",
         "O1",
         "fields",
@@ -937,6 +976,7 @@ INTERFACES = [
             ("tool_call_ids", None),
             ("revision", None),
             ("resolved_by_rejected_resend", None),
+            ("claimed", "None"),
         ],
         False,
     ),
@@ -1254,6 +1294,7 @@ INTERFACES = [
             ("receipt", "None"),
             ("committed_at", "None"),
             ("updated_at", None),
+            ("attempts", "[]"),
         ],
         False,
     ),
@@ -2266,6 +2307,19 @@ INTERFACES = [
         [("self", "POSITIONAL_OR_KEYWORD", None), ("fields", "POSITIONAL_OR_KEYWORD", None)],
         False,
     ),
+    # Added by AF-3 (interface-changes.md): the check rule D5 needs before an operator resend.
+    (
+        "qagents.permissions",
+        "Permissions.verify_settlement",
+        "O4b",
+        "call",
+        [
+            ("self", "POSITIONAL_OR_KEYWORD", None),
+            ("fields", "POSITIONAL_OR_KEYWORD", None),
+            ("mac", "POSITIONAL_OR_KEYWORD", None),
+        ],
+        False,
+    ),
     (
         "qagents.permissions",
         "arguments_digest",
@@ -2842,4 +2896,47 @@ SEAMS = [
     ("M45", "qagents.effects._engine._require_claims", "O2"),
     ("M46", "qagents.session.SQLiteStore._delete", "O3"),
     ("M47", "qagents.session.Lease.sends_drained", "O3"),
+    # Added by AF-1 (interface-changes.md): the transport-level no-answer guard of SPEC 5.1.
+    ("M48", "qagents.effects._declare._no_answer", "O1"),
+    ("M49", "qagents.effects._engine._lookup_state", "O2"),
+    # Added by AF-3 (interface-changes.md): an operator resend is checked before any row sends.
+    ("M50", "qagents.effects._engine._resend_verified", "O2"),
+    # Added by AF-5 (interface-changes.md): the build warns when no secret signs approvals.
+    ("M51", "qagents.permissions.Permissions._asks_by_rule", "O4b"),
+    # Added by the AF-1 re-fix (interface-changes.md): the no-answer guard reads the chain.
+    ("M52", "qagents.effects._declare._error_links", "O1"),
+    # Added by the AF-1 re-fix: an error after the engine's deadline cancel is the timeout.
+    ("M53", "qagents.effects._engine._cancelled_at_deadline", "O2"),
+    # Added by the AF-1 re-fix: the one definition of the no-answer set.
+    ("M54", "qagents.effects._declare._no_answer_types", "O1"),
+    # Added by the AF-2 re-fix: a rejected claim moves only when the self-fence passes.
+    ("M55", "qagents.effects._engine._may_move_claim", "O2"),
+    # Added by the AF-2 re-fix: a rejected record reads a claim another session took over.
+    ("M56", "qagents.effects._engine._claim_kind", "O2"),
+    # Added by the AF-2 re-fix: an inconclusive lookup holds a rejected record before D2.
+    ("M57", "qagents.effects._table._lookup_inconclusive", "O2"),
+    # Added by the AF-3 re-fix: the operator checks a resend without an unverified one.
+    ("M58", "qagents.effects._operator._answer_state", "O5"),
+    # Added by the AF-5 re-fix: an invalid decision is the hold reason only where a row sends.
+    ("M59", "qagents.effects._engine._authorization_decides", "O2"),
+    # Added by the AF-5 re-fix: the warning names only tools with an automatic re-send.
+    ("M60", "qagents.agent._resends_automatically", "O4a"),
+    # Added by the AF-5 re-fix: with can_use_tool, the build warns that a call may ask.
+    ("M61", "qagents.permissions.Permissions._callback_may_ask", "O4b"),
+    # Added by the AF-4 re-fix: a lost lease is the runtime's own cancel, counted from the mark.
+    ("M62", "qagents.runtime.AgentRuntime._stop_preparing", "O6"),
+    # Added by the AF-4 re-fix: the operator lease takes back only its own cancel.
+    ("M63", "qagents.effects._operator._take_back_cancel", "O5"),
+    # Added by the AF-1 re-fix, round 2: httpx2 and httpcore in the no-answer set (as M54).
+    ("M64", "qagents.effects._declare._no_answer_types", "O1"),
+    # Added by the AF-2 re-fix, round 2: a rejected record takes back a never-sent claim
+    # (seam as M56), and D2 keeps a key that was never sent (seam as M33).
+    ("M65", "qagents.effects._engine._claim_kind", "O2"),
+    ("M66", "qagents.effects._engine._d2_plan", "O2"),
+    # Added by the AF-3 re-fix, round 2: the operator sets aside every unverified resend
+    # (seam as M58).
+    ("M67", "qagents.effects._operator._answer_state", "O5"),
+    # Added by the AF-4 re-fix, round 2: an error raised for the lease's own cancel is
+    # session_busy too (seam as M63).
+    ("M68", "qagents.effects._operator._take_back_cancel", "O5"),
 ]

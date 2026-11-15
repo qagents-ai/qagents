@@ -32,6 +32,10 @@ BACKENDS = [
     ),
 ]
 FAST = {"lease_ttl_s": 0.3, "heartbeat_s": 0.05}
+STEADY = {"lease_ttl_s": 30.0}
+"""A lease no loaded machine outlives by accident: a test ends it with `Backend.expire_lease`."""
+CUE = {"lease_ttl_s": 30.0, "heartbeat_s": 0.01}
+"""A lease that is lost only when its store refuses a renewal, noticed at the next heartbeat."""
 
 
 class CrashableStore(SessionStore):
@@ -286,14 +290,19 @@ class Backend:
         self.schema = f"qagents_test_{uuid.uuid4().hex[:12]}"
         self._memory: InMemoryStore | None = None
         self._opened: list[SessionStore] = []
+        self.ahead = 0.0
+        """Seconds the memory and SQLite store clocks run ahead of wall time."""
+
+    def clock(self) -> float:
+        return time.time() + self.ahead
 
     def store(self) -> SessionStore:
         if self.kind == "memory":
             # SPEC 7.7.6: legacy recovery tests deliberately use sub-second takeover.
-            self._memory = self._memory or InMemoryStore(takeover_grace_s=0.0)
+            self._memory = self._memory or InMemoryStore(clock=self.clock, takeover_grace_s=0.0)
             return self._memory
         if self.kind == "sqlite":
-            store: SessionStore = SQLiteStore(self.path, takeover_grace_s=0.0)
+            store: SessionStore = SQLiteStore(self.path, clock=self.clock, takeover_grace_s=0.0)
         else:
             from qagents.stores.postgres import PostgresStore
 
@@ -310,6 +319,27 @@ class Backend:
                     await store.aclose()
 
         run(main())
+
+    async def expire_lease(self, store: SessionStore, session_id: str) -> None:
+        """End the lease a dead worker left on ``session_id`` now, instead of waiting for it.
+
+        The memory and SQLite store clocks move past it. Postgres leases run on the
+        database's clock, so there the lease's expiry moves into the past instead.
+        """
+        if self.kind != "postgres":
+            expires = (await store.status(session_id)).lease_expires_at
+            assert expires is not None
+            self.ahead += max(expires - self.clock(), 0.0) + 1.0
+            return
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect(DSN, autocommit=True) as connection:
+            await connection.execute(
+                f'UPDATE "{self.schema}".sessions'
+                " SET lease_expires_at = clock_timestamp() - interval '1 hour'"
+                " WHERE session_id = %s",
+                (session_id,),
+            )
 
     def drop(self) -> None:
         if self.kind != "postgres":
@@ -331,7 +361,9 @@ def backend(request: pytest.FixtureRequest, tmp_path) -> Backend:
     made.drop()
 
 
-async def crash_worker(store: SessionStore, log: list[str]) -> AgentRuntime:
+async def crash_worker(
+    store: SessionStore, log: list[str], timing: dict[str, float] = FAST
+) -> AgentRuntime:
     """Worker A starts a run and dies while the receipt is being sent."""
     gate, started = asyncio.Event(), asyncio.Event()
     connection = CrashableStore(store)
@@ -340,7 +372,7 @@ async def crash_worker(store: SessionStore, log: list[str]) -> AgentRuntime:
         [receipt_agent(log, gate, started)],
         worker_id="worker-a",
         deps_factory=lambda session_id: "A",
-        **FAST,
+        **timing,
     )
     handle = await worker.start("billing", "charge and send the receipt", session_id="order-7")
     await asyncio.wait_for(started.wait(), 5)
@@ -352,7 +384,9 @@ async def crash_worker(store: SessionStore, log: list[str]) -> AgentRuntime:
     return worker
 
 
-def recovering_worker(store: SessionStore, log: list[str], name: str) -> AgentRuntime:
+def recovering_worker(
+    store: SessionStore, log: list[str], name: str, timing: dict[str, float] = FAST
+) -> AgentRuntime:
     gate, started = asyncio.Event(), asyncio.Event()
     gate.set()
     return AgentRuntime(
@@ -360,23 +394,21 @@ def recovering_worker(store: SessionStore, log: list[str], name: str) -> AgentRu
         [receipt_agent(log, gate, started, replies=["The card was charged and the receipt sent."])],
         worker_id=name,
         deps_factory=lambda session_id: name,
-        **FAST,
+        **timing,
     )
 
 
 def test_a_dead_workers_run_is_recovered_without_repeating_finished_tools(backend):
     async def check() -> None:
         log: list[str] = []
-        await crash_worker(backend.store(), log)
+        await crash_worker(backend.store(), log, STEADY)
         store = backend.store()
         status = await store.status("order-7")
         assert status.status == "running" and status.lease_owner.startswith("worker-a#")
 
-        worker = recovering_worker(store, log, "worker-b")
-        assert status.lease_expires_at is not None
-        if status.lease_expires_at - time.time() > 0.15:  # store clock; Postgres may differ
-            assert await worker.recover() == []  # the lease has not expired yet
-        await asyncio.sleep(FAST["lease_ttl_s"] + 0.1)
+        worker = recovering_worker(store, log, "worker-b", STEADY)
+        assert await worker.recover() == []  # the lease has not expired yet
+        await backend.expire_lease(store, "order-7")  # no wall-clock wait for it to run out
         (handle,) = await worker.recover()
         assert handle.resumed and handle.agent == "billing"
         result = await handle.wait()
@@ -397,9 +429,11 @@ def test_a_dead_workers_run_is_recovered_without_repeating_finished_tools(backen
 def test_two_workers_racing_to_recover_a_run_have_one_winner(backend):
     async def check() -> None:
         log: list[str] = []
-        await crash_worker(backend.store(), log)
-        await asyncio.sleep(FAST["lease_ttl_s"] + 0.1)
-        workers = [recovering_worker(backend.store(), log, f"worker-{n}") for n in "bcd"]
+        # STEADY leases: under load a sub-second lease ran out while worker A started its run
+        # (T4). The dead worker's lease is ended on purpose, so nothing races the wall clock.
+        await crash_worker(backend.store(), log, STEADY)
+        await backend.expire_lease(backend.store(), "order-7")
+        workers = [recovering_worker(backend.store(), log, f"worker-{n}", STEADY) for n in "bcd"]
         found = await asyncio.gather(*[worker.recover() for worker in workers])
         handles = [handle for handles in found for handle in handles]
         assert len(handles) == 1
@@ -595,6 +629,10 @@ async def test_a_worker_that_loses_its_lease_stops_and_cannot_write():
     entries = len(await store.load("s"))
     with pytest.raises(RunInterrupted, match="lost its lease"):
         await asyncio.wait_for(handle.wait(), 5)
+    # Once launched, a lost lease cancels the runtime's own task, never the caller's.
+    caller = asyncio.current_task()
+    assert caller is not None and caller.cancelling() == 0
+    assert handle._task is not None and handle._task.cancelled()
     gate.set()
     await asyncio.sleep(0.05)
     assert len(await store.load("s")) == entries  # w1 wrote nothing after losing the lease
@@ -1361,7 +1399,7 @@ async def test_renewal_errors_stop_the_run_at_its_last_confirmed_deadline(failur
         await runtime.shutdown(timeout_s=0)
 
 
-async def test_unconfirmed_lease_also_cancels_preparation():
+async def test_unconfirmed_lease_also_stops_preparation_with_a_lease_error():
     class UnreachableRenewal(InMemoryStore):
         async def renew_lease(self, session_id, owner, ttl):
             raise ConnectionError("renewal unavailable")
@@ -1377,13 +1415,250 @@ async def test_unconfirmed_lease_also_cancels_preparation():
     runtime = AgentRuntime(UnreachableRenewal(), [echo_agent()], deps_factory=deps, **FAST)
     starting = asyncio.create_task(runtime.start("worker", "go", session_id="s"))
     try:
-        done, _ = await asyncio.wait([starting], timeout=1)
-        assert starting in done and starting.cancelled()
+        done, _ = await asyncio.wait([starting], timeout=5)
+        assert starting in done and not starting.cancelled()
+        assert isinstance(starting.exception(), LeaseError)  # not the runtime's own cancel
+        assert starting.cancelling() == 0
         assert stopped.is_set()
     finally:
         starting.cancel()
         await asyncio.gather(starting, return_exceptions=True)
         await runtime.shutdown(timeout_s=0)
+
+
+class LosesLeaseOnCue(InMemoryStore):
+    """Renews leases until ``refused`` is set, then refuses, as after a takeover.
+
+    ``stall`` names an entry kind: the first leased write with one sets ``refused`` and
+    waits, writing nothing, until it is cancelled. The identical retry goes through.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refused = False
+        self.stall: str | None = None
+
+    async def renew_lease(self, session_id, owner, ttl_s):
+        if self.refused:
+            return False
+        return await super().renew_lease(session_id, owner, ttl_s)
+
+    async def append_leased(self, session_id, entries, owner):
+        if self.stall is not None and any(entry.kind == self.stall for entry in entries):
+            self.stall, self.refused = None, True
+            await asyncio.Event().wait()
+        return await super().append_leased(session_id, entries, owner)
+
+
+def open_run(agent: str = "worker") -> list[Entry]:
+    """The journal of a run that started and was never finished."""
+    return [
+        Entry(kind="run_started", run_id="r", data={"agent": agent}),
+        Entry(kind="message", run_id="r", data={"message": Message.user("go").model_dump()}),
+    ]
+
+
+@pytest.mark.parametrize("phase", ["start", "resume", "start_journaled"])
+async def test_a_lease_lost_while_the_run_is_prepared_raises_lease_error(phase):
+    store = LosesLeaseOnCue()
+    stopped = asyncio.Event()
+
+    async def deps(session_id: str) -> None:
+        store.refused = True  # another worker takes the session over meanwhile
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    if phase == "resume":
+        await store.append("s", open_run())
+    journaled = phase == "start_journaled"
+    if journaled:  # lost after the run is journaled, while its limits are written
+        store.stall = LIMITS_KIND
+    runtime = AgentRuntime(store, [echo_agent()], deps_factory=None if journaled else deps, **CUE)
+    before = [entry.kind for entry in await store.load("s")]
+    caller = asyncio.current_task()
+    assert caller is not None
+    outcome: BaseException | None = None
+    try:
+        async with asyncio.timeout(5):
+            if phase == "resume":
+                await runtime.resume("s")
+            else:
+                limits = Limits(max_turns=3) if journaled else None
+                await runtime.start("worker", "go", session_id="s", limits=limits)
+    except BaseException as raised:  # a CancelledError too: that was the bug
+        outcome = raised
+    assert isinstance(outcome, LeaseError), repr(outcome)
+    assert "while it prepared the run" in str(outcome)
+    assert caller.cancelling() == 0  # the runtime took its own cancel back
+    await asyncio.sleep(0)  # and the caller goes on as usual
+    assert runtime.handles == {}
+    status = await store.status("s")
+    assert status.lease_owner is None  # released: recover() need not wait for it to expire
+    kinds = [entry.kind for entry in await store.load("s")]
+    if phase == "start":
+        assert stopped.is_set() and kinds == [] and status.status == "idle"
+    elif phase == "resume":
+        assert stopped.is_set() and kinds == before and status.status == "running"
+    else:  # the run was journaled: it stays open, and recover() resumes it
+        assert {"run_started", "message", LIMITS_KIND} <= set(kinds)
+        assert status.status == "running"
+        store.refused = False
+        other = AgentRuntime(store, [echo_agent()], worker_id="other")
+        (handle,) = await other.recover()
+        assert (await handle.wait()).text == "answering: go"
+        await other.shutdown()
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize("lease_lost_too", [False, True])
+async def test_an_outside_cancel_during_start_still_propagates(lease_lost_too):
+    store = LosesLeaseOnCue()
+    preparing = asyncio.Event()
+
+    async def deps(session_id: str) -> None:
+        preparing.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if lease_lost_too:  # the lease is lost as well before start() ends
+                store.refused = True
+                await asyncio.Event().wait()  # the runtime's own cancel ends this wait
+            raise
+
+    runtime = AgentRuntime(store, [echo_agent()], deps_factory=deps, **CUE)
+    starting = asyncio.create_task(runtime.start("worker", "go", session_id="s"))
+    async with asyncio.timeout(5):
+        await preparing.wait()
+        starting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await starting
+    assert starting.cancelled()
+    assert starting.cancelling() == 1  # the outside cancel stays; only the runtime's is gone
+    status = await store.status("s")
+    assert status.lease_owner is None and await store.load("s") == []
+    assert runtime.handles == {}
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize("entry", ["start", "recover"])
+async def test_an_older_cancel_request_on_the_caller_does_not_hide_a_lost_lease(entry):
+    """A cancel the caller caught earlier without ``uncancel()`` still counts in its
+    ``cancelling()``. It is not a cancel of this preparation from outside (AF-4 review)."""
+    store = LosesLeaseOnCue()
+    if entry == "recover":
+        await store.append("s", open_run())
+
+    async def deps(session_id: str) -> None:
+        store.refused = True  # another worker takes the session over meanwhile
+        await asyncio.Event().wait()
+
+    runtime = AgentRuntime(store, [echo_agent()], deps_factory=deps, **CUE)
+
+    async def caller() -> tuple[object, int]:
+        me = asyncio.current_task()
+        assert me is not None
+        me.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass  # caught without uncancel(): the request stays counted
+        assert me.cancelling() == 1
+        try:
+            async with asyncio.timeout(5):
+                if entry == "start":
+                    return await runtime.start("worker", "go", session_id="s"), me.cancelling()
+                return await runtime.recover(), me.cancelling()
+        except BaseException as raised:  # a CancelledError too: that was the bug
+            return raised, me.cancelling()
+
+    outcome, cancelling = await asyncio.create_task(caller())
+    if entry == "start":
+        assert isinstance(outcome, LeaseError), repr(outcome)
+        assert "while it prepared the run" in str(outcome)
+    else:
+        assert outcome == [], repr(outcome)  # recover() passes the session over
+    assert cancelling == 1  # the runtime took back its own cancel, not the older one
+    status = await store.status("s")
+    assert status.lease_owner is None
+    assert runtime.handles == {}
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize("phase", ["start", "resume"])
+async def test_an_error_raised_for_the_runtimes_cancel_still_reports_the_lost_lease(phase):
+    """Preparation code that turns the runtime's cancel into its own error does not hide
+    why the run did not start: the caller gets LeaseError, caused by that error (AF-4)."""
+    store = LosesLeaseOnCue()
+
+    class DepsUnavailable(Exception):
+        pass
+
+    async def deps(session_id: str) -> None:
+        store.refused = True  # another worker takes the session over meanwhile
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancel:
+            raise DepsUnavailable("pool closed") from cancel
+
+    if phase == "resume":
+        await store.append("s", open_run())
+    before = [entry.kind for entry in await store.load("s")]
+    runtime = AgentRuntime(store, [echo_agent()], deps_factory=deps, **CUE)
+    caller = asyncio.current_task()
+    assert caller is not None
+    outcome: BaseException | None = None
+    try:
+        async with asyncio.timeout(5):
+            if phase == "resume":
+                await runtime.resume("s")
+            else:
+                await runtime.start("worker", "go", session_id="s")
+    except BaseException as raised:
+        outcome = raised
+    assert isinstance(outcome, LeaseError), repr(outcome)
+    assert "while it prepared the run" in str(outcome)
+    assert isinstance(outcome.__cause__, DepsUnavailable)
+    assert caller.cancelling() == 0
+    assert runtime.handles == {}
+    status = await store.status("s")
+    assert status.lease_owner is None
+    assert [entry.kind for entry in await store.load("s")] == before
+    assert status.status == ("running" if phase == "resume" else "idle")
+    await runtime.shutdown()
+
+
+async def test_a_lease_lost_while_a_recovery_is_prepared_leaves_run_forever_polling():
+    store = LosesLeaseOnCue()
+    await store.append("s", open_run())
+    attempts = 0
+    third = asyncio.Event()
+
+    async def deps(session_id: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 3:
+            third.set()
+        store.refused = True
+        await asyncio.Event().wait()
+
+    runtime = AgentRuntime(store, [echo_agent()], deps_factory=deps, **CUE)
+    caller = asyncio.current_task()
+    assert caller is not None
+    async with asyncio.timeout(5):
+        assert await runtime.recover() == []  # not a CancelledError
+    assert caller.cancelling() == 0
+    status = await store.status("s")
+    assert (status.status, status.lease_owner) == ("running", None)
+    assert [entry.kind for entry in await store.load("s")] == ["run_started", "message"]
+
+    polling = asyncio.create_task(runtime.run_forever(poll_interval_s=0.01))
+    async with asyncio.timeout(5):
+        await third.wait()  # run_forever polled again after its first poll lost the lease
+    assert not polling.done()
+    await runtime.shutdown(timeout_s=0)
+    await asyncio.wait_for(polling, 5)
 
 
 async def test_reused_worker_name_cannot_share_or_renew_another_acquisition():

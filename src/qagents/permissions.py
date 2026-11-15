@@ -212,8 +212,16 @@ class Permissions:
             on_ask: Answers "ask" decisions in-process. Without it the run pauses.
             approval_secret: Signs every pause, so that ``agent.resume`` accepts
                 only answers that carry the pause's token, for calls the journal
-                still records unchanged. Use at least 16 random bytes, for
-                example ``secrets.token_hex(32)``, and keep it out of the code.
+                still records unchanged. It also signs the approval decisions of
+                effects tools: without it no decision verifies, so rules D3 and D4
+                never re-send an effect of a tool that asks. Where one of them
+                would, an effect whose outcome is in doubt is held as
+                ``APPROVAL_UNVERIFIABLE`` until a declared lookup finds it (in the
+                run or through ``agent.recheck``) or an operator settles it. The
+                agent warns when it is built, or at run start for a toolkit's
+                tools, and names each such tool, also those ``can_use_tool`` may
+                ask about. Use at least 16 random bytes, for example
+                ``secrets.token_hex(32)``, and keep it out of the code.
             approval_ttl_s: Decision validity from the recorded store time, in seconds.
             authorize_settlement: Host policy for operator answers; may be asynchronous.
             resend_min_age_s: Minimum operator resend age, in store-clock seconds.
@@ -340,6 +348,25 @@ class Permissions:
             return None
         return hmac.new(self._approval_key, jcs(dict(fields)), hashlib.sha256).hexdigest()
 
+    def verify_settlement(self, fields: Mapping[str, JSONValue], mac: str | None) -> bool:
+        """Whether ``mac`` signs these settlement fields under the ``approval_secret``.
+
+        Takes the fields that `sign_settlement` signs. Always false without an
+        ``approval_secret``, for a ``mac`` that is not an ASCII string, and for
+        fields that have no canonical JSON. The engine checks an operator
+        ``resend`` with it before rule D5 sends.
+        """
+        try:
+            expected = self.sign_settlement(fields)
+        except (TypeError, ValueError):
+            return False
+        return (
+            expected is not None
+            and isinstance(mac, str)
+            and mac.isascii()
+            and hmac.compare_digest(mac, expected)
+        )
+
     async def decide(self, ctx: RunContext[Any], tool: Tool, call: ToolCallPart) -> Decision:
         name = tool.name
         if _matches(name, self.deny):
@@ -355,6 +382,32 @@ class Permissions:
             decision = _as_decision(answer)
             if decision is not None:
                 return decision
+        return self._by_rules(tool)
+
+    def _asks_by_rule(self, tool: Tool) -> bool:
+        """Whether the patterns, the ``mode`` and ``requires_approval`` ask before ``tool`` runs.
+
+        This is the decision for a call that no ``deny`` pattern refuses and that
+        ``can_use_tool`` leaves to the rules (it is not consulted here: it decides
+        per call). The agent checks it when it is built, to warn about effects
+        tools whose approval decisions no ``approval_secret`` signs.
+        """
+        return not _matches(tool.name, self.deny) and self._by_rules(tool).behavior == "ask"
+
+    def _callback_may_ask(self, tool: Tool) -> bool:
+        """Whether ``can_use_tool`` may lead to an "ask" before ``tool`` runs.
+
+        It decides per call, before the ``ask`` patterns and the mode, so the build cannot
+        tell: any call that no ``deny`` pattern refuses first may be asked, by the callback
+        or by the rules it leaves the call to. False without ``can_use_tool``. The agent
+        checks it when it is built, as `_asks_by_rule` without a callback.
+        """
+        return self.can_use_tool is not None and not _matches(tool.name, self.deny)
+
+    def _by_rules(self, tool: Tool) -> Decision:
+        """Steps 3 to 5 of the order: the ``ask`` and ``allow`` patterns, then the mode
+        (under ``"default"``, ``requires_approval``)."""
+        name = tool.name
         if _matches(name, self.ask):
             return Decision(behavior="ask", reason="an ask rule matches this tool.")
         if _matches(name, self.allow):

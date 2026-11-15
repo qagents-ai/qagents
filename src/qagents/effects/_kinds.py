@@ -24,6 +24,7 @@ KIND_EFFECT_SEND_ENDED = "effect_send_ended"
 KIND_EFFECT_OBSERVED = "effect_observed"
 KIND_EFFECT_SETTLED = "effect_settled"
 KIND_EFFECT_CONFLICT = "effect_conflict"
+KIND_EFFECT_CLAIMED = "effect_claimed"  # [additive] a claim moved to this session (7.10)
 KIND_MEMO_RECORDED = "memo_recorded"
 KIND_RUN_RESUMED = "run_resumed"
 KIND_WORKFLOW_STEP_STARTED = "workflow_step_started"
@@ -37,6 +38,7 @@ EFFECT_KINDS = frozenset(
         KIND_EFFECT_OBSERVED,
         KIND_EFFECT_SETTLED,
         KIND_EFFECT_CONFLICT,
+        KIND_EFFECT_CLAIMED,
     }
 )
 STATUS_CHANGING_KINDS = frozenset(
@@ -46,6 +48,7 @@ STATUS_CHANGING_KINDS = frozenset(
         KIND_EFFECT_FAILED,
         KIND_EFFECT_SETTLED,
         KIND_EFFECT_CONFLICT,
+        KIND_EFFECT_CLAIMED,
     }
 )
 LIFECYCLE_KINDS = frozenset(
@@ -219,6 +222,42 @@ class EffectConflictData(EffectRefData):
     detail: str | None = None
 
 
+class ClaimAttemptData(_Data):  # [additive] one attempt of a claim's history, by any owner
+    session_id: str
+    number: int
+    generation: int
+    idempotency_key: str
+    epoch: int | None
+    store_ts: float
+    outcome: Literal["committed", "rejected", "unknown", "not_sent"] | None = None
+
+
+class EffectClaimedData(EffectRefData):
+    """[additive] A rejected claim moves to this record before any lookup or send (SPEC 7.10).
+
+    It carries what the lookup must ask the destination about: the frozen request and its
+    operation tag, and every earlier attempt with its idempotency key. The claim index
+    accepts it only while the claim still matches ``previous_owner``, ``status``,
+    ``generation`` and ``attempts`` exactly. ``status`` is ``"not_sent"`` when a record
+    in R(n) takes back a claim whose last owner's attempt was never sent.
+    """
+
+    version: str
+    request_digest: str
+    destination_digest: str
+    request: dict[str, JSONValue]
+    operation_tag: str
+    receipt_identity: list[str] | None
+    operation_id: str  # the call that took the claim; it is not one of the record's own attempts
+    tool_call_id: str | None
+    previous_owner: dict[str, str]  # {session_id, incarnation, record_id}
+    status: Literal["rejected", "not_sent"]  # the claim's status when it was read
+    generation: int
+    first_use_at: float
+    attempts: list[ClaimAttemptData]
+    store_ts: float
+
+
 class MemoRecordedData(_Data):
     operation_id: str
     name: str
@@ -315,6 +354,20 @@ APPROVAL_MAC_FIELDS = (
     "decided_at",
     "expires_at",
 )  # SPEC 7.5
+
+
+def settlement_mac_fields(session_id: str, kind: str, data: dict[str, Any]) -> dict[str, Any]:
+    """What an operator answer's MAC signs (SPEC 5.3): the session id, the entry kind
+    (``effect_settled``, or ``effect_committed`` for ``via=operator``) and every journaled
+    data field except ``mac``. The operator signs these fields. With approval_secret, a
+    pending ``resend`` is verified against them before a run sends, and every journaled
+    ``resend`` before the operator path accepts another one; the other answers authorize
+    no send and are not checked when they are used."""
+    return {
+        "session_id": session_id,
+        "kind": kind,
+        "data": {name: value for name, value in data.items() if name != "mac"},
+    }
 
 
 def lease_entry_id(owner_token: str) -> str:

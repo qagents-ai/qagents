@@ -9,7 +9,7 @@ import pytest
 from qagents.effects._fold import EffectView, fold_effects
 from qagents.effects._types import HoldReason
 
-from ._samples import committed, failed, intent, reference
+from ._samples import claim_attempt, claimed, committed, failed, intent, reference
 
 
 def entry(seq, kind, data=None, *, run="run", identity=None, ts=90000.0):
@@ -455,3 +455,123 @@ def test_record_id_lookup_refuses_collisions_and_does_not_guess():
     assert view.by_record_id("missing") is None
     with pytest.raises(ValueError, match="ambiguous"):
         view.by_record_id(reference()["record_id"])
+
+
+def lookup_commit(**changes):
+    return committed(attempt=None, intent_seq=None, via="lookup", found_tag="op1_refund", **changes)
+
+
+def test_claim_transfer_folds_to_the_rejection_it_carries():
+    transfer = claimed(generation=2, first_use_at=77.0)
+    op = operation(
+        [
+            entry(
+                1,
+                "lease_acquired",
+                {"epoch": 1, "acquired_at": 1.0, "worker": "w", "purpose": "run"},
+            ),
+            entry(2, "effect_claimed", transfer),
+        ]
+    )
+    assert (op.state, op.generation, op.first_use_at, op.revision) == ("R", 2, 77.0, 2)
+    assert (
+        op.request == transfer["request"]
+        and op.descriptor.request_digest == transfer["request_digest"]
+    )
+    assert op.attempts == [] and op.operation_ids == []  # the taking call has not sent
+    assert [a.idempotency_key for a in op.claimed.attempts] == ["q1_2"]
+    assert op.claimed.model_extra["seq"] == 2
+    [record] = fold_effects([entry(2, "effect_claimed", transfer)]).records("session")
+    assert record.status == "rejected" and record.attempts == ()
+
+
+@pytest.mark.parametrize(
+    "later, state",
+    [
+        ([entry(3, "effect_intent", intent(attempt=2, rule="D2"))], "D"),
+        (
+            [
+                entry(3, "effect_intent", intent(attempt=2, rule="D2")),
+                entry(4, "effect_failed", failed(attempt=2, intent_seq=3, why="not_sent")),
+            ],
+            "R",
+        ),
+        ([entry(3, "effect_intent", intent(attempt=2, generation=1, rule="D2"))], "D"),
+        (
+            [
+                entry(3, "effect_intent", intent(attempt=2, generation=1, rule="D2")),
+                entry(4, "effect_failed", failed(attempt=2, intent_seq=3, why="not_sent")),
+            ],
+            "N",
+        ),
+        ([entry(3, "effect_committed", lookup_commit())], "C"),
+    ],
+    ids=["d2_sent", "d2_not_sent", "next_generation", "next_generation_not_sent", "found"],
+)
+def test_transferred_rejection_counts_only_for_its_generation(later, state):
+    op = operation([entry(2, "effect_claimed", claimed()), *later])
+    assert op.state == state and not op.findings
+
+
+def test_a_claim_taken_back_after_an_unsent_d2_folds_to_a_rejection_of_its_generation():
+    """AF-2 recheck: a rejected record takes back a claim whose last owner never sent its D2
+    (generation 1), so its fold is R(1), with every earlier attempt for the lookup."""
+    history = [
+        claim_attempt(session_id="one", number=1, generation=0),
+        claim_attempt(session_id="two", number=2, generation=1, outcome="not_sent"),
+    ]
+    back = claimed(status="not_sent", generation=1, attempts=history)
+    entries = [
+        entry(1, "effect_intent", intent()),
+        entry(2, "effect_failed", failed(why="rejected")),
+        entry(3, "effect_claimed", back),
+    ]
+    op = operation(entries)
+    assert (op.state, op.generation, op.revision) == ("R", 1, 3) and not op.findings
+    assert op.claimed.status == "not_sent"
+    assert [(a.number, a.outcome) for a in op.claimed.attempts] == [
+        (1, "rejected"),
+        (2, "not_sent"),
+    ]
+    [record] = fold_effects(entries).records("session")
+    assert record.status == "rejected"
+
+
+def test_lookup_commit_without_an_attempt_needs_a_claim_transfer():
+    assert operation([entry(1, "effect_committed", lookup_commit())]).state == "X"
+    op = operation(
+        [entry(1, "effect_claimed", claimed()), entry(2, "effect_committed", lookup_commit())]
+    )
+    assert op.state == "C" and op.commit_seq == 2 and op.via == "lookup"
+
+
+def test_claim_transfer_with_another_descriptor_conflicts_with_the_intent():
+    op = operation(
+        [
+            entry(1, "effect_claimed", claimed()),
+            entry(2, "effect_intent", intent(attempt=2, request_digest="other", rule="D2")),
+        ]
+    )
+    assert op.state == "X" and op.findings[0].what == "descriptor"
+    assert op.findings[0].seqs == [1, 2]
+
+
+def test_incremental_and_batch_folds_match_every_prefix_of_a_transfer():
+    entries = [
+        entry(1, "effect_claimed", claimed()),
+        entry(2, "effect_observed", {**reference(), "attempts": [], "verdict": "absent"}),
+        entry(3, "effect_intent", intent(attempt=2, rule="D2")),
+        entry(4, "effect_failed", failed(attempt=2, intent_seq=3)),
+        entry(5, "effect_committed", committed(attempt=2, intent_seq=3)),
+    ]
+    view = EffectView()
+    for index, item in enumerate(entries):
+        view.apply(item)
+        assert asdict(view) == asdict(fold_effects(entries[: index + 1]))
+    assert [fold_effects(entries[:n]).get("shop", "refund", "R1").state for n in range(1, 6)] == [
+        "R",
+        "R",
+        "D",
+        "D",
+        "C",
+    ]

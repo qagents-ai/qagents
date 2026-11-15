@@ -1,10 +1,15 @@
 """Public crash exploration over a real Agent and destination observations."""
 
+import re
+
+import pytest
+
 from qagents import Agent, RunContext, tool
-from qagents.effects import Attempt, Dedupe, EffectContext, Key, Settle, effect
+from qagents.effects import Absent, Attempt, Dedupe, EffectContext, Found, Key, Settle, effect
+from qagents.errors import EffectRejected
 from qagents.models.recording import RecordingModel
 from qagents.models.testing import ScriptedModel, call
-from qagents.session import Entry
+from qagents.session import Entry, Session
 from qagents.testing.crash import Cassette, FakeStripeRefunds, Faults, assert_recovers, crash_test
 
 from .test_engine_dispatch import Receipt, Request
@@ -264,3 +269,132 @@ async def test_held_effect_refuses_a_competing_run_resume_and_settlement(tmp_pat
         assert point.verdict == "safe", report.explain(point.id)
         assert point.outcome == "completed_as_reference", report.explain(point.id)
         assert len(point.execution.applications) == 1
+
+
+class _Declined(Exception):
+    """The fixture destination's definite refusal, listed in rejected_on."""
+
+
+class _DeclineFirstRefunds:
+    """Refuses the first refund (the customer's card), then applies; found by operation tag."""
+
+    mutating = frozenset({"refunds.create"})
+    contract_errors = {
+        "changed_params": lambda: _Declined("changed payload"),
+        "concurrent": lambda: _Declined("concurrent"),
+        "duplicate": lambda: _Declined("duplicate"),
+    }
+
+    def __init__(self, *, clock, keys):
+        self.clock, self.keys = clock, keys
+        self.refunds = self
+        self.rows = []
+        self.calls = 0
+
+    async def create(self, order, tag, idempotency_key=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise _Declined("card declined")
+        row = Receipt(id=f"re-{len(self.rows) + 1}")
+        self.rows.append((tag, row))
+        return row.model_copy(deep=True)
+
+    async def pages(self):
+        yield [(tag, row.model_copy(deep=True)) for tag, row in self.rows]
+
+
+def _transfer_build(env):
+    @effect(
+        "shared.refund",
+        key=Key("request", "id"),
+        namespace="shop",
+        timeout_s=2,
+        dedupe=Dedupe(3600, contract="offline fixture", concurrent="waits"),
+        rejected_on=(_Declined,),
+    )
+    async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+        return await ctx.deps.refunds.create(
+            attempt.request.id, attempt.operation_tag, attempt.idempotency_key
+        )
+
+    @send.lookup
+    async def find(ctx, inquiry):
+        async for page in ctx.deps.refunds.pages():
+            for tag, row in page:
+                if tag == inquiry.operation_tag:
+                    return Found(row, tag=tag)
+        return Absent()
+
+    @tool(effects=[send])
+    async def refund(ctx: RunContext, id: str) -> str:
+        """Refund the fixture order."""
+        try:
+            return (await ctx.perform(send, Request(id=id))).id
+        except EffectRejected:
+            return "declined"
+
+    return Agent(env.model, tools=[refund]), env.service(send, _DeclineFirstRefunds)
+
+
+async def _after_an_earlier_session(env, agent, deps):
+    """Session "earlier" is refused first; then the crash-test session performs the same key.
+
+    The earlier session has its own offline model, so the ledger sees only the main run.
+    """
+    earlier = Session(env.store, id="earlier")
+    if (await env.store.status("earlier")).open_run_id is not None:
+        env.clock.advance(120)  # the dead leg's lease on the earlier session expires
+        await Agent(ScriptedModel(["Done."]), tools=list(agent.tools)).resume(earlier, deps=deps)
+    elif not await env.store.load("earlier"):
+        model = ScriptedModel([call("refund", id="R1"), "Done."])
+        await Agent(model, tools=list(agent.tools)).run("Refund", session=earlier, deps=deps)
+    main = Session(env.store, id=env.session_id)
+    if (await env.store.status(env.session_id)).open_run_id is not None:
+        return await agent.resume(main, deps=deps)
+    return await agent.run("Refund", session=main, deps=deps)
+
+
+@pytest.mark.parametrize("store", ["memory", "sqlite"])
+async def test_crash_at_each_step_of_a_claim_transfer_recovers_with_one_application(
+    tmp_path, store
+):
+    report = await crash_test(
+        _transfer_build,
+        "Refund",
+        directory=tmp_path,
+        store=store,
+        model=[call("refund", id="R1"), "Complete."],
+        faults=Faults.parse("kill_before,kill_after"),
+        transport="client",
+        points="effects",
+        scenario=_after_an_earlier_session,
+    )
+    reference = report.points[0]
+    final = [
+        Entry.model_validate_json(raw) for raw in reference.execution.final_snapshot.entries_json
+    ]
+    assert [e.kind for e in final if e.kind.startswith("effect_")] == [
+        "effect_claimed",
+        "effect_observed",
+        "effect_intent",
+        "effect_committed",
+    ]
+    # The new journal step is a crash point, and so is the lookup it leads to before D2.
+    taken = [p for p in report.points if "effect_claimed" in p.id]
+    assert taken, [p.id for p in report.points]
+    first = min(p.execution.point.plans[0].index for p in taken)
+    main = [
+        p
+        for p in report.points[1:]
+        if p.execution.point.plans and p.execution.point.plans[0].index >= first
+    ]
+    labels = "~".join(p.id for p in taken)
+    assert re.search(r"(^|~)before\(\d+\)/effect_claimed", labels), labels
+    assert re.search(r"(^|~)after\(\d+\)/effect_claimed", labels), labels
+    assert any("effect_observed" in p.id for p in main)
+    for point in [reference, *main]:
+        assert point.verdict == "safe", report.explain(point.id)
+        assert point.outcome == "completed_as_reference", report.explain(point.id)
+    # No point applies twice. (Points inside the earlier session are judged against the
+    # crash-test session's journal only, so their binding checks cannot see that session.)
+    assert all(len(p.execution.applications) == 1 for p in report.points), report.explain()

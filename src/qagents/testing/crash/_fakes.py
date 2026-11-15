@@ -13,6 +13,7 @@ from typing import Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, ValidationError
 
+from qagents.effects import _declare
 from qagents.effects._canonical import digest
 from qagents.effects._declare import Dedupe, Effect, Unique
 from qagents.effects._types import Absent, Attempt, Found, Inquiry, NotYetVisible
@@ -345,7 +346,10 @@ class ContractFake:
                     if isinstance(error, asyncio.CancelledError)
                     else error
                 )
-                rejected = isinstance(error, (EffectRejected, *self.effect.rejected_on))
+                # A transport-level no answer is an error, never a rejection (SPEC 5.1).
+                rejected = not _declare._no_answer(error) and isinstance(
+                    error, (EffectRejected, *self.effect.rejected_on)
+                )
                 cached.retain_error = (
                     isinstance(contract, Dedupe)
                     and (contract.replays_rejections if rejected else contract.replays_errors)

@@ -206,6 +206,97 @@ def _lookup_at_end(original, started, quiescent):
     return quiescent is not None
 
 
+def _local_attempts_only(original, effect, op):
+    # fable-3: only this record's own attempts let the lookup run, not a transferred claim's.
+    return "none_declared" if not op.attempts else original(effect, op)
+
+
+def _raised_error_only(original, error):
+    # AF-1 review: only the raised error's own class counts, not its cause or context.
+    return iter((error,))
+
+
+def _cancellation_only(original, effect, timed_out, error):
+    # AF-1 review: the old rule, where only a CancelledError after the deadline is the timeout.
+    import asyncio
+
+    return timed_out and isinstance(error, asyncio.CancelledError)
+
+
+def _first_set_only(original):
+    # AF-1 review: the set before it held responses cut short and client-library types.
+    return original()[:5]
+
+
+def _without_httpx2(original):
+    # AF-1 recheck: the set without httpx2 (anthropic>=2.8, mcp>=2.3) and httpcore.
+    dropped = ("httpx2", "httpcore", "httpcore2")
+    return tuple(kind for kind in original() if kind.__module__.split(".")[0] not in dropped)
+
+
+def _lease_kept_only(original, journal, effect):
+    # AF-2 review: the claim moved whenever the lease was not lost, without the self-fence.
+    return not journal.lease.lost()
+
+
+def _rejected_reads_no_claim(original, op, claim, prepared, session_id):
+    # AF-2 review: a rejected record never read the claim again, so a moved claim locked it out.
+    return "own" if op.state == "R" else original(op, claim, prepared, session_id)
+
+
+def _unsent_claim_held_elsewhere(original, op, claim, prepared, session_id):
+    # AF-2 recheck: a rejected record held a claim the other owner never sent, so after a
+    # taker's D2 ended not_sent the owner's retry was held CLAIMED_ELSEWHERE for good.
+    kind = original(op, claim, prepared, session_id)
+    return "held_elsewhere" if kind == "not_sent" and op.state == "R" else kind
+
+
+def _every_replayed_rejection_changes_key(original, effect, op):
+    # AF-2 recheck: under replays_rejections D2 always took generation + 1, also when no
+    # attempt at the current generation had been sent.
+    from qagents.effects import Dedupe
+
+    changes = isinstance(effect.dedupe, Dedupe) and effect.dedupe.replays_rejections
+    return effect.lookup_fn is not None, op.generation + int(changes)
+
+
+def _folded_state(original, permissions, session_id, op, answer):
+    # AF-3 review: the operator path checked a resend against the folded state, so a forged
+    # resend that reopened a closed record let a real one through.
+    return op.state
+
+
+def _pending_resend_only(original, permissions, session_id, op, answer):
+    # AF-3 recheck: only the pending resend was set aside when it did not verify, so an
+    # earlier forged resend still made a closed record held for a real one.
+    from dataclasses import replace
+
+    from qagents.effects import _engine, _fold
+
+    if answer.outcome != "resend" or _engine._resend_verified(permissions, session_id, op):
+        return op.state
+    others = [item for item in op.settlements if item is not op.pending_resend]
+    return _fold._status_of(replace(op, settlements=others, pending_resend=None))
+
+
+def _count_from_zero(original, runtime, handle):
+    # AF-4 review: the caller's count was compared with 0, not with its count when the
+    # preparation began, so an older cancel request turned a lost lease into CancelledError.
+    handle._preparing_mark = 0
+    return original(runtime, handle)
+
+
+def _only_a_cancel_is_the_leases(original, owner, mark):
+    # AF-4 recheck: the cancel was taken back, but only a CancelledError became
+    # session_busy; an error that authorize_settlement raised for the lease's cancel
+    # reached the caller as that error.
+    import asyncio
+    import sys
+
+    took_back = original(owner, mark)
+    return took_back and isinstance(sys.exc_info()[1], asyncio.CancelledError)
+
+
 E = "tests/effects/test_"
 M = "tests/effects/mutants/test_scenarios.py::"
 
@@ -341,6 +432,153 @@ _ROWS = [
     (
         E + "store_writer.py::test_cancel_close_twice_never_releases_before_thread_send_drains",
         nothing,
+    ),
+    # M48: without the no-answer guard, a timeout that also derives from a declared
+    # refusal counts as rejected, and D2 re-sends it under a new key (AF-1).
+    (
+        E
+        + "engine_no_answer.py::test_no_answer_after_application_is_held_not_resent_under_a_new_key[memory-timeout_subclass]",
+        constant(False),
+    ),
+    # M49: a claim taken over from another session as rejected skips the declared lookup,
+    # and D2 applies the operation again under a new key (AF-2).
+    (
+        E
+        + "engine_claim_transfer.py::test_applied_then_rejection_shaped_error_is_found_not_applied_again[memory-True]",
+        _local_attempts_only,
+    ),
+    # M50: an operator resend is trusted without its MAC, so a forged effect_settled entry
+    # written straight to the store authorizes a D5 send (AF-3).
+    (
+        E + "engine_settlement_mac.py::test_forged_resend_is_held_and_never_sent[memory-no_mac]",
+        constant(True),
+    ),
+    # M51: the build check misses an effects tool that asks for approval, so nothing warns
+    # that, without approval_secret, its effects hold APPROVAL_UNVERIFIABLE (AF-5).
+    (
+        E
+        + "unsigned_approvals.py::test_build_warns_once_for_an_approval_gated_effects_tool_without_a_secret[requires_approval]",
+        constant(False),
+    ),
+    # M52: without the chain walk, a client's refusal type raised from an httpx timeout
+    # counts as rejected, and D2 re-sends it under a new key (AF-1 review).
+    (
+        E
+        + "engine_no_answer.py::test_no_answer_after_application_is_held_not_resent_under_a_new_key[memory-wrapped_from]",
+        _raised_error_only,
+    ),
+    # M53: a declared refusal type that an async send raises after the engine cancelled it
+    # at its deadline counts as rejected, and D2 re-sends it under a new key (AF-1 review).
+    (
+        E
+        + "engine_no_answer.py::test_refusal_raised_after_the_engine_cancelled_the_send_is_its_timeout[memory-after]",
+        _cancellation_only,
+    ),
+    # M54: the no-answer set without the standard library's responses cut short and the
+    # client libraries' transport types, so an IncompleteReadError counts as rejected.
+    (
+        E
+        + "engine_guards.py::test_a_response_cut_short_or_a_client_library_disconnect_is_unknown[IncompleteReadError]",
+        _first_set_only,
+    ),
+    # M55: a worker whose lease cannot cover a send still takes a rejected claim over, and
+    # the owner's own retry then fails with ClaimConflict (AF-2 review).
+    (
+        E
+        + "engine_claim_transfer.py::test_a_takeover_whose_self_fence_fails_journals_nothing_and_keeps_the_claim[memory]",
+        _lease_kept_only,
+    ),
+    # M56: a rejected record never reads the claim again, so after another session took
+    # the claim over and died before sending, the owner's retry fails with ClaimConflict.
+    (
+        E
+        + "engine_claim_transfer.py::test_the_owner_takes_its_claim_back_from_a_taker_that_sent_nothing[memory-False]",
+        _rejected_reads_no_claim,
+    ),
+    # M57: D2 sends after a lookup that said NotYetVisible or Unknown, so an application
+    # answered rejection-shaped is applied again under a new key (AF-2 review).
+    (
+        E
+        + "engine_claim_transfer.py::test_an_inconclusive_lookup_in_another_session_holds_instead_of_sending[memory-not_yet_visible-True]",
+        constant(False),
+    ),
+    # M58: the operator path accepts a resend on a record that only an unverified resend
+    # reopened, so D5 re-sends a not_applied record (AF-3 review).
+    (
+        E
+        + "engine_settlement_mac.py::test_forged_resend_cannot_reopen_a_record_for_an_operator_resend[memory-not_applied-1_forged]",
+        _folded_state,
+    ),
+    # M59: an unverifiable decision names the hold on every held record, also where no row
+    # would re-send, so without approval_secret an opaque effect hides RESPONSE_LOST (AF-5).
+    (
+        E
+        + "unsigned_approvals.py::test_an_effect_no_row_would_resend_holds_for_its_own_reason_without_a_secret[opaque]",
+        constant(True),
+    ),
+    # M60: the warning names an effects tool whose effects no row ever re-sends, and tells
+    # the developer that approval_secret would let them be re-sent (AF-5 review).
+    (
+        E
+        + "unsigned_approvals.py::test_an_approval_gated_effects_tool_with_no_automatic_resend_does_not_warn[opaque]",
+        constant(True),
+    ),
+    # M61: the build check ignores can_use_tool, so an effects tool that the callback sends
+    # to "ask" holds APPROVAL_UNVERIFIABLE with no warning (AF-5 review).
+    (
+        E
+        + "unsigned_approvals.py::test_build_warns_once_when_can_use_tool_may_ask_for_an_effects_tool[no_rule]",
+        constant(False),
+    ),
+    # M62: a caller that caught an older cancel without uncancel() gets the runtime's own
+    # CancelledError, not LeaseError, when its lease is lost while the run is prepared (AF-4).
+    (
+        "tests/test_runtime.py::test_an_older_cancel_request_on_the_caller_does_not_hide_a_lost_lease[start]",
+        _count_from_zero,
+    ),
+    # M63: the operator lease never takes its own cancel back and turns any CancelledError
+    # after a lost lease into session_busy, so the caller is left cancelling (AF-4 review).
+    (
+        E
+        + "settlement.py::test_a_lease_lost_while_the_operator_waits_is_session_busy_and_takes_its_cancel_back[memory-settle-False]",
+        constant(True),
+    ),
+    # M64: the no-answer set without httpx2 and httpcore, so a client's refusal type raised
+    # from httpx2's error for a server that closed without answering counts as rejected,
+    # and D2 re-sends it under a new key (AF-1 recheck).
+    (
+        E
+        + "engine_no_answer.py::test_no_answer_after_application_is_held_not_resent_under_a_new_key[memory-httpx2_wrapped_from]",
+        _without_httpx2,
+    ),
+    # M65: a rejected record holds a claim whose last owner never sent its D2, so the
+    # owner's retry holds CLAIMED_ELSEWHERE on every call, also after a delete (AF-2 recheck).
+    (
+        E
+        + "engine_claim_transfer.py::test_the_owner_takes_back_a_claim_whose_taker_never_sent_its_d2[memory-True-lookup-kept]",
+        _unsent_claim_held_elsewhere,
+    ),
+    # M66: D2 after taking back a never-sent claim skips the key the other owner chose and
+    # never sent, so the sessions retrying one business key use two keys (AF-2 recheck).
+    (
+        E
+        + "engine_claim_transfer.py::test_the_owner_takes_back_a_claim_whose_taker_never_sent_its_d2[memory-True-no_lookup-kept]",
+        _every_replayed_rejection_changes_key,
+    ),
+    # M67: the operator path sets aside only the pending resend when it does not verify, so
+    # an earlier forged resend still makes a not_applied record held, and D5 re-sends it
+    # under a genuine resend (AF-3 recheck).
+    (
+        E
+        + "engine_settlement_mac.py::test_forged_resend_cannot_reopen_a_record_for_an_operator_resend[memory-not_applied-2_forged]",
+        _pending_resend_only,
+    ),
+    # M68: an error that authorize_settlement raises for the lost lease's cancel reaches
+    # the caller as that error, not as session_busy (AF-4 recheck).
+    (
+        E
+        + "settlement.py::test_an_error_the_authorization_raises_for_the_lease_cancel_is_session_busy[memory-False]",
+        _only_a_cancel_is_the_leases,
     ),
 ]
 

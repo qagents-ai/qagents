@@ -9,7 +9,8 @@ playbook when the agent needs knowledge from earlier sessions.
 
 [Run the approval and recovery example](guides/support-review.md) ·
 [Configure a model provider](providers.md) ·
-[Connect memory and QAgent Gym](integrations/gym.md)
+[Connect memory and QAgent Gym](integrations/gym.md) ·
+[Compare with other frameworks](comparison.md)
 
 !!! warning "Status: 0.2.0, alpha"
     The offline test suite passes, including the QCloud provider driven through the real
@@ -33,6 +34,7 @@ playbook when the agent needs knowledge from earlier sessions.
 | Any ACP agent | `ACPAgent(["node", ".../bin.js", "--acp"], workspace=...)` | [Any ACP agent](integrations/acp.md) |
 | Your tools inside a coding agent | `tool_server(tools, ctx=ctx)`, `expose_tools=[...]` | [Serving tools over MCP](integrations/mcp-server.md) |
 | A multi-step job that resumes | `Workflow(store, id=...)` | [Workflows](concepts/multi-agent.md#workflows) |
+| An external write recovered after a lost response (Effects 0.3 preview, unreleased) | `@effect(...)` and `ctx.perform(...)` | [Recover an external action](guides/recover-effect.md) |
 | Traces | `hooks=[OTelHooks()]` | [Tracing](concepts/hooks.md#tracing) |
 | Tests without a model | `ScriptedModel([...])` | [Testing](testing.md) |
 | Learning loops, memory and adapter recipes | the separate QAgent Gym package | [Gym and integrations](integrations/gym.md) |

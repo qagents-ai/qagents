@@ -28,6 +28,64 @@ uses worker process termination and a separate HTTP destination. It includes
 trials with destination deduplication disabled to confirm that the benchmark
 detects duplicate credits.
 
+## Effects tools that ask for approval
+
+A tool asks for approval when it is declared `requires_approval=True`, matches
+an `ask` pattern, runs under `Permissions(mode="ask_all")`, or when your
+`can_use_tool` returns `"ask"` for the call. Its effects are sent under the
+decision a person made. When an attempt's outcome is unknown, the automatic
+re-sends need that decision again: rule D3 (the same key, inside the
+destination's dedupe window) and rule D4 (after an authoritative absence)
+send only under the original decision, and only if it verifies and has not
+expired. A decision verifies only under `Permissions(approval_secret=...)`,
+which signs the journaled decision.
+
+Only the recovery of effects that D3 or D4 can re-send depends on the secret:
+those with a `Dedupe` or `Unique` contract, or with an authoritative lookup. An effect with
+neither is never re-sent automatically, with or without the secret, and is
+held for its own reason, such as `RESPONSE_LOST`.
+
+Without `approval_secret`:
+
+- No effect of such a tool is re-sent automatically, in the same run or after
+  a crash. Where D3 or D4 would re-send it, and unless a declared lookup finds
+  it, an effect whose outcome is unknown is held with `APPROVAL_UNVERIFIABLE`
+  and no `retry_after`. Before then it keeps its own reason: an authoritative
+  absence seen too early is `NOT_YET_QUIESCENT`, with a `retry_after`.
+- The held effect waits for `agent.recheck` (its lookup) or for an operator's
+  answer through `agent.settle`: `Settle.committed`, `Settle.not_applied`,
+  `Settle.resend` or `Settle.close_unknown`.
+- A call whose effect had not started is asked again after a crash.
+- The agent logs a warning when it is built, or at run start for tools a
+  toolkit provides. It names the tools and the fix. With `can_use_tool` the
+  build cannot tell which calls ask, so the warning names every effects tool
+  that D3 or D4 can re-send and that no `deny` pattern refuses, and says it
+  may ask.
+
+```python
+import os
+
+from qagents import Permissions
+
+permissions = Permissions(approval_secret=os.environ["APPROVAL_SECRET"])
+```
+
+Give every worker and every restart the same secret: a decision signed under
+another secret does not verify either. The secret also signs paused approvals
+and operator answers; see [signed pauses](../concepts/permissions.md#signed-pauses).
+
+Two hold reasons concern the decision:
+
+| Reason | Cause | Next step |
+|---|---|---|
+| `APPROVAL_EXPIRED` | The decision is older than `approval_ttl_s` (store clock) when a re-send would go out. | Recheck, or settle as an operator. |
+| `APPROVAL_UNVERIFIABLE` | The decision does not verify: no `approval_secret`, a MAC that does not match, or an operator `resend` that does not verify. | Recheck, or settle as an operator. Set `approval_secret` for later calls. |
+
+Both reasons appear only where a re-send (D3 or D4) would otherwise go out,
+except an operator `resend` that does not verify, which is always
+`APPROVAL_UNVERIFIABLE`. A held effect never asks the person again: the first
+intent spent the decision.
+
 
 ## Run the offline crash harness
 
@@ -104,7 +162,7 @@ $env:QAGENTS_RUN_MUTATIONS = "1"
 python -m pytest -q -m mutants tests/effects/mutants
 ```
 
-Each of the 47 mutations runs in an isolated interpreter with an
+Each mutation runs in an isolated interpreter with an
 unmodified baseline. The test requires an exercised fault and an
 assertion that detects it. The suite covers runtime, store and report
 checks, including whether a reference run applied an effect.

@@ -1678,6 +1678,58 @@ def test_declared_rejection_fault_uses_the_actual_exception_class(virtual_loop):
     virtual_loop.run_until_complete(workload())
 
 
+def test_no_answer_error_after_application_is_kept_as_an_error_not_a_rejection(virtual_loop):
+    class Refused(Exception):
+        pass
+
+    class LostResponse(Refused, ConnectionResetError):
+        """A transport error whose class also derives from the declared refusal."""
+
+    world = World(virtual_loop)
+    contract = Dedupe(3600, contract="unit", replays_errors=True, replays_rejections=False)
+    fake = ContractFake(world, _refund_effect(contract, rejected_on=(Refused,)))
+
+    async def reset(receipt):
+        raise LostResponse("connection reset after the destination applied")
+
+    async def workload():
+        with pytest.raises(LostResponse):
+            await fake.send(_attempt(), leg=0, key="delivery-1", after_apply=reset)
+        assert world.count_applied(fake.effect) == 1
+        # Kept as an error response under replays_errors, never re-executed as an
+        # unsaved rejection: the same key does not apply a second time.
+        with pytest.raises(LostResponse):
+            await fake.send(_attempt(number=2), leg=1, key="delivery-1")
+        assert world.count_applied(fake.effect) == 1
+
+    virtual_loop.run_until_complete(workload())
+
+
+def test_refusal_raised_from_a_no_answer_error_is_kept_as_an_error_not_a_rejection(virtual_loop):
+    class Refused(Exception):
+        """The client's own error, which wraps the transport error it caught."""
+
+    world = World(virtual_loop)
+    contract = Dedupe(3600, contract="unit", replays_errors=True, replays_rejections=False)
+    fake = ContractFake(world, _refund_effect(contract, rejected_on=(Refused,)))
+
+    async def reset(receipt):
+        try:
+            raise ConnectionResetError("connection reset after the destination applied")
+        except ConnectionError as error:
+            raise Refused(f"payments request failed: {error}") from error
+
+    async def workload():
+        with pytest.raises(Refused):
+            await fake.send(_attempt(), leg=0, key="delivery-1", after_apply=reset)
+        assert world.count_applied(fake.effect) == 1
+        with pytest.raises(Refused):
+            await fake.send(_attempt(number=2), leg=1, key="delivery-1")
+        assert world.count_applied(fake.effect) == 1
+
+    virtual_loop.run_until_complete(workload())
+
+
 def test_unique_duplicate_response_keeps_the_one_application(virtual_loop):
     class Duplicate(Exception):
         pass
@@ -2756,6 +2808,24 @@ def test_effect_window_tracks_distinct_operations_of_same_effect():
         trace, [_refund_effect()], Faults.parse("kill_before"), points="effects"
     )
     assert [p.plans[0].index for p in points if p.plans] == [1, 2, 3, 4, 5]
+
+
+def test_effect_window_opens_at_a_claim_transfer_before_the_lookup_and_d2():
+    """A crash between the claim's move and the D2 send is an effect point (SPEC 7.10)."""
+    trace = [
+        _boundary(1),
+        _boundary(2, "effect_claimed", name="test.refund", record_id="one"),
+        _boundary(3, "effect_observed", name="test.refund", record_id="one"),
+        _boundary(4, "effect_intent", name="test.refund", record_id="one"),
+        _boundary(5, "effect_committed", name="test.refund", record_id="one"),
+        _boundary(6, "custom"),
+    ]
+    faults = Faults.parse("kill_before,stall")
+    points = reference_points(trace, [_refund_effect()], faults, points="effects")
+    kills = [p.plans[0].index for p in points if p.plans and p.plans[0].kind == "kill_before"]
+    assert kills == [2, 3, 4, 5]
+    stalls = [p.plans[0].index for p in points if p.plans and p.plans[0].kind == "stall"]
+    assert stalls == [2, 4, 5]
 
 
 def test_zero_sigma_and_unknown_concurrency_keep_distinct_stable_points():

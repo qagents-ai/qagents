@@ -188,7 +188,10 @@ HOLD_DETAIL: Mapping[HoldReason, str] = MappingProxyType(
         HoldReason.KEY_CHANGED: "The same call changed its business key; restore the original key.",
         HoldReason.VERSION_CHANGED: "Effect version changed; operator review needed.",
         HoldReason.APPROVAL_EXPIRED: "Approval expired; recheck or use an operator settlement.",
-        HoldReason.APPROVAL_UNVERIFIABLE: "Approval unverifiable; obtain a valid decision.",
+        HoldReason.APPROVAL_UNVERIFIABLE: (
+            "Approval unverifiable: no approval_secret, or no valid proof; "
+            "recheck or use an operator settlement."
+        ),
         HoldReason.LEASE: "The writer lost its lease; a current owner must recover the operation.",
         HoldReason.CONFLICT: "Conflicting journal evidence; inspect before settlement.",
         HoldReason.CLAIMED_ELSEWHERE: "Another session owns this operation; inspect its record.",
@@ -276,6 +279,13 @@ class Settle:
     def __post_init__(self) -> None:
         if self.outcome not in ("committed", "not_applied", "resend", "close_unknown"):
             raise ValueError("Unknown settlement outcome.")
+        # The operator resolves a record id by prefix (SPEC 5.3). An empty id is a prefix of
+        # every id and would settle a session's only record, so refuse it here as well as in
+        # the constructors, for an answer built directly.
+        if not isinstance(self.record_id, str):
+            raise TypeError("A settlement record id must be a string.")
+        if not self.record_id.strip():
+            raise ValueError("A settlement record id must not be empty.")
         if not isinstance(self.by, str) or not self.by.strip():
             raise ValueError("A settlement needs the asserted operator identity in by=.")
         proof = self.reason if self.outcome == "close_unknown" else self.evidence

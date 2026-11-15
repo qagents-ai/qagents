@@ -7,6 +7,7 @@ import contextlib
 import copy
 import inspect
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -14,13 +15,16 @@ from qagents import session as _session
 from qagents.errors import ConfigurationError, LeaseError, SettlementConflict
 from qagents.session import Session
 
-from . import _canonical, _engine, _kinds, _ports, _quiescence, _table
+from . import _canonical, _engine, _fold, _kinds, _ports, _quiescence, _table
 from ._declare import Effect
 from ._fold import Operation
 from ._types import MISSING, Absent, EffectRecord, Found, HeldEffect, Settle
 
 if TYPE_CHECKING:
     from qagents.permissions import Permissions
+
+# The record statuses (EffectRecord.status) a forged resend can stand on.
+_STATUS = {"N": "never attempted", "R": "rejected", "NA": "not_applied", "CU": "closed_unknown"}
 
 
 @contextlib.asynccontextmanager
@@ -43,30 +47,66 @@ async def _take_lease(
     )
     if not await writer.open():
         raise SettlementConflict(reason="session_busy")
+    # The operator works in its caller's task, so a lost lease cancels that task. Only
+    # that one cancel is the lease's own: it is taken back, and a cancel from outside
+    # propagates, counted from the caller's cancelling() now (as in the runtime).
     owner = asyncio.current_task()
-    lost = False
+    mark = 0 if owner is None else owner.cancelling()
+    lost = False  # the keeper reported the lease lost and cancelled the owner, once
+    owed = False  # that cancel is not taken back yet
 
     def on_lost(reason: str) -> None:
-        nonlocal lost
-        lost = True
-        if owner is not None:
+        nonlocal lost, owed
+        if owner is not None and not lost:
+            lost = owed = True
             owner.cancel()
+
+    def take_back() -> bool:
+        nonlocal owed
+        if not owed or owner is None:
+            return False
+        owed = False
+        return _take_back_cancel(owner, mark)
 
     keeper = asyncio.create_task(writer.keep(on_lost=on_lost))
     try:
         await writer.load()
         yield writer
     except asyncio.CancelledError:
-        if lost:
+        if take_back():  # the lease's own cancel: another worker took the session over
             raise SettlementConflict(reason="session_busy") from None
-        raise
+        raise  # a cancel from outside, with or without the lease's own
     except LeaseError as error:
         raise SettlementConflict(reason="session_busy") from error
+    except SettlementConflict:
+        raise  # the operator's own answer, also one decided after the lease's cancel was caught
+    except Exception as error:
+        # What the interrupted code (an authorize_settlement callback) raised for the
+        # lease's own cancel: the lost lease is still why nothing was written, and that
+        # error is the cause, as the runtime's LeaseError. Else it propagates as is.
+        if take_back():
+            raise SettlementConflict(reason="session_busy") from error
+        raise
     finally:
         keeper.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await keeper
-        await writer.close()
+        try:
+            await asyncio.wait([keeper])  # unlike awaiting it, lets an outside cancel through
+        finally:
+            take_back()  # a lease's cancel that the operator's code caught
+            await writer.close()
+        if not keeper.cancelled():
+            keeper.result()  # a keeper that failed fails the call, as before
+
+
+def _take_back_cancel(owner: asyncio.Task[Any], mark: int) -> bool:
+    """Take back the one cancel `_take_lease` gave ``owner`` for a lost lease.
+
+    True when no other cancel request remains (``owner.cancelling()`` is back at
+    ``mark``, its count when the lease was taken): the CancelledError, or an error the
+    operator's code raised for it, is then the lease's own and becomes
+    ``SettlementConflict(reason="session_busy")``.
+    """
+    return owner.uncancel() <= mark
 
 
 def _resolve(writer: _session.LeasedWriter, reference: str) -> Operation:
@@ -116,9 +156,37 @@ def _revision(op: Operation, answer: Settle) -> None:
         raise SettlementConflict(reason="revision")
 
 
-def _eligible(op: Operation, answer: Settle) -> None:
-    if op.state not in {"D", "X"} or (answer.outcome == "resend" and op.state != "D"):
-        raise SettlementConflict(reason="already_settled" if op.state != "X" else "refused")
+def _answer_state(permissions: Permissions, session_id: str, op: Operation, answer: Settle) -> str:
+    """The state a resend is checked against (O3r). With signed pauses, a journaled resend
+    that does not verify is no operator answer, so a new resend is checked against the
+    record's status without any such resend, the pending one and every earlier one: forged
+    resends cannot reopen a not_applied, closed_unknown or rejected record for a real one
+    (M25, M67, SPEC 5.3). The other answers send nothing, so they are checked against the
+    folded state and can close such a record again."""
+    if answer.outcome != "resend":
+        return op.state
+    kept = [
+        settlement
+        for settlement in op.settlements
+        if settlement.outcome != "resend"
+        or _engine._settlement_verified(permissions, session_id, settlement)
+    ]
+    if len(kept) == len(op.settlements):
+        return op.state
+    pending = op.pending_resend if any(item is op.pending_resend for item in kept) else None
+    return _fold._status_of(replace(op, settlements=kept, pending_resend=pending))
+
+
+def _eligible(op: Operation, answer: Settle, state: str) -> None:
+    if state not in {"D", "X"} or (answer.outcome == "resend" and state != "D"):
+        if state != op.state:  # only a resend standing on an unverified one
+            raise SettlementConflict(
+                "Settlement refused: already_settled. The record's pending resend does not "
+                "verify under approval_secret, and without the resends that do not verify "
+                f"the record is {_STATUS.get(state, state)}, so it is not resent.",
+                reason="already_settled",
+            )
+        raise SettlementConflict(reason="already_settled" if state != "X" else "refused")
 
 
 def _reach(writer: _session.LeasedWriter, op: Operation, rule: str, point: str | None) -> None:
@@ -161,7 +229,8 @@ async def settle(
     async with _take_lease(session, ttl_s=lease_ttl_s, worker=worker, purpose="settle") as writer:
         op = _resolve(writer, answer.record_id)
         _revision(op, answer)
-        _eligible(op, answer)  # C at entry is a conflict, even for a compatible receipt
+        # C at entry is a conflict, even for a compatible receipt
+        _eligible(op, answer, _answer_state(permissions, session.id, op, answer))
         op = await _findings(writer, op)
         _revision(op, answer)
         effect = _declaration(effects, op)
@@ -231,7 +300,7 @@ async def settle(
         entries = await writer.load()
         op = writer.view().get(op.namespace, op.name, op.key)
         _revision(op, answer)
-        _eligible(op, answer)
+        _eligible(op, answer, _answer_state(permissions, session.id, op, answer))
         if answer.outcome == "committed":
             patch, patch_error = _engine.on_commit_patch(
                 effect, _session.derive_state(entries).values, op.request, receipt
@@ -261,12 +330,10 @@ async def settle(
                 covers_attempts=[attempt.number for attempt in op.attempts],
             ).model_dump(mode="json")
             kind = _kinds.KIND_EFFECT_SETTLED
+        # With approval_secret, runs verify a pending resend against these same fields
+        # before any row sends, and settle before it accepts another resend (SPEC 5.3).
         data["mac"] = permissions.sign_settlement(
-            {
-                "session_id": session.id,
-                "kind": kind,
-                "data": {key: value for key, value in data.items() if key != "mac"},
-            }
+            _kinds.settlement_mac_fields(session.id, kind, data)
         )
         await writer.append_effect([_session.Entry(kind=kind, data=data)])
         op = writer.view().get(op.namespace, op.name, op.key)

@@ -33,7 +33,7 @@ python -m examples.patterns.react_assistant --model claude-opus-5-5
 
 `ANTHROPIC_AUTH_TOKEN`, or a profile from `ant auth login`, works as well.
 
-**QCloud.** Needs the `qcloud-ai` SDK (not on PyPI yet; see the [main README](../README.md#install))
+**QCloud.** Needs the `qcloud-ai` SDK (not on PyPI yet; see the [main README](../README.md#providers))
 and a key. The model is `--model`, else `QCLOUD_MODEL`, else the harness's GLM default:
 
 ```bash
@@ -233,3 +233,9 @@ docstring of [`harness.py`](harness.py).
 | [`custom_provider.py`](custom_provider.py) | A complete model provider in thirty lines. |
 | [`serve_fastapi.py`](serve_fastapi.py) | An agent over HTTP with server-sent events, approvals and questions to the user. |
 | [`live_acceptance.py`](live_acceptance.py) | A short paid acceptance test against the live QCloud API. |
+| [`support_review.py`](support_review.py) | Inspect an order, propose a support case, pause for approval and write the approved case to a local SQLite queue. |
+| [`scoped_memory.py`](scoped_memory.py) | Tenant- and user-scoped preference memory in session state, across a reopened SQLite store; offline. |
+| [`team_messages.py`](team_messages.py) | A coordinator, a researcher and a reviewer exchange messages through a `TeamMailbox` (unreleased). |
+| [`devvi_coder.py`](devvi_coder.py) | A lead agent plans a change, Devvi makes the edits over ACP, and the lead reviews them (unreleased). |
+| [`recover_credit.py`](recover_credit.py) | Recover a credit whose response was lost, through an operator settlement across two workers (Effects 0.3 preview; not run by the test suite). |
+| [`subprocess_refund.py`](subprocess_refund.py) | A subprocess-isolated crash test of a simulated Stripe refund (Effects 0.3 preview; not run by the test suite). |

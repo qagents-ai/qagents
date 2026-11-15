@@ -1,8 +1,10 @@
 """Boundary checks for the engine's sending conditions and destination contracts."""
 
+import asyncio
 from collections import Counter
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from pydantic import BaseModel
 
@@ -141,6 +143,233 @@ def test_destination_contract_classifies_rejection_and_unique_duplicate():
     assert engine._classify_send_error(unique, RuntimeError()) == "unknown"
 
 
+class _Refused(Exception):
+    """A client's definite refusal type, the kind rejected_on lists."""
+
+
+@pytest.mark.parametrize(
+    "base",
+    [TimeoutError, ConnectionResetError, httpx.ReadTimeout, httpx.RemoteProtocolError],
+    ids=lambda base: base.__name__,
+)
+def test_no_answer_error_is_unknown_even_when_it_derives_from_a_declared_refusal(base):
+    send = declared(rejected_on=(_Refused,))
+    lost = type(f"Refused{base.__name__}", (_Refused, base), {})("response lost")
+    assert isinstance(lost, send.rejected_on)
+    assert engine._classify_send_error(send, lost) == "unknown"
+    assert engine._classify_send_error(send, base("response lost")) == "unknown"
+    assert engine._classify_send_error(send, _Refused("declined")) == "rejected"
+
+
+@pytest.mark.parametrize(
+    "base",
+    [TimeoutError, ConnectionResetError, httpx.ReadTimeout, httpx.RemoteProtocolError],
+    ids=lambda base: base.__name__,
+)
+def test_no_answer_error_is_unknown_even_if_rejected_on_skipped_the_declaration_check(base):
+    # The shape of the analysis probe: an effect whose rejected_on lists a base class of
+    # the transport errors. The declaration refuses it now; classification must not rely
+    # on that, because a worker leg rebuilds effects without re-declaring them.
+    send = declared()
+    send.rejected_on = (OSError, httpx.HTTPError)
+    assert engine._classify_send_error(send, base("response lost")) == "unknown"
+
+
+def test_no_answer_overrides_effect_rejected_and_cancellation_bases():
+    send = declared(rejected_on=(_Refused,))
+    lost = type("RejectedTimeout", (EffectRejected, TimeoutError), {})("response lost")
+    assert engine._classify_send_error(send, lost) == "unknown"
+    cancelled = type("RefusedCancel", (_Refused, asyncio.CancelledError), {})("stopped")
+    assert engine._classify_send_error(send, cancelled) == "unknown"
+    assert engine._classify_send_error(send, asyncio.CancelledError()) == "unknown"
+
+
+def _wrapped(inner: BaseException, outer: BaseException, style: str) -> BaseException:
+    """``outer`` as a client raises it while handling ``inner``, with Python's own links."""
+    try:
+        try:
+            raise inner
+        except BaseException as error:
+            if style == "from":
+                raise outer from error
+            if style == "from_none":
+                raise outer from None
+            raise outer  # noqa: B904
+    except BaseException as raised:
+        return raised
+    raise AssertionError("nothing was raised")
+
+
+@pytest.mark.parametrize("style", ["from", "context", "from_none"])
+@pytest.mark.parametrize(
+    "inner",
+    [
+        TimeoutError,
+        ConnectionResetError,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+        asyncio.CancelledError,
+    ],
+    ids=lambda inner: inner.__name__,
+)
+def test_refusal_raised_from_or_while_handling_a_no_answer_error_is_unknown(inner, style):
+    # AF-1 review: clients wrap the transport error instead of inheriting from it,
+    # `except httpx.HTTPError as e: raise PaymentsError(...) from e`.
+    send = declared(rejected_on=(_Refused,))
+    refused = _wrapped(inner("response lost"), _Refused("payments request failed"), style)
+    assert engine._classify_send_error(send, refused) == "unknown"
+    rejected = _wrapped(inner("response lost"), EffectRejected("refused"), style)
+    assert engine._classify_send_error(send, rejected) == "unknown"
+
+
+def test_a_no_answer_error_deeper_in_the_chain_is_unknown():
+    # The chain requests builds: a socket timeout, the urllib3 error raised from it,
+    # and the requests error raised while handling that.
+    class PoolReadTimeout(Exception):
+        pass
+
+    pool = _wrapped(TimeoutError("timed out"), PoolReadTimeout("read timed out"), "from")
+    refused = _wrapped(pool, _Refused("read timed out"), "context")
+    assert engine._classify_send_error(declared(rejected_on=(_Refused,)), refused) == "unknown"
+
+
+def test_a_refusal_from_a_received_response_or_an_unrelated_error_stays_rejected():
+    send = declared(rejected_on=(_Refused,))
+    request = httpx.Request("POST", "https://payments.example/charges")
+    status = httpx.HTTPStatusError(
+        "400 Bad Request", request=request, response=httpx.Response(400, request=request)
+    )
+    for style in ("from", "context"):
+        assert engine._classify_send_error(send, _wrapped(status, _Refused("bad"), style)) == (
+            "rejected"
+        )
+        assert engine._classify_send_error(send, _wrapped(KeyError("x"), _Refused(), style)) == (
+            "rejected"
+        )
+
+
+def test_an_exception_group_holding_a_no_answer_error_is_unknown():
+    # AF-1 review: an asyncio.TaskGroup child's timeout reaches the engine inside a group.
+    send = declared()
+    send.rejected_on = (_Refused, BaseExceptionGroup)  # refused at declaration now
+    timeout = ExceptionGroup("charge", [ValueError("audit"), httpx.ReadTimeout("lost")])
+    assert engine._classify_send_error(send, timeout) == "unknown"
+    cancelled = BaseExceptionGroup("charge", [asyncio.CancelledError()])
+    assert engine._classify_send_error(send, cancelled) == "unknown"
+    nested = ExceptionGroup("outer", [ExceptionGroup("inner", [ConnectionResetError()])])
+    assert engine._classify_send_error(send, nested) == "unknown"
+    wrapped = _wrapped(timeout, _Refused("payments request failed"), "from")
+    assert engine._classify_send_error(declared(rejected_on=(_Refused,)), wrapped) == "unknown"
+    refusals = type("Refusals", (_Refused, ExceptionGroup), {})("charge", [ValueError("bad")])
+    assert engine._classify_send_error(send, refusals) == "rejected"
+
+
+def _lost_responses():
+    """Errors that mean no answer came back and carry no cause or context to read."""
+    import http.client
+    import ssl
+    import warnings
+
+    cases = [
+        (EOFError, asyncio.IncompleteReadError(b"", 10)),
+        (http.client.HTTPException, http.client.IncompleteRead(b"partial")),
+        (http.client.HTTPException, http.client.BadStatusLine("")),
+        (ssl.SSLError, ssl.SSLEOFError(8, "EOF occurred in violation of protocol")),
+        (ssl.SSLError, ssl.SSLZeroReturnError(6, "TLS/SSL connection has been closed")),
+    ]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # requests warns about its optional extras
+            import requests
+    except ImportError:
+        pass
+    else:
+        cases.append((requests.RequestException, requests.ConnectionError("aborted")))
+        cases.append((requests.RequestException, requests.exceptions.ChunkedEncodingError()))
+    try:
+        import aiohttp
+    except ImportError:
+        pass
+    else:
+        cases.append((aiohttp.ClientError, aiohttp.ServerDisconnectedError()))
+        cases.append((aiohttp.ClientError, aiohttp.ClientPayloadError("not completed")))
+    return cases
+
+
+_LOST = _lost_responses()
+
+
+@pytest.mark.parametrize("base,lost", _LOST, ids=[type(lost).__name__ for _, lost in _LOST])
+def test_a_response_cut_short_or_a_client_library_disconnect_is_unknown(base, lost):
+    # AF-1 review: these were accepted bases and classified as rejected.
+    send = declared()
+    send.rejected_on = (base,)  # refused at declaration now
+    assert isinstance(lost, base)
+    assert engine._classify_send_error(send, lost) == "unknown"
+
+
+_DISCONNECTED = "Server disconnected without sending a response."
+
+
+@pytest.mark.parametrize("module", ["httpx2", "httpcore", "httpcore2"])
+def test_a_disconnect_reported_by_httpx2_or_httpcore_is_unknown(module):
+    # AF-1 review: httpx2 (the transport of anthropic>=2.8 and mcp>=2.3) shares no class
+    # with httpx, and a server that closes without answering leaves no builtin error in
+    # the chain, so httpx2.RemoteProtocolError counted as a refusal.
+    library = pytest.importorskip(module)
+    base = library.HTTPError if module == "httpx2" else library.ProtocolError
+    send = declared()
+    send.rejected_on = (base,)  # refused at declaration now
+    lost = library.RemoteProtocolError(_DISCONNECTED)
+    assert isinstance(lost, base)
+    assert engine._classify_send_error(send, lost) == "unknown"
+
+
+@pytest.mark.parametrize("style", ["from", "context", "from_none"])
+def test_a_refusal_raised_from_or_while_handling_an_httpx2_disconnect_is_unknown(style):
+    httpx2 = pytest.importorskip("httpx2")
+    httpcore2 = pytest.importorskip("httpcore2")
+    # The chain httpx2 builds (its error raised from httpcore2's), wrapped by the client.
+    core = httpcore2.RemoteProtocolError(_DISCONNECTED)
+    lost = _wrapped(core, httpx2.RemoteProtocolError(_DISCONNECTED), "from")
+    refused = _wrapped(lost, _Refused("payments request failed"), style)
+    assert engine._classify_send_error(declared(rejected_on=(_Refused,)), refused) == "unknown"
+    # A response that was received is still a refusal, raised directly or wrapped.
+    request = httpx2.Request("POST", "https://payments.example/charges")
+    status = httpx2.HTTPStatusError(
+        "400 Bad Request", request=request, response=httpx2.Response(400, request=request)
+    )
+    received = declared(rejected_on=(httpx2.HTTPStatusError,))
+    assert engine._classify_send_error(received, status) == "rejected"
+    wrapped = _wrapped(status, _Refused("bad"), style)
+    assert engine._classify_send_error(declared(rejected_on=(_Refused,)), wrapped) == "rejected"
+
+
+def test_an_sdk_connection_error_raised_from_an_httpx2_disconnect_is_unknown():
+    anthropic = pytest.importorskip("anthropic")
+    httpx2 = pytest.importorskip("httpx2")
+    # anthropic>=2.8 raises APIConnectionError from the httpx2 error. The SDK's catch-all
+    # base is accepted at declaration, so only the chain makes the disconnect unknown.
+    send = declared(rejected_on=(anthropic.APIError,))
+    request = httpx2.Request("POST", "https://api.anthropic.example/v1/messages")
+    connection = anthropic.APIConnectionError(request=request)
+    lost = _wrapped(httpx2.RemoteProtocolError(_DISCONNECTED), connection, "from")
+    assert engine._classify_send_error(send, lost) == "unknown"
+    response = httpx2.Response(400, request=request)
+    refused = anthropic.BadRequestError("invalid request", response=response, body=None)
+    assert engine._classify_send_error(send, refused) == "rejected"
+
+
+def test_a_cycle_in_the_error_chain_ends():
+    send = declared(rejected_on=(_Refused,))
+    refused, other = _Refused("declined"), ValueError("cached")
+    refused.__context__, other.__context__ = other, refused
+    assert engine._classify_send_error(send, refused) == "rejected"
+    lost = TimeoutError("lost")
+    other.__cause__, lost.__context__ = lost, refused
+    assert engine._classify_send_error(send, refused) == "unknown"
+
+
 @pytest.mark.parametrize("remaining,renewed", [(4.0, 0), (3.99, 1)])
 async def test_m7_margin_boundary_renews_at_most_once(remaining, renewed):
     class Lease:
@@ -210,5 +439,44 @@ def test_d5_requires_settlement_identity_and_d2_changes_only_replayed_rejection_
     assert engine._authorization_valid("D5", scope, 0) is None
     original = declared(dedupe=Dedupe(1000, "contract", replays_rejections=False))
     replayed = declared(dedupe=Dedupe(1000, "contract", replays_rejections=True))
-    assert engine._d2_plan(original, SimpleNamespace(generation=2)) == (False, 2)
-    assert engine._d2_plan(replayed, SimpleNamespace(generation=2)) == (False, 3)
+    bare = SimpleNamespace(generation=2, attempts=[], claimed=None)
+    assert engine._d2_plan(original, bare) == (False, 2)
+    assert engine._d2_plan(replayed, bare) == (False, 3)
+
+
+def _attempt(generation, outcome):
+    return SimpleNamespace(generation=generation, terminal=outcome, outcome=outcome)
+
+
+@pytest.mark.parametrize(
+    ("own", "carried", "expected"),
+    [
+        ([("rejected", 2)], [], 3),
+        ([("not_sent", 2), ("rejected", 2)], [], 3),
+        ([("rejected", 1)], [("not_sent", 2)], 2),
+        ([("rejected", 1)], [("rejected", 1), ("not_sent", 2)], 2),
+        ([("not_sent", 2)], [("not_sent", 2)], 2),
+        ([("rejected", 1)], [("unknown", 2)], 3),
+        ([("rejected", 1)], [(None, 2)], 3),
+    ],
+    ids=[
+        "own_rejection",
+        "own_rejection_after_not_sent",
+        "carried_not_sent",
+        "carried_history",
+        "both_not_sent",
+        "carried_unknown",
+        "carried_without_outcome",
+    ],
+)
+def test_d2_keeps_a_key_that_was_never_sent_under_replayed_rejections(own, carried, expected):
+    """AF-2 recheck: a generation whose attempts were all definitely not sent keeps its key."""
+    replayed = declared(dedupe=Dedupe(1000, "contract", replays_rejections=True))
+    op = SimpleNamespace(
+        generation=2,
+        attempts=[_attempt(g, outcome) for outcome, g in own],
+        claimed=SimpleNamespace(attempts=[_attempt(g, outcome) for outcome, g in carried])
+        if carried
+        else None,
+    )
+    assert engine._d2_plan(replayed, op) == (False, expected)

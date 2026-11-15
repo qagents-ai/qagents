@@ -40,6 +40,10 @@ universal gateway dependency.
 
 ## Compared with what exists
 
+For a dated, sourced comparison with LangGraph, CrewAI, Microsoft Agent Framework, the OpenAI
+Agents SDK, Google ADK and Pydantic AI, including where they are stronger, see
+[Comparison with other frameworks](comparison.md).
+
 | Documented gap elsewhere | What qagents does |
 |---|---|
 | Graph frameworks re-run the whole node after a crash or an approval, and match interrupts by position | Resume is per tool call, keyed by call id; a finished call never runs again |

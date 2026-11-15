@@ -9,7 +9,7 @@ from pydantic import JsonValue as JSONValue
 
 from ..errors import ClaimConflict
 from ._canonical import LIMIT_BYTES, Descriptor, jcs
-from ._kinds import EffectIntentData
+from ._kinds import ClaimAttemptData, EffectClaimedData, EffectIntentData
 
 if TYPE_CHECKING:
     from ..session import Entry
@@ -29,6 +29,8 @@ class Claim(BaseModel):
     receipt: dict[str, JSONValue] | None = None
     committed_at: float | None = None
     updated_at: float
+    # [additive] every attempt of every owner, so a new owner's lookup can ask about them
+    attempts: list[ClaimAttemptData] = []
 
 
 def next_claim(
@@ -54,6 +56,14 @@ def next_claim(
                 or intent.generation < existing.generation
             ):
                 _conflict(existing)
+        attempt = ClaimAttemptData(
+            session_id=session_id,
+            number=intent.attempt,
+            generation=intent.generation,
+            idempotency_key=intent.idempotency_key,
+            epoch=intent.epoch,
+            store_ts=intent.store_ts,
+        )
         return Claim(
             namespace=intent.namespace,
             effect=intent.name,
@@ -66,7 +76,10 @@ def next_claim(
             generation=intent.generation,
             status="held" if existing and existing.status in ("sent", "held") else "sent",
             updated_at=now,
+            attempts=[*(existing.attempts if existing else []), attempt],
         )
+    if entry.kind == "effect_claimed":
+        return _transfer(existing, entry, session_id=session_id, incarnation=incarnation, now=now)
     if existing is None:
         return None
     if entry.kind == "effect_committed" and data.get("via") == "claim":
@@ -85,11 +98,19 @@ def next_claim(
         claim.status = "committed"
         claim.receipt = receipt
         claim.committed_at = now
+        _record_outcome(claim, session_id, data.get("attempt"), "committed")
     elif entry.kind == "effect_failed":
         why = data.get("why")
         claim.status = why if why in ("rejected", "not_sent") else "held"
         if existing.status in ("held", "committed"):
             claim.status = "held"  # earlier uncertainty or contradictory terminal evidence
+        definite = data.get("committed") is False
+        _record_outcome(
+            claim,
+            session_id,
+            data.get("attempt"),
+            "not_sent" if definite and why == "not_sent" else "rejected" if definite else "unknown",
+        )
     elif entry.kind in ("effect_settled", "effect_conflict"):
         claim.status = "held"
     elif entry.kind == "effect_observed" and data.get("reason") is not None:
@@ -97,6 +118,54 @@ def next_claim(
             claim.status = "held"
     else:
         return existing
+    claim.updated_at = now
+    return claim
+
+
+def _record_outcome(claim: Claim, session_id: str, number: object, outcome: str) -> None:
+    """Keep each attempt's known outcome, as the fold does; a commit is never overwritten."""
+    for attempt in reversed(claim.attempts):
+        if attempt.session_id == session_id and attempt.number == number:
+            if attempt.outcome != "committed":
+                attempt.outcome = outcome
+            return
+
+
+def _transfer(
+    existing: Claim | None, entry: Entry, *, session_id: str, incarnation: str, now: float
+) -> Claim:
+    """Move a rejected or never-sent claim, unchanged since the new owner read it, to the
+    new owner. The status is part of what must still match (SPEC 7.10)."""
+    data = EffectClaimedData.model_validate(entry.data)
+    if existing is None:
+        raise ClaimConflict(
+            "This effect key has no claim to take over.",
+            namespace=data.namespace,
+            effect=data.name,
+            key=data.key,
+            owner_session="",
+        )
+    descriptor = Descriptor(
+        data.name, data.version, data.destination_digest, data.request_digest
+    ).digest()
+    previous = (existing.session_id, existing.incarnation, existing.record_id)
+    named = tuple(
+        data.previous_owner.get(name) for name in ("session_id", "incarnation", "record_id")
+    )
+    if (
+        descriptor != existing.descriptor_digest
+        or existing.status not in ("rejected", "not_sent")
+        or data.status != existing.status
+        or named != previous
+        or previous == (session_id, incarnation, data.record_id)
+        or data.generation != existing.generation
+        or data.first_use_at != existing.first_use_at
+        or [item.model_dump(mode="json") for item in data.attempts]
+        != [item.model_dump(mode="json") for item in existing.attempts]
+    ):
+        _conflict(existing)
+    claim = existing.model_copy(deep=True)
+    claim.session_id, claim.incarnation, claim.record_id = session_id, incarnation, data.record_id
     claim.updated_at = now
     return claim
 

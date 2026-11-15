@@ -130,6 +130,15 @@ def _effects_child_refusal(agent: Agent, *, durable_session: bool) -> str | None
     return None
 
 
+def _resends_automatically(tool: Tool) -> bool:
+    """Whether rule D3 or D4 can ever re-send one of the tool's effects (SPEC 7.1): D3 needs a
+    ``Dedupe`` or ``Unique`` contract, D4 an authoritative lookup. Opaque and reconcilable
+    effects are never re-sent automatically, with or without a verifiable decision."""
+    return any(
+        effect.klass in ("deduplicated", "unique", "authoritative") for effect in tool.effects
+    )
+
+
 def _store_root(store: SessionStore) -> SessionStore:
     """Follow only library-owned writer wrappers, preserving the root store identity."""
     from .runtime import _LeasedStore
@@ -399,6 +408,8 @@ class Agent:
         """Agents this one may hand the conversation to; change it to connect agents
         both ways. Names must stay unique among the agents reachable through handoffs."""
         self.compactor = compactor
+        self._unsigned_approvals_warned: set[str] = set()
+        """Effects tools already warned about: approval decisions that nothing signs."""
         self._check_effect_tools(item for item in self.tools if isinstance(item, Tool))
         for target in self.handoffs:
             if refusal := _effects_child_refusal(target, durable_session=False):
@@ -476,9 +487,8 @@ class Agent:
     ) -> None:
         limits = limits or self.limits
         timing = timing or _ports.Timing.for_lease(self.lease_ttl_s, 1.0, effects=True)
-        for tool in tools:
-            if not tool.effects:
-                continue
+        effects_tools = [tool for tool in tools if tool.effects]
+        for tool in effects_tools:
             timeout = tool.timeout if tool.timeout is not None else limits.tool_timeout_s
             for warning in _engine.check_declarations(
                 tool.effects,
@@ -486,6 +496,50 @@ class Agent:
                 tool_timeout_s=timeout,
             ):
                 logger.warning("%s: %s", tool.name, warning)
+        self._warn_unsigned_approvals(effects_tools)
+
+    def _warn_unsigned_approvals(self, effects_tools: list[Tool]) -> None:
+        """Warn, once per tool, about effects tools that ask for approval while no
+        ``approval_secret`` signs the decisions (SPEC 5.1). D3 and D4 re-send only under a
+        verifiable decision (5.4), so these effects are never re-sent automatically: where
+        one of them would, an effect whose outcome is in doubt holds as
+        APPROVAL_UNVERIFIABLE. Only tools with an effect that D3 or D4 can re-send are named:
+        for the others the secret changes no hold (7.1 H1). With ``can_use_tool`` the build
+        cannot tell which calls ask, so every such tool that no deny pattern refuses may ask
+        and is named. The hold is right; the warning tells the developer before the first
+        crash does."""
+        permissions = self.permissions
+        if permissions.signs_pauses:
+            return
+        per_call = permissions.can_use_tool is not None
+        may_ask = permissions._callback_may_ask if per_call else permissions._asks_by_rule
+        names = [
+            tool.name
+            for tool in effects_tools
+            if tool.name not in self._unsigned_approvals_warned
+            and _resends_automatically(tool)
+            and may_ask(tool)
+        ]
+        if not names:
+            return
+        self._unsigned_approvals_warned.update(names)
+        subject = "this effects tool" if len(names) == 1 else "these effects tools"
+        if per_call:
+            subject += (
+                " may ask for approval (can_use_tool decides per call, so the build cannot tell)"
+            )
+        else:
+            subject += " asks for approval" if len(names) == 1 else " ask for approval"
+        logger.warning(
+            "%s: %s, but Permissions has no approval_secret, so no decision is signed. Without "
+            "a verifiable decision, rules D3 and D4 never re-send an effect automatically, in "
+            "the run or after a crash: where one of them would, an effect whose outcome is in "
+            "doubt, and that no lookup finds, is held as APPROVAL_UNVERIFIABLE until an "
+            "operator settles it (agent.settle). Set Permissions(approval_secret=...) to sign "
+            "approval decisions.",
+            ", ".join(names),
+            subject,
+        )
 
     def stream(
         self,

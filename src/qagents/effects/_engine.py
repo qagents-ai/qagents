@@ -15,7 +15,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
 
@@ -34,6 +34,7 @@ from qagents.errors import (
 from qagents.session import EFFECTS_REQUIRED, Entry, SessionStore
 
 from . import _canonical as canonical
+from . import _declare
 from . import _kinds as kinds
 from . import _ports as ports
 from . import _quiescence as quiescence
@@ -41,7 +42,7 @@ from . import _table as table
 from . import _types as types
 from ._canonical import LIMIT_BYTES, JSONValue, check_model_numbers, jcs, resolve_namespace
 from ._declare import Dedupe, Effect, Unique
-from ._fold import Operation, _new_operation
+from ._fold import SETTLEMENT_FOLD_KEYS, Operation, _new_operation
 from ._kinds import StatePatchData
 from ._ports import FINDINGS_LOGGER, CallScope, EffectJournal, Timing
 from ._types import (
@@ -57,8 +58,20 @@ from ._types import (
     Unknown,
 )
 
+if TYPE_CHECKING:
+    from qagents.permissions import Permissions
+
 Verdict = Found | NotYetVisible | Absent | Unknown
 _TOOLERROR_WARNED = False
+# The hold detail for an operator resend that does not verify under the approval_secret.
+_RESEND_UNVERIFIABLE = (
+    "Operator resend unverifiable: no valid MAC for this record and revision; settle again."
+)
+# An R(n) record has no operator recheck (O1), so its hold names the way to look again.
+_REJECTED_LOOKUP_INCONCLUSIVE = (
+    "The lookup could not tell whether the rejected request was applied, so no retry was "
+    "sent; perform it again or resume to look again."
+)
 
 
 @dataclass
@@ -406,7 +419,9 @@ async def _dispatch(
                 prompts.TOOL_THREADS_EXHAUSTED.format(name=effect.name, count=tools.TOOL_THREADS)
             )
     try:
-        number = max((item.number for item in op.attempts), default=0) + 1
+        number = (
+            max((item.number for item in [*op.attempts, *_claimed_attempts(op)]), default=0) + 1
+        )
         salt = await journal.salt()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + effect.timeout_s
@@ -599,6 +614,7 @@ async def _dispatch(
                     rule,
                     result=result,
                     error=error,
+                    timeout=_cancelled_at_deadline(effect, True, error),
                     overran=True,
                 )
                 await _append_outcome(
@@ -645,7 +661,7 @@ async def _dispatch(
             rule,
             result=result,
             error=error,
-            timeout=timed_out and isinstance(error, asyncio.CancelledError),
+            timeout=_cancelled_at_deadline(effect, timed_out, error),
         )
     finally:
         if slot is not None:
@@ -722,12 +738,32 @@ def _may_overrun(effect: Effect) -> bool:
     return not effect.is_async
 
 
+def _cancelled_at_deadline(effect: Effect, timed_out: bool, error: BaseException | None) -> bool:
+    """Whether a send's error is the engine's own timeout (SPEC 7.1 E5, E5o; mutant seam M53).
+
+    Past the deadline the engine cancels an async send. The cancellation, not an
+    answer from the destination, ends it then, so any error it raises, within m or
+    later, is that timeout and its outcome is unknown: also a ``rejected_on`` type
+    that the send raises in reaction (``except CancelledError: ... raise
+    PaymentsError()``). A sync send is never cancelled; its late error is classified
+    as it was raised.
+    """
+    return timed_out and error is not None and effect.is_async
+
+
 def _classify_send_error(
     effect: Effect, error: BaseException
 ) -> Literal["rejected", "duplicate", "unknown"]:
-    """Only explicit destination contracts classify a raised response as definite (M4)."""
+    """Only explicit destination contracts classify a raised response as definite (M4).
+
+    A transport-level no answer (a timeout, a lost connection, a cancellation, an
+    httpx transport error) is never a rejection, even when its class also derives
+    from EffectRejected or a rejected_on type (SPEC 5.1). Its outcome is unknown.
+    """
     global _TOOLERROR_WARNED
-    if isinstance(error, EffectRejected) or isinstance(error, effect.rejected_on):
+    if not _declare._no_answer(error) and (
+        isinstance(error, EffectRejected) or isinstance(error, effect.rejected_on)
+    ):
         return "rejected"
     if isinstance(effect.dedupe, Unique) and isinstance(error, effect.dedupe.on_duplicate):
         return "duplicate"
@@ -763,6 +799,7 @@ def _authorization_valid(rule: str, scope: CallScope, store_now: float) -> HoldR
             None
             if scope.authorization.decision == "resend"
             and scope.authorization.settlement_seq is not None
+            and scope.authorization.verifiable
             else HoldReason.APPROVAL_UNVERIFIABLE
         )
     if rule not in {"D1", "D2", "D3", "D4"}:
@@ -777,10 +814,129 @@ def _authorization_valid(rule: str, scope: CallScope, store_now: float) -> HoldR
     return None
 
 
+def _resend_verified(permissions: Permissions | None, session_id: str, op: Operation) -> bool:
+    """With an approval_secret, a pending operator resend counts only if it verifies
+    (`_settlement_verified`; M50, SPEC 5.3). Runs check it before any row sends."""
+    settlement = op.pending_resend
+    return settlement is None or _settlement_verified(permissions, session_id, settlement)
+
+
+def _settlement_verified(
+    permissions: Permissions | None, session_id: str, settlement: kinds.EffectSettledData
+) -> bool:
+    """With an approval_secret, a folded ``effect_settled`` answer counts only if its MAC
+    signs the journaled answer and it names the revision it followed (SPEC 5.3). A copy of a genuine
+    answer appended later names an older revision. Without a secret the journal is trusted,
+    as before. The operator path checks every journaled resend with it before it accepts
+    another resend."""
+    if permissions is None or not permissions.signs_pauses:
+        return True
+    prior = (settlement.model_extra or {}).get("prior_revision")
+    data = settlement.model_dump(mode="json", exclude=set(SETTLEMENT_FOLD_KEYS))
+    fields = kinds.settlement_mac_fields(session_id, kinds.KIND_EFFECT_SETTLED, data)
+    return prior == settlement.expected_revision and permissions.verify_settlement(
+        fields, settlement.mac
+    )
+
+
 def _d2_plan(effect: Effect, op: Operation) -> tuple[bool, int]:
-    """Look up a rejection before retrying; only replayed rejections advance generation (M33)."""
-    changes_key = isinstance(effect.dedupe, Dedupe) and effect.dedupe.replays_rejections
+    """Look up a rejection before retrying; only replayed rejections advance generation (M33).
+
+    A generation whose attempts were all definitely not sent has no rejection to replay,
+    so D2 keeps its key. That is the claim a record takes back after the other owner's D2
+    was not sent: D2 then uses the key that owner had chosen and never sent (SPEC 4.4 D2,
+    7.10; M66). A generation with no recorded attempt still changes the key.
+    """
+    replays = isinstance(effect.dedupe, Dedupe) and effect.dedupe.replays_rejections
+    outcomes = [a.terminal for a in op.attempts if a.generation == op.generation]
+    outcomes += [a.outcome for a in _claimed_attempts(op) if a.generation == op.generation]
+    never_sent = bool(outcomes) and all(outcome == "not_sent" for outcome in outcomes)
+    changes_key = replays and not never_sent
     return effect.lookup_fn is not None, op.generation + int(changes_key)
+
+
+def _claimed_attempts(op: Operation) -> list[kinds.ClaimAttemptData]:
+    return list(op.claimed.attempts) if op.claimed is not None else []
+
+
+def _lookup_state(effect: Effect, op: Operation) -> Literal["not_run", "none_declared"]:
+    """A declared lookup runs first once the journal holds any earlier attempt (M49).
+
+    The attempts may be this record's own or another owner's, carried over by a
+    claim transfer (SPEC 4.4 D2, 7.10).
+    """
+    if effect.lookup_fn is None or not (op.attempts or op.claimed is not None):
+        return "none_declared"
+    return "not_run"
+
+
+def _claim_kind(
+    op: Operation, claim: Any, prepared: _Prepared, session_id: str
+) -> Literal[
+    "none", "own", "committed_same", "held_elsewhere", "other_descriptor", "rejected", "not_sent"
+]:
+    """How rule C1 reads the claim before deciding (SPEC 7.1 C1, 7.10; M56, M65).
+
+    A record in N reads any claim. A record in R(n) reads only a claim that another
+    session took over after this record was rejected: its own claim leaves the R(n) rows
+    to decide. A claim the other owner rejected or never sent moves back by
+    ``effect_claimed`` (in N a never-sent one moves with the D1 intent); only a claim
+    that may still be sent or applied elsewhere is held.
+    """
+    if claim is None:
+        return "none"
+    if op.state == "R" and claim.session_id == session_id:
+        return "own"
+    if claim.descriptor_digest != prepared.descriptor.digest():
+        return "other_descriptor"
+    if claim.status == "committed":
+        return "committed_same"
+    if claim.status in ("rejected", "not_sent"):
+        return claim.status
+    return "held_elsewhere"
+
+
+async def _may_move_claim(journal: EffectJournal, effect: Effect) -> bool:
+    """A claim moves to this record only if this worker could send next: the
+    self-fence must pass, else nothing is journaled (SPEC 7.1 C1, F1; M55). A worker
+    that cannot send would otherwise take the claim from its owner and strand it."""
+    return await _self_fence(journal, effect)
+
+
+async def _take_claim(
+    effect: Effect, op: Operation, claim: Any, prepared: _Prepared, scope: CallScope
+) -> None:
+    """Journal the move of a rejected or never-sent claim, with its attempt history,
+    before any lookup or send (SPEC 7.10). The claim index refuses it if the claim,
+    its status included, changed since it was read."""
+    journal = scope.journal
+    payload = kinds.EffectClaimedData(
+        **_reference(op),
+        version=effect.version,
+        request_digest=prepared.frozen.digest,
+        destination_digest=prepared.descriptor.destination_digest,
+        request=prepared.frozen.json,
+        operation_tag=canonical.operation_tag(
+            op.namespace, op.name, op.key, prepared.frozen.digest
+        ),
+        receipt_identity=list(effect.receipt_identity)
+        if effect.receipt_identity is not None
+        else None,
+        operation_id=scope.operation_id,
+        tool_call_id=scope.tool_call_id,
+        previous_owner={
+            "session_id": claim.session_id,
+            "incarnation": claim.incarnation,
+            "record_id": claim.record_id,
+        },
+        status=claim.status,
+        generation=claim.generation,
+        first_use_at=claim.first_use_at,
+        attempts=claim.attempts,
+        store_ts=await journal.store_now(),
+    )
+    await _append_outcome(scope, kinds.KIND_EFFECT_CLAIMED, payload)
+    _reach(scope, op, "C1")
 
 
 async def perform(
@@ -952,6 +1108,18 @@ def _conflict(op: Operation) -> None:
     )
 
 
+def _authorization_decides(op: Operation, situation: table.PerformSituation) -> bool:
+    """Whether an expired or unverifiable decision is the reason this record is held.
+
+    It is only on a row that would send (SPEC 7.1 H1): with a valid decision, D3 or D4 would
+    send now. Otherwise the record's own evidence names the reason, as under a valid
+    decision, so an effect that no row re-sends yet (no dedupe contract and no authoritative
+    absence after quiescence) is held for that reason and keeps its retry_after (AF-5).
+    """
+    valid = replace(situation, auth_valid=True)
+    return table.decide(table.TState(op.state), table.TEvent.PERFORM, valid).sends
+
+
 def _dedupe_allowed(effect: Effect, op: Operation, scope: CallScope, now: float) -> bool:
     journal = scope.journal
     contract = effect.dedupe
@@ -1001,7 +1169,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
     claim = None
     claim_kind = "none"
     if (
-        (op.state == "N" or op.via == "claim")
+        (op.state in ("N", "R") or op.via == "claim")
         and not effect.key.is_per_call
         and ("claims" in journal.store.features)
     ):
@@ -1010,17 +1178,9 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
             claim is None or claim.descriptor_digest != prepared.descriptor.digest()
         ):
             _conflict(op)
-        if claim is not None:
-            if claim.descriptor_digest != prepared.descriptor.digest():
-                claim_kind = "other_descriptor"
-            elif claim.status == "committed":
-                claim_kind = "committed_same"
-            elif claim.status in ("rejected", "not_sent"):
-                claim_kind = claim.status
-            else:
-                claim_kind = "held_elsewhere"
+        claim_kind = _claim_kind(op, claim, prepared, journal.session_id)
 
-    lookup = "none_declared" if effect.lookup_fn is None or not op.attempts else "not_run"
+    lookup = _lookup_state(effect, op)
     reason = None
     retry_blocked = False
     while True:
@@ -1040,13 +1200,27 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
         )
         pending = op.pending_resend
         resend_seq = (pending.model_extra or {}).get("seq") if pending is not None else None
-        dedupe = op.state == "D" and not retry_blocked and _dedupe_allowed(effect, op, scope, now)
+        # A resend that does not verify authorizes nothing, and no row sends while it stands:
+        # it may have reopened a record that was rejected or settled (SPEC 5.3, 7.5).
+        resend_unverified = pending is not None and not _resend_verified(
+            scope.permissions, scope.session_id, op
+        )
+        # Such a resend can also stand on a key that never had an attempt, so nothing that
+        # reads the attempts' first use runs first: the record is held, not an error.
+        dedupe = (
+            op.state == "D"
+            and not retry_blocked
+            and not resend_unverified
+            and _dedupe_allowed(effect, op, scope, now)
+        )
         if op.state == "D" and send_running(journal.store, scope.session_id, op.record_id):
             await _hold(effect, op, scope, HoldReason.SEND_STILL_RUNNING)
         auth_rule = (
             "D3" if dedupe else "D4" if op.state == "D" else "D2" if op.state == "R" else "D1"
         )
         invalid = _authorization_valid(auth_rule, scope, now)
+        if resend_unverified:
+            invalid = HoldReason.APPROVAL_UNVERIFIABLE
         situation = table.PerformSituation(
             allowed=True,
             same_call=same_call,
@@ -1061,7 +1235,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
             fence_ok=not journal.lease.lost(),
             auth_valid=invalid is None,
             dedupe_valid=dedupe,
-            resend_accepted=resend_seq is not None and not retry_blocked,
+            resend_accepted=resend_seq is not None and not retry_blocked and not resend_unverified,
         )
         if op.state in ("N", "R") and invalid is not None and not own_rejection:
             raise ConfigurationError("The tool attempt has no valid authorization to send.")
@@ -1189,18 +1363,42 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
                 )
                 _reach(scope, op, "C1", "claim_replayed")
                 return _receipt(effect, view.get(*key), scope, replayed=True)
-            # The atomic claim append checks for intervening changes and transfers ownership.
+            if claim_kind == "rejected" or (claim_kind == "not_sent" and op.state == "R"):
+                if not await _may_move_claim(journal, effect):
+                    raise LeaseError("Effect dispatch refused: no safe lease margin.")
+                # Record first: the claim and its earlier attempts move here, then the
+                # folded R(n) rows decide, so a declared lookup runs before any D2. A
+                # claim whose last owner never sent its attempt comes back the same way.
+                await _take_claim(effect, op, claim, prepared, scope)
+                claim_kind = "none"
+                lookup = _lookup_state(effect, journal.view().get(*key))
+                continue
+            # Never sent: the atomic intent append checks the claim and transfers it (D1).
             op = replace(op, generation=claim.generation, first_use_at=claim.first_use_at)
             row = table.decide(
-                table.TState.R if claim_kind == "rejected" else table.TState.N,
+                table.TState.N,
                 table.TEvent.PERFORM,
                 replace(situation, claim="none", same_call=False),
+            )
+        if row.rule == "L2":
+            # The declared lookup could not answer, so the rejection may be wrong: hold, and
+            # let the next call look again rather than send D2 (SPEC 4.4 D2, 5.1).
+            await _hold(
+                effect,
+                op,
+                scope,
+                HoldReason.NOT_YET_VISIBLE
+                if lookup == "not_yet_visible"
+                else HoldReason.LOOKUP_INCONCLUSIVE,
+                rule="L2",
+                detail=_REJECTED_LOOKUP_INCONCLUSIVE,
             )
         if row.rule == "F1":
             raise LeaseError("Effect dispatch refused: no safe lease margin.")
         if not row.sends:
             if (
                 reason is None
+                and not resend_unverified
                 and isinstance(effect.dedupe, Dedupe)
                 and not quiescence._dedupe_window_covers(
                     now,
@@ -1210,7 +1408,17 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
                 )
             ):
                 reason = HoldReason.WINDOW_EXPIRED
-            await _hold(effect, op, scope, invalid or reason or HoldReason.DISPATCH_UNKNOWN)
+            if invalid is not None and not (
+                resend_unverified or _authorization_decides(op, situation)
+            ):
+                invalid = None
+            await _hold(
+                effect,
+                op,
+                scope,
+                invalid or reason or HoldReason.DISPATCH_UNKNOWN,
+                detail=_RESEND_UNVERIFIABLE if resend_unverified else None,
+            )
 
         dispatch_scope = scope
         generation = op.generation
@@ -1222,6 +1430,7 @@ async def _perform(effect: Effect, prepared: _Prepared, scope: CallScope) -> Any
                 authorization=ports.Authorization(
                     "resend",
                     settlement_seq=resend_seq,
+                    verifiable=not resend_unverified,
                 ),
             )
         token = _DISPATCH_INPUT.set(prepared)
@@ -1271,17 +1480,29 @@ async def lookup_and_record(
     # The caller's view and the model in Inquiry can both change while lookup awaits.
     # Binding always uses the original durable JSON, independently of either object.
     original = deepcopy(op)
-    if original.request is None or original.descriptor is None or not original.attempts:
-        raise ConfigurationError("Lookup requires a journaled effect intent.")
+    if (
+        original.request is None
+        or original.descriptor is None
+        or not (original.attempts or original.claimed is not None)
+    ):
+        raise ConfigurationError("Lookup requires a journaled effect intent or claim transfer.")
     request = json.loads(jcs(original.request))
-    inquiry = types.Inquiry(
-        request=effect.request_type.model_validate_json(jcs(request)),
-        key=original.key,
-        operation_tag=canonical.operation_tag(
-            original.namespace, original.name, original.key, original.descriptor.request_digest
+    # Earlier owners' attempts come first: the lookup asks about every key ever sent. A
+    # record that took its claim back finds its own earlier attempts in that history too.
+    claimed = _claimed_attempts(original)
+    carried = {
+        (a.number, a.idempotency_key, a.epoch, a.store_ts)
+        for a in claimed
+        if a.session_id == journal.session_id
+    }
+    attempts = (
+        *(
+            types.AttemptInfo(
+                a.number, a.generation, a.idempotency_key, a.epoch, a.store_ts, a.outcome
+            )
+            for a in claimed
         ),
-        idempotency_keys=tuple(dict.fromkeys(a.intent.idempotency_key for a in original.attempts)),
-        attempts=tuple(
+        *(
             types.AttemptInfo(
                 a.number,
                 a.generation,
@@ -1291,7 +1512,18 @@ async def lookup_and_record(
                 a.terminal,
             )
             for a in original.attempts
+            if (a.number, a.intent.idempotency_key, a.intent.epoch, a.intent.store_ts)
+            not in carried
         ),
+    )
+    inquiry = types.Inquiry(
+        request=effect.request_type.model_validate_json(jcs(request)),
+        key=original.key,
+        operation_tag=canonical.operation_tag(
+            original.namespace, original.name, original.key, original.descriptor.request_digest
+        ),
+        idempotency_keys=tuple(dict.fromkeys(a.idempotency_key for a in attempts)),
+        attempts=attempts,
         first_use_at=original.first_use_at,
     )
     ctx = types.EffectContext(deps, session_id=journal.session_id)
@@ -1397,11 +1629,12 @@ async def lookup_and_record(
     patch = patch_error = None
     if receipt is not None and current.commit_seq is None and current.state != "X":
         patch, patch_error = on_commit_patch(effect, state_values(), request, receipt)
-    target = original.attempts[-1]
+    # After a claim transfer with no local attempt, the find names no attempt of this record.
+    target = original.attempts[-1] if original.attempts else None
     committed = kinds.EffectCommittedData(
         **ref,
-        attempt=target.number,
-        intent_seq=target.intent_seq,
+        attempt=target.number if target is not None else None,
+        intent_seq=target.intent_seq if target is not None else None,
         via="lookup",
         receipt=receipt,
         receipt_error=receipt_error,

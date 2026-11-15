@@ -155,6 +155,12 @@ def _found(situation):
     return None if situation.lookup == "not_run" else situation.lookup == "found"
 
 
+def _lookup_inconclusive(situation):
+    """A declared lookup that said NotYetVisible or Unknown holds a rejected record: D2
+    sends only after Absent, or when no lookup is declared (SPEC 4.4 D2, 5.1; M57)."""
+    return situation.lookup in ("not_yet_visible", "unknown")
+
+
 P = TEvent.PERFORM
 E = TEvent.OUTCOME
 OP = TEvent.OPERATOR
@@ -192,7 +198,7 @@ ROWS: tuple[Row, ...] = (
     ),
     _row(
         "C1",
-        "N",
+        "N R",
         P,
         "resolve_claim",
         "C_or_same",
@@ -201,6 +207,16 @@ ROWS: tuple[Row, ...] = (
     ),
     _row("L1", "D", P, "commit_lookup", "C", "lookup", _found),
     _row("L2", "R", P, "commit_lookup", "C", "lookup", _found),
+    # Looked up through the module at decision time, so its seam (M57) can be seeded.
+    _row(
+        "L2",
+        "R",
+        P,
+        "hold_inconclusive_lookup",
+        "R",
+        "lookup",
+        lambda s: _lookup_inconclusive(s),
+    ),
     _row(
         "D1",
         "N",

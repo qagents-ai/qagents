@@ -265,6 +265,46 @@ async def test_e5o_resistant_send_is_tracked_until_late_commit_and_end():
     assert scope.journal.view().records("session")[0].attempts[0].overran
 
 
+class _Declined(Exception):
+    """A client's refusal type, listed in rejected_on."""
+
+
+async def test_e5o_refusal_raised_late_by_a_cancelled_async_send_is_the_timeout():
+    # AF-1 review: past the deadline the engine cancels the send, which ignores the
+    # cancellation for longer than m and then raises its declared refusal type.
+    scope, _, _ = host()
+    scope.journal.timing = Timing(60, 0.01, 1)
+    release = asyncio.Event()
+
+    async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+        aborted = False
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            aborted = True
+        if aborted:
+            await release.wait()
+            raise _Declined("request aborted")
+        return Receipt(id="late")
+
+    refund = effect("refund", key=Key("request", "id"), timeout_s=0.01, rejected_on=(_Declined,))(
+        send
+    )
+    outcome = await dispatch(refund, scope)
+    assert outcome.kind == "held" and outcome.error_kind == "timeout"
+    release.set()
+    await scope.journal.lease.sends_drained()
+    late = [item for item in scope.journal.entries if item.kind == "effect_failed"][-1]
+    assert late.data["overran"]
+    assert (late.data["why"], late.data["error_kind"], late.data["committed"]) == (
+        "unknown",
+        "timeout",
+        None,
+    )
+    assert scope.journal.view().records("session")[0].status != "rejected"
+    assert scope.rejected == []
+
+
 async def test_e6_caller_cancellation_waits_for_commit():
     scope, _, _ = host()
     started, release = asyncio.Event(), asyncio.Event()

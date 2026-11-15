@@ -64,11 +64,34 @@ def test_c1_precedes_first_send_for_foreign_claims(claim):
     assert rule("N", claim=claim) == "C1"
 
 
+@pytest.mark.parametrize(
+    "claim", ["committed_same", "held_elsewhere", "other_descriptor", "rejected", "not_sent"]
+)
+def test_c1_reads_a_claim_another_session_took_from_a_rejected_record(claim):
+    """SPEC 7.1 C1, 7.10: before L2 or D2, but after the call's own rejection (P3r)."""
+    assert rule("R", claim=claim, lookup="not_run") == "C1"
+    assert rule("R", claim=claim) == "C1"
+    assert rule("R", claim=claim, same_call=True, own_rejection=True) == "P3r"
+    assert rule("R", claim="own", lookup="not_run") == "NEED_LOOKUP"
+    assert rule("R", claim="own") == "D2"
+
+
 def test_lookup_precedes_resend_and_a_bound_found_never_sends():
     assert rule("D", lookup="not_run", dedupe_valid=True) == "NEED_LOOKUP"
     assert rule("R", lookup="not_run") == "NEED_LOOKUP"
     assert rule("D", lookup="found", dedupe_valid=True) == "L1"
     assert rule("R", lookup="found") == "L2"
+
+
+@pytest.mark.parametrize("lookup", ["not_yet_visible", "unknown"])
+def test_an_inconclusive_lookup_holds_a_rejected_record_instead_of_d2(lookup):
+    """SPEC 4.4 D2, 5.1: only Absent, or no declared lookup, lets D2 send."""
+    row = t.decide(t.TState.R, t.TEvent.PERFORM, perform(lookup=lookup))
+    assert (row.rule, row.action, row.sends) == ("L2", "hold_inconclusive_lookup", False)
+    assert rule("R", lookup=lookup, same_call=True) == "L2"
+    assert rule("R", lookup=lookup, same_call=True, own_rejection=True) == "P3r"
+    for answered in ("none_declared", "absent", "absent_authoritative_after_q"):
+        assert rule("R", lookup=answered) == "D2"
 
 
 def test_only_d_rows_send_and_their_order_is_fixed():
@@ -275,7 +298,8 @@ def valid_internal_perform(state, s):
     if state == t.TState.R:
         return (
             s.own_rejection
-            or s.lookup in ("not_run", "found")
+            or s.claim not in ("none", "own")
+            or s.lookup in ("not_run", "found", "not_yet_visible", "unknown")
             or not s.fence_ok
             or (not s.same_call and s.auth_valid)
         )
