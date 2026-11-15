@@ -1123,28 +1123,32 @@ def test_git_gets_a_small_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     assert env["GIT_NO_LAZY_FETCH"] == "1" and env["GIT_TERMINAL_PROMPT"] == "0"
 
 
+@pytest.mark.parametrize("trusted_git", [False, True])
 def test_git_is_never_taken_from_the_workspace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted_git: bool
 ) -> None:
     import qagents.external.changes as ext
 
     workspace = tmp_path / "repo"
     (workspace / "bin").mkdir(parents=True)
-    for name in ("git.exe", "git"):  # what the agent could plant there
-        planted = workspace / name
+    name = "git.exe" if sys.platform == "win32" else "git"
+    for planted in (workspace / name, workspace / "bin" / name):
         planted.write_text("planted")
         planted.chmod(0o755)
-        (workspace / "bin" / name).write_text("planted")
-        (workspace / "bin" / name).chmod(0o755)
     monkeypatch.chdir(workspace)  # Windows looks in the current directory first
-    path = os.pathsep.join([".", str(workspace / "bin"), os.environ.get("PATH", "")])
-    monkeypatch.setenv("PATH", path)
+    path = [".", str(workspace / "bin")]
+    expected = None
+    if trusted_git:
+        trusted_directory = tmp_path / "trusted"
+        trusted_directory.mkdir()
+        expected = trusted_directory / name
+        expected.write_text("trusted")
+        expected.chmod(0o755)
+        path.append(str(trusted_directory))
+    monkeypatch.setenv("PATH", os.pathsep.join(path))
+
     found = ext._git_program(str(workspace))
-    if shutil.which("git") is None:
-        assert found is None
-    else:
-        assert found is not None and os.path.isabs(found)
-        assert not Path(found).resolve().is_relative_to(workspace.resolve())
+    assert (Path(found) if found is not None else None) == expected
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
