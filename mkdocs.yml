@@ -94,6 +94,7 @@ nav:
       - Docs for coding agents: coding-agents.md
   - Design:
       - Principles and guarantees: design.md
+      - Comparison with other frameworks: comparison.md
   - API reference:
       - Agent: reference/agent.md
       - Tools: reference/tools.md

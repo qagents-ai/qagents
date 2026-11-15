@@ -38,6 +38,7 @@ This index describes qagents 0.2.0. Every page below, in this order, is also in 
 ## Design
 
 - [Principles and guarantees](design/): qagents is designed for agents whose work spans model requests, tool calls, human decisions, and process restarts.
+- [Comparison with other frameworks](comparison/): This page compares qagents with six other Python agent frameworks on the points that decide a choice for long-running agents: durable runs, human approvals, what happens to external writes after a...
 
 ## API reference
 
