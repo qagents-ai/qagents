@@ -222,17 +222,32 @@ async def test_e7_failed_second_fence_records_not_sent(monkeypatch):
     assert len(checks) == 2
 
 
-async def test_e5_async_timeout_cancels_and_records_actual_end():
+async def test_e5_async_timeout_cancels_and_records_actual_end(monkeypatch):
     scope, _, _ = host()
     ended = []
+    entered = asyncio.Event()
+    original_wait = asyncio.wait
+    first_wait = True
+
+    async def timeout_after_entry(tasks, *, timeout):
+        nonlocal first_wait
+        if first_wait:
+            first_wait = False
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            return set(), set(tasks)
+        return await original_wait(tasks, timeout=timeout)
 
     async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
         try:
+            entered.set()
             await asyncio.Event().wait()
         finally:
             ended.append(True)
 
-    outcome = await dispatch(declared(send, timeout=0.01), scope)
+    # Establish entry before the timeout decision: an overloaded scheduler may
+    # legitimately exhaust a 10 ms budget before user code starts (not_sent).
+    monkeypatch.setattr(engine.asyncio, "wait", timeout_after_entry)
+    outcome = await dispatch(declared(send, timeout=5), scope)
     assert outcome.kind == "held" and outcome.error_kind == "timeout"
     assert ended == [True]
     assert scope.journal.entries[-1].data["send_ended"]
@@ -361,6 +376,48 @@ async def test_transport_delayed_past_deadline_does_not_enter_send_callback():
         outcome = await dispatch(declared(send, timeout=0.01), scope)
     finally:
         ports.TRANSPORT.reset(token)
+    assert outcome.kind == "not_sent"
+    assert scope.journal.entries[-1].data["why"] == "not_sent"
+
+
+async def test_early_timer_timeout_closes_send_before_clock_deadline(monkeypatch):
+    # asyncio may coalesce timers before their deadline by the host clock quantum.
+    # Once dispatch decides to time out, a transport cannot revive its callback.
+    scope, _, _ = host()
+    entered = asyncio.Event()
+    observed_before_deadline = []
+    original_wait = asyncio.wait
+    first_wait = True
+
+    async def early_wait(tasks, *, timeout):
+        nonlocal first_wait
+        if first_wait:
+            first_wait = False
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            return set(), set(tasks)
+        return await original_wait(tasks, timeout=timeout)
+
+    class Transport:
+        async def send(self, effect, ctx, attempt, call_send):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                observed_before_deadline.append(
+                    asyncio.get_running_loop().time() < attempt.deadline
+                )
+                return await call_send()
+
+    async def send(ctx: EffectContext, attempt: Attempt[Request]) -> Receipt:
+        raise AssertionError("a closed attempt must not enter user code")
+
+    monkeypatch.setattr(engine.asyncio, "wait", early_wait)
+    token = ports.TRANSPORT.set(Transport())
+    try:
+        outcome = await dispatch(declared(send, timeout=5), scope)
+    finally:
+        ports.TRANSPORT.reset(token)
+    assert observed_before_deadline == [True]
     assert outcome.kind == "not_sent"
     assert scope.journal.entries[-1].data["why"] == "not_sent"
 

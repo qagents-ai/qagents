@@ -132,6 +132,10 @@ class _VirtualTime:
         self.inconclusive_reasons: list[str] = []
         self.thread_started = None
         super().__init__()
+        # Virtual timers must not inherit the host clock's coalescing quantum
+        # (15.6 ms on some Windows versions). Keep distinct scheduled events ordered.
+        # asyncio needs a positive epsilon to dispatch a timer exactly at clock.time().
+        self._clock_resolution = 1e-9
         try:
             _check_shape(self)
         except BaseException:

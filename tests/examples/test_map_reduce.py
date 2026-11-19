@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import runpy
@@ -36,16 +37,22 @@ def policy(request):
 
 
 class Tracking(FunctionModel):
-    """A FunctionModel that streams slowly and records how many requests overlapped."""
+    """Hold the first batch together and record how many requests overlapped."""
 
     def __init__(self, function) -> None:
         super().__init__(function, delay=0.002)
         self.active = self.peak = 0
+        self.first_batch = asyncio.Event()
 
     async def stream(self, request):
         self.active += 1
         self.peak = max(self.peak, self.active)
         try:
+            if system_text(request).startswith("You summarise one document"):
+                if self.active >= 3:
+                    self.first_batch.set()
+                await asyncio.wait_for(self.first_batch.wait(), timeout=5)
+                await asyncio.sleep(0)
             async for event in super().stream(request):
                 yield event
         finally:

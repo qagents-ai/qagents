@@ -9,6 +9,16 @@ every such change is listed under "Changed").
 
 ### Added
 
+#### Repeated evaluation
+
+- `TrialTarget` supplies the case and repetition index to isolated trial factories.
+- `reliability()` reports pass@k and pass^k from complete repeated results;
+  `compare_reliability()` compares matched cases with a seeded case bootstrap.
+  The reliability guide and executable example describe their assumptions.
+- Reject delayed effect callbacks after the dispatch timeout decision, including
+  early timer wakeups on Windows. Virtual crash timers no longer inherit a coarse
+  host clock resolution, preserving scheduled event order on Python 3.11.
+
 #### External agents
 
 - `qagents.external`: `ExternalAgent`, the contract for another agent program that runs its

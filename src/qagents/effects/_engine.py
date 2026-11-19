@@ -536,6 +536,7 @@ async def _dispatch(
         )
         ctx = types.EffectContext(scope.deps, session_id=scope.session_id, emit=scope.emit)
         raw = None
+        timed_out = False
 
         async def invoke() -> Any:
             nonlocal raw
@@ -545,13 +546,13 @@ async def _dispatch(
 
                 async def call_send() -> Any:
                     nonlocal raw
-                    if loop.time() >= attempt.deadline:
+                    if timed_out or loop.time() >= attempt.deadline:
                         raise _DispatchNotSent()
                     if effect.is_async:
                         return await effect.send(ctx, attempt)
 
                     def call_sync() -> Any:
-                        if loop.time() >= attempt.deadline:
+                        if timed_out or loop.time() >= attempt.deadline:
                             raise _DispatchNotSent()
                         return effect.send(ctx, attempt)
 

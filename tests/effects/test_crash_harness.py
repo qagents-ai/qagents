@@ -13,6 +13,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel
@@ -46,6 +47,19 @@ from qagents.testing.crash._transport import HarnessTransport
 from qagents.testing.crash._world import LEG, Boundary, LegCrashed, World, WorldSealed, WorldStore
 from qagents.testing.stores import _intent as _store_probe_intent
 from qagents.testing.stores import check_store
+
+
+def test_virtual_timer_order_is_independent_of_host_clock_resolution(monkeypatch):
+    monkeypatch.setattr(time, "get_clock_info", lambda name: SimpleNamespace(resolution=0.015625))
+    loop = VirtualLoop()
+    observed = []
+    try:
+        loop.call_later(1, lambda: observed.append(loop.time()))
+        loop.call_later(1.001, lambda: observed.append(loop.time()))
+        loop.run_until_complete(asyncio.sleep(1.002))
+    finally:
+        loop.close()
+    assert observed == pytest.approx([1, 1.001], abs=1e-9)
 
 
 class _RefundRequest(BaseModel):
