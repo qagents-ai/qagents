@@ -226,6 +226,7 @@ src/qagents/external/ ExternalAgent: the base class for agents that run their ow
                       are driven over a control protocol; ScriptedExternalAgent for tests.
                       Modules: contract, permissions, turn, agent, tool, changes, scripted
 src/qagents/prompts.py the strings qagents itself sends to a model (see "Nothing hidden")
+src/qagents/eval_statistics.py repeated-trial reliability estimates and paired case bootstrap
 src/qagents/models/   QCloudModel, OpenAIChatModel, AnthropicModel, FallbackModel, testing models
 src/qagents/toolkits/ files, shell, web, notes, planning, human, mcp (MCPToolkit)
 src/qagents/stores/   PostgresStore (the postgres extra)

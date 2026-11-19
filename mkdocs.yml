@@ -87,6 +87,7 @@ nav:
       - Model providers: providers.md
       - Ready-made tools: toolkits.md
       - Testing agents: testing.md
+      - Repeated-run reliability: guides/reliability.md
       - Serving over HTTP: serving.md
       - Devvi as a coding worker: integrations/devvi.md
       - Any ACP agent: integrations/acp.md

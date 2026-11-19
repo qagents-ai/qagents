@@ -79,6 +79,11 @@ memory changes. Keep training episodes separate from evaluation episodes. Gym ca
 evaluation and training-data exports; a file export is not evidence that fine-tuning or RL
 improved a model. Weight training remains a separate, explicitly configured training job.
 
-The public qagents version remains 0.2.0. The completed prerequisite fixes improve journals,
-leases and workflow recovery; the proposed Effects API and crash-test harness belong to
-later implementation stages.
+The package version remains 0.2.0. The current main checkout also includes the Effects 0.3
+preview and crash harness. Check the installed API when using unreleased capabilities.
+
+Gym's [environment rollout guide](https://github.com/mpvasilis/qagent-gym/blob/main/docs/environment-rollouts.md)
+adds multi-step observations, actions and environment-supplied rewards, including an optional
+Gymnasium adapter. A Gym generator can select each action using a fixed context snapshot.
+QAgents' [reliability utilities](../guides/reliability.md) measure repeated outcomes and compare
+paired cases; `TrialTarget` supplies the repetition index for seeded environment trials.

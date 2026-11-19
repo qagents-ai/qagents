@@ -100,6 +100,13 @@ from .workflow import Workflow, WorkflowStatus
 
 if TYPE_CHECKING:
     # Re-exports for type checkers; at run time __getattr__ resolves them.
+    from .eval_statistics import CaseReliability as CaseReliability
+    from .eval_statistics import PairedComparison as PairedComparison
+    from .eval_statistics import ReliabilityReport as ReliabilityReport
+    from .eval_statistics import SuccessEstimate as SuccessEstimate
+    from .eval_statistics import compare_reliability as compare_reliability
+    from .eval_statistics import reliability as reliability
+    from .evals import TrialTarget as TrialTarget
     from .external import ExternalAgent as ExternalAgent
     from .external import ExternalApproval as ExternalApproval
     from .external import ExternalCapabilities as ExternalCapabilities
@@ -113,6 +120,13 @@ if TYPE_CHECKING:
 __version__ = "0.2.0"
 
 _LAZY = {
+    "TrialTarget": "qagents.evals",
+    "SuccessEstimate": "qagents.eval_statistics",
+    "CaseReliability": "qagents.eval_statistics",
+    "ReliabilityReport": "qagents.eval_statistics",
+    "PairedComparison": "qagents.eval_statistics",
+    "reliability": "qagents.eval_statistics",
+    "compare_reliability": "qagents.eval_statistics",
     "AnthropicModel": "qagents.models.anthropic",
     "ExternalAgent": "qagents.external",
     "ExternalApproval": "qagents.external",
@@ -123,7 +137,7 @@ _LAZY = {
     "MLflowHooks": "qagents.integrations.mlflow",
     "PostgresStore": "qagents.stores.postgres",
 }
-"""Names from optional extras, and the external-agent API, resolved on first access."""
+"""Optional extras, external agents and evaluation utilities, resolved on first access."""
 
 _NEEDS = {"MCPToolkit": ("mcp", "mcp_types")}
 """Lazy names whose module cannot be imported without these packages."""
@@ -152,6 +166,13 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
+    "TrialTarget",
+    "SuccessEstimate",
+    "CaseReliability",
+    "ReliabilityReport",
+    "PairedComparison",
+    "reliability",
+    "compare_reliability",
     "Agent",
     "AgentRuntime",
     "Approval",

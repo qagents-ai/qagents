@@ -64,6 +64,10 @@ from pydantic_core import to_jsonable_python
 from . import prompts
 from .agent import Agent, Limits, RunStream, extract_json
 from .errors import ConfigurationError
+from .eval_statistics import PairedComparison as PairedComparison
+from .eval_statistics import ReliabilityReport as ReliabilityReport
+from .eval_statistics import compare_reliability as compare_reliability
+from .eval_statistics import reliability as reliability
 from .hooks import Hooks
 from .messages import Message, Usage
 from .models.base import Model, ModelSettings
@@ -1013,7 +1017,24 @@ class EvalReport(BaseModel):
 
 # --- running ----------------------------------------------------------------------
 
-Target = Agent | Callable[[Case], Any]
+
+@dataclass(frozen=True)
+class TrialTarget:
+    """An evaluation factory receiving (case, zero-based repetition).
+
+    Use the repetition to choose a reproducible seed or create fresh application
+    state. The function may be sync or async and returns an Agent or RunResult.
+    Existing one-argument case targets keep their behavior.
+    """
+
+    function: Callable[[Case, int], Any]
+
+    def __post_init__(self) -> None:
+        if not callable(self.function):
+            raise ConfigurationError("TrialTarget requires a callable")
+
+
+Target = Agent | Callable[[Case], Any] | TrialTarget
 """An agent, or a function of the case (sync or async) returning an `Agent` to run
 or a `RunResult` it produced itself."""
 
@@ -1035,8 +1056,9 @@ async def evaluate(
     """Run every case through ``target`` and score each run.
 
     Args:
-        target: An `Agent`, or a function of the `Case` (sync or async) that
-            returns an `Agent` to run or a `RunResult` it produced itself. A
+        target: An `Agent`, a function of the `Case`, or a `TrialTarget` whose
+            function also receives the repetition index. The function returns
+            an `Agent` to run or a `RunResult` it produced itself. A
             sync function runs in a worker thread, so it may block.
         dataset: The cases to run.
         evaluators: Evaluators, or plain functions (wrapped in `Custom`).
@@ -1069,7 +1091,7 @@ async def evaluate(
         raise ConfigurationError("evaluate(concurrency=...) must be 1 or more.")
     if repeat < 1:
         raise ConfigurationError("evaluate(repeat=...) must be 1 or more.")
-    if not isinstance(target, Agent) and not callable(target):
+    if not isinstance(target, (Agent, TrialTarget)) and not callable(target):
         raise ConfigurationError(
             f"Cannot evaluate {target!r}: pass an Agent, or a function of the case that "
             "returns an Agent or a RunResult."
@@ -1156,7 +1178,7 @@ async def _run_case(
     structured: bool | None = None
     began = time.perf_counter()
     try:
-        produced = await _produce(target, case)
+        produced = await _produce(target, case, index)
         if isinstance(produced, Agent):
             structured = produced.output_type is not None
             session = new_session(case, index)
@@ -1236,13 +1258,15 @@ async def _run_case(
     )
 
 
-async def _produce(target: Target, case: Case) -> Any:
+async def _produce(target: Target, case: Case, index: int) -> Any:
     if isinstance(target, Agent):
         return target
-    if _is_async_callable(target):
-        produced = target(case)
+    function = target.function if isinstance(target, TrialTarget) else target
+    args = (case, index) if isinstance(target, TrialTarget) else (case,)
+    if _is_async_callable(function):
+        produced = function(*args)
     else:
-        produced = await asyncio.to_thread(target, case)
+        produced = await asyncio.to_thread(function, *args)
     if inspect.isawaitable(produced):
         produced = await produced
     return produced
@@ -1587,7 +1611,8 @@ def _is_async_callable(function: Any) -> bool:
 def _target_label(target: Target) -> str:
     if isinstance(target, Agent):
         return f"{target.name} ({target.model.provider}:{target.model.name})"
-    return getattr(target, "__name__", None) or type(target).__name__
+    function = target.function if isinstance(target, TrialTarget) else target
+    return getattr(function, "__name__", None) or type(function).__name__
 
 
 def _ended(ctx: EvalContext) -> str:

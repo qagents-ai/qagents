@@ -29,6 +29,7 @@ This index describes qagents 0.2.0. Every page below, in this order, is also in 
 - [Model providers](providers/): A provider is a subclass of Model. Three ship with qagents, and two more are for tests.
 - [Ready-made tools](toolkits/): qagents.toolkits has factories that return ordinary tools. Give them to an agent like your own.
 - [Testing agents](testing/): The loop, your tools, your permissions and your hooks can all run in a unit test, with no network and no model.
+- [Repeated-run reliability](guides/reliability/): Use repeated evaluation when an agent must work consistently.
 - [Serving over HTTP](serving/): qagents is a library: it runs inside your web service, worker or script.
 - [Devvi as a coding worker](integrations/devvi/): Devvi is a coding agent: a fork of DeepSeek Harness, MIT-licensed.
 - [Any ACP agent](integrations/acp/): The Agent Client Protocol (ACP) is how a program drives a coding agent: open a session in a workspace, send a prompt, follow what the agent does, answer its permission requests, cancel it.

@@ -29,6 +29,9 @@ async def test_weather_question():
 
 ## Scripted replies
 
+For repeated evaluations, pass@k, pass^k and paired confidence intervals, see
+[Repeated-run reliability](guides/reliability.md).
+
 `ScriptedModel(replies)` answers with the given replies, in order, and fails the test if the
 agent asks for more replies than the script has. A reply can be:
 

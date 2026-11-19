@@ -445,6 +445,11 @@ what each example actually exercises. qagents itself contains no Gym adapter cod
 
 ## Testing your agents
 
+Repeated evaluations can measure both pass@k and pass^k, with paired confidence
+intervals across cases. `TrialTarget` gives each repetition a stable index for
+seeds and fresh fixtures. Run `python -m examples.reliability` or read the
+[reliability guide](docs/guides/reliability.md).
+
 Keep your application tools and stores; replace the model with a deterministic script:
 
 ```python
