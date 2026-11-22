@@ -18,7 +18,7 @@ from pydantic import BaseModel
 anthropic = pytest.importorskip("anthropic")
 httpx2 = pytest.importorskip("httpx2")
 
-from qagents import Agent, ImagePart, Message, ModelSettings, TextPart, tool  # noqa: E402
+from qagents import Agent, ImagePart, Limits, Message, ModelSettings, TextPart, tool  # noqa: E402
 from qagents.errors import (  # noqa: E402
     ConfigurationError,
     ModelAuthenticationError,
@@ -719,17 +719,39 @@ async def test_cost_uses_overridden_prices_and_is_none_for_unknown_models():
         reply(text_events(0, "ok"), start=message_start(model="claude-x")),
     )
     priced = make_model(fake, "claude-x", pricing=custom)
-    assert (
-        await priced.request(ModelRequest(messages=[Message.user("hi")]))
-    ).usage.cost_usd == pytest.approx(0.003)
+    priced_usage = (await priced.request(ModelRequest(messages=[Message.user("hi")]))).usage
+    assert priced_usage.cost_usd == pytest.approx(0.003)
+    assert priced_usage.cost_complete
     unpriced = make_model(fake, "claude-x")
-    assert (
-        await unpriced.request(ModelRequest(messages=[Message.user("hi")]))
-    ).usage.cost_usd is None
+    unpriced_usage = (await unpriced.request(ModelRequest(messages=[Message.user("hi")]))).usage
+    assert unpriced_usage.cost_usd is None
+    assert not unpriced_usage.cost_complete
     haiku = PRICING["claude-haiku-5-5"]
     assert haiku.cost(input_tokens=200_000, output_tokens=0) == pytest.approx(
         0.1
     )  # long-context tier
+
+
+async def test_the_agent_continues_after_a_priced_claude_tool_turn_under_budget():
+    @tool(read_only=True)
+    def count_characters(text: str) -> int:
+        """Count characters in the draft."""
+        return len(text)
+
+    fake = FakeAnthropic(
+        reply(
+            tool_events(0, "toolu_1", "count_characters", '{"text":"A draft"}'),
+            stop_reason="tool_use",
+        ),
+        reply(text_events(0, "A draft")),
+    )
+    agent = Agent(make_model(fake), tools=[count_characters], limits=Limits(max_cost_usd=0.5))
+
+    result = await agent.run("Return a measured draft")
+
+    assert (result.status, result.output) == ("completed", "A draft")
+    assert result.usage.cost_complete and 0 < result.usage.cost_usd < 0.5
+    assert len(fake.bodies) == 2
 
 
 async def test_invalid_tool_arguments_are_reported_not_guessed():
@@ -866,6 +888,7 @@ async def test_pause_turn_is_continued_within_one_model_request():
     }
     assert response.message.text == "Searching. Done." and response.finish_reason == "stop"
     assert response.usage.requests == 2 and response.usage.input_tokens == 40
+    assert response.usage.cost_complete
 
 
 async def test_a_stream_that_stops_early_is_an_ambiguous_error():

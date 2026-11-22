@@ -982,15 +982,14 @@ class AnthropicModel(Model):
         last = responses[-1]
         parts: list[Part] = []
         usage = Usage()
-        cost: float | None = 0.0
         metadata: dict[str, Any] = {}
         for accumulator in responses:
             parts.extend(accumulator.parts())
-            usage = usage.add(accumulator.usage())
-            piece = self._cost(accumulator)
-            cost = None if cost is None or piece is None else cost + piece
+            segment = accumulator.usage()
+            segment.cost_usd = self._cost(accumulator)
+            # Usage.add classifies each segment by whether its price is known.
+            usage = usage.add(segment)
             metadata.update(accumulator.metadata())
-        usage.cost_usd = cost
         # The size of the last request sent, unlike usage, which sums every segment.
         context_tokens = metadata["context_tokens"] = last.context_tokens()
         finish = _FINISH_REASONS.get(last.stop_reason or "", "stop")

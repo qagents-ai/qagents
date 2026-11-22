@@ -514,6 +514,41 @@ async def test_a_refusing_worker_is_an_error_not_an_answer():
     ]
 
 
+async def test_a_truncated_worker_is_an_error_even_when_its_json_validates():
+    class Facts(BaseModel):
+        facts: list[str]
+
+    cut = ModelResponse(
+        message=Message.assistant('{"facts": ["Only one finding"]}'), finish_reason="length"
+    )
+    worker = Agent(ScriptedModel([cut]), name="worker", output_type=Facts)
+    lead = Agent(
+        ScriptedModel([call("worker_parallel", tasks=["Gather findings"]), "Try again later"]),
+        tools=[fan_out(worker)],
+    )
+
+    result = await lead.run("Report all findings")
+
+    assert fan_out_result(result) == [
+        {
+            "task": "Gather findings",
+            "error": prompts.SUBAGENT_STOPPED.format(name="worker", reason="max_output_tokens"),
+        }
+    ]
+
+
+async def test_route_does_not_start_a_specialist_after_a_truncated_classifier_reply():
+    cut = ModelResponse(message=Message.assistant("billing"), finish_reason="length")
+    classifier = Agent(ScriptedModel([cut]), name="classifier")
+    routes = specialists()
+
+    result = await route(classifier, routes, "Which team should handle this?", default="technical")
+
+    assert result.route is None
+    assert result.classification.stop_reason == "max_output_tokens"
+    assert all(not agent.model.requests for agent in routes.values())
+
+
 async def test_a_worker_too_deep_is_reported_without_a_traceback(caplog):
     worker_model = ScriptedModel([])
     worker = Agent(worker_model, name="worker")

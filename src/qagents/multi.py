@@ -193,8 +193,7 @@ async def _run_task(agent: Agent, ctx: RunContext[Any], label: str, task: str) -
         }
     result = stream.result
     assert result is not None
-    if result.status != "completed" or result.stop_reason == "content_filter":
-        # A refusal is not an answer, even though the run ended "completed".
+    if result.status != "completed" or result.stop_reason is not None:
         stopped = prompts.SUBAGENT_STOPPED.format(
             name=agent.name, reason=result.stop_reason or result.status
         )
@@ -209,7 +208,7 @@ class RouteResult(BaseModel):
 
     route: str | None
     """The route that handled the prompt; ``None`` when the classifier did not
-    finish (it paused, hit a limit, was blocked or refused) and no route ran."""
+    finish (it paused, hit a limit, was blocked, truncated or refused) and no route ran."""
     used_default: bool = False
     """The classifier's answer named no route, so ``default=`` was taken."""
     result: RunResult
@@ -296,7 +295,7 @@ async def route(
     classification = await classifier.run(
         prompt, deps=deps, session=classifier_session, parent=parent
     )
-    if classification.status != "completed" or classification.stop_reason == "content_filter":
+    if classification.status != "completed" or classification.stop_reason is not None:
         return RouteResult(route=None, result=classification, classification=classification)
     chosen = _match_route(classification.output, routes)
     used_default = chosen is None

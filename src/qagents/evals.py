@@ -786,7 +786,7 @@ class LLMJudge(Evaluator):
         )
 
     async def __call__(self, ctx: EvalContext) -> EvaluatorResult:
-        if ctx.result.status != "completed":
+        if ctx.result.status != "completed" or ctx.result.stop_reason is not None:
             # Grading an answer that was never finished costs a request and proves nothing.
             return self._verdict(False, f"not graded: {_ended(ctx)}")
         stream: RunStream | None = None
@@ -800,7 +800,7 @@ class LLMJudge(Evaluator):
         if result.status != "completed":
             reason = result.stop_reason or result.status
             return self._failed(f"the judge did not finish ({reason})", result.usage)
-        if result.output is None:  # a refusal (content_filter) gives no structured output
+        if result.stop_reason is not None or result.output is None:
             reason = result.stop_reason or "no output"
             return self._failed(f"the judge gave no verdict ({reason})", result.usage)
         try:
@@ -1072,8 +1072,8 @@ async def evaluate(
         metadata: Anything to record with the report (logged as MLflow params).
         store: Where the case sessions are kept, so failed runs can be inspected
             afterwards. By default every case gets a fresh in-memory session.
-        require_completed: A run that did not complete (paused, limit reached,
-            cancelled) fails its case, whatever the evaluators say.
+        require_completed: A run that ends without a final answer, including a
+            truncated or refused reply, fails its case, whatever the evaluators say.
         on_result: Called with every `CaseResult` as it is ready (sync or async),
             for progress output. If it raises, the evaluation stops with that error.
 
@@ -1235,7 +1235,7 @@ async def _run_case(
         structured=structured,
     )
     evaluations = [await _apply(check, ctx) for check in checks]
-    completed = result.status == "completed"
+    completed = result.status == "completed" and result.stop_reason is None
     passed = (completed or not require_completed) and all(item.passed for item in evaluations)
     if structured is None:  # a RunResult from a target function: text is in output_text
         structured = not isinstance(result.output, str)

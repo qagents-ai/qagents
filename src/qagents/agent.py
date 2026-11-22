@@ -763,8 +763,8 @@ class Agent:
         when it fails or is cancelled) and its events are forwarded as
         `SubagentEvent`, ``run_started`` included (``run_finished`` is not:
         its result is the tool result). A sub-agent run that pauses, is
-        blocked, stops at a limit, is refused by the provider or would nest
-        too deep is reported to the caller as an error result.
+        blocked, stops at a limit, is truncated or refused by the provider,
+        or would nest too deep is reported to the caller as an error result.
 
         Args:
             name: Tool name; defaults to the agent's name.
@@ -799,7 +799,7 @@ class Agent:
                         )
             result = stream.result
             assert result is not None  # its usage reached the caller's run as it ended
-            if result.status != "completed" or result.stop_reason == "content_filter":
+            if result.status != "completed" or result.stop_reason is not None:
                 raise ToolError(
                     prompts.SUBAGENT_STOPPED.format(
                         name=agent.name, reason=result.stop_reason or result.status

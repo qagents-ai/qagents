@@ -363,13 +363,15 @@ class Workflow:
         (with a new ``run_paused`` entry); to read a paused step without
         running anything, use `status`.
 
-        Only a ``completed`` run is recorded as the step's result. When the
-        step's run ended otherwise (blocked by a guardrail, at a limit,
-        cancelled), the next ``run_agent`` starts a new run in the step's
-        session: it sends ``prompt`` again, and the model sees the earlier
-        attempt. When the step's run completed but the process died before
-        the step was recorded, the result is rebuilt from the step's journal
-        and recorded, and the agent is not run again.
+        Only a ``completed`` run with an untruncated reply is recorded as the
+        step's result. A reply cut off at ``max_output_tokens`` is returned
+        to the caller with that stop reason. After a truncated reply or another
+        stop (a guardrail, a limit or cancellation), the next ``run_agent`` starts
+        a new run in the step's session: it sends ``prompt`` again, and the
+        model sees the earlier attempt. When the step's run completed with an
+        untruncated reply but the process died before the step was recorded,
+        the result is rebuilt from the step's journal and recorded, and the
+        agent is not run again.
 
             result = await wf.run_agent("plan", planner, "Plan the launch")
             if result.status == "paused":
@@ -448,7 +450,7 @@ class Workflow:
                 stream = agent.stream(prompt, session=session, state=state, **options)
                 await self._note_agent_step(name, session, stream.run_id)
                 result = await _drive(stream, on_event)
-            if result.status == "completed":
+            if result.status == "completed" and result.stop_reason != "max_output_tokens":
                 recorded = to_jsonable_python(result)
                 await self._journal.append("workflow_step", {"name": name, "result": recorded})
                 await self._scan()
@@ -698,7 +700,11 @@ class Workflow:
         run_id = entries[start].run_id
         own = [entry for entry in entries[start:] if entry.run_id == run_id]
         finish = next((entry for entry in own if entry.kind == "run_finished"), None)
-        if finish is None or finish.data.get("status") != "completed":
+        if (
+            finish is None
+            or finish.data.get("status") != "completed"
+            or finish.data.get("stop_reason") == "max_output_tokens"
+        ):
             return None  # still open, or ended otherwise: the step runs again
         data = finish.data
         if "output" not in data:
