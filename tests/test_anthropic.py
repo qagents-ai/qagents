@@ -541,6 +541,40 @@ def test_constructor_fails_early_on_bad_options():
         AnthropicModel(fallbacks="always")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("thinking", "reason"),
+    [
+        ({"type": "disabled"}, "requires adaptive thinking"),
+        ({"type": "enabled", "budget_tokens": 1024}, "requires adaptive thinking"),
+        ({"type": "between_tools"}, "requires adaptive thinking"),
+        ("adaptive", "thinking must be a JSON object"),
+        ([], "thinking must be a JSON object"),
+    ],
+)
+def test_opus_5_5_rejects_incompatible_thinking_modes_before_sending(thinking, reason):
+    options = {"thinking": thinking}
+    with pytest.raises(ModelBadRequestError, match=reason):
+        AnthropicModel("claude-opus-5-5", request_options=options)
+    with pytest.raises(ModelBadRequestError, match=reason):
+        AnthropicModel("claude-opus-5-5").validate_settings(ModelSettings(extra=options))
+
+
+def test_opus_5_5_can_omit_thinking_or_set_adaptive_display():
+    model = AnthropicModel("claude-opus-5-5", effort="high")
+    request = ModelRequest(messages=[Message.user("Review this proposal.")])
+    params = model.build_params(request)
+    assert "thinking" not in params and params["output_config"]["effort"] == "high"
+    adaptive = {"type": "adaptive", "display": "omitted"}
+    settings = ModelSettings(extra={"thinking": adaptive})
+    assert (
+        model.build_params(request.model_copy(update={"settings": settings}))["thinking"]
+        == adaptive
+    )
+    AnthropicModel(
+        "claude-opus-5", effort="high", request_options={"thinking": {"type": "disabled"}}
+    )
+
+
 def test_structured_output_is_sent_to_the_4_x_models_too():
     schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
     request = ModelRequest(messages=[Message.user("hi")], output=OutputSpec(json_schema=schema))

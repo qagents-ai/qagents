@@ -660,8 +660,17 @@ class AnthropicModel(Model):
             raise self._bad_request(f"{self.name} has no effort parameter (output_config.effort).")
         if effort == "xhigh" and base in NO_XHIGH_EFFORT:
             raise self._bad_request(f"{self.name} has no 'xhigh' effort; use 'high' or 'max'.")
-        thinking = extra.get("thinking") or {}
-        if thinking.get("type") == "adaptive" and base in MANUAL_THINKING_ONLY:
+        thinking = extra.get("thinking")
+        if (
+            base == "claude-opus-5-5"
+            and thinking is not None
+            and thinking.get("type") != "adaptive"
+        ):
+            raise self._bad_request(
+                f"{self.name} requires adaptive thinking. Omit thinking or set its type "
+                "to 'adaptive' and use output_config.effort to control reasoning depth."
+            )
+        if thinking and thinking.get("type") == "adaptive" and base in MANUAL_THINKING_ONLY:
             raise self._bad_request(
                 f"{self.name} has no adaptive thinking; use {{'type': 'enabled', "
                 "'budget_tokens': N}."
