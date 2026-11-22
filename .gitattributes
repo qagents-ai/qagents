@@ -1,0 +1,3 @@
+* text=auto eol=lf
+# Byte-for-byte copies of Devvi's snapshots; one session log ends in a torn line on purpose.
+tests/fixtures/devvi/** -text

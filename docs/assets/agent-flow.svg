@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+<title id="title">Deep work, with continuity</title>
+<desc id="desc">A long-running agent plans, uses typed tools, pauses for human review and resumes. Sessions retain execution history and state. Application memory supplies scoped context.</desc>
+<defs>
+              <linearGradient id="night" x2="1" y2="1">
+                <stop stop-color="#122b38"/><stop offset="1" stop-color="#101722"/>
+              </linearGradient>
+              <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+                <circle cx="1" cy="1" r="1" fill="#476272" opacity=".22"/>
+              </pattern>
+              <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 1 1 L 8 5 L 1 9" fill="none" stroke="#6d9b9a" stroke-width="1.5"/>
+              </marker>
+            </defs>
+<g font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif">
+<rect x="0" y="0" width="1200" height="620" rx="26" fill="url(#night)" stroke="none"/>
+<rect x="0" y="0" width="1200" height="620" rx="26" fill="url(#dots)" stroke="none"/>
+<text x="48" y="48" fill="#8ce6c4" font-size="15" font-weight="700" text-anchor="start">01</text>
+<text x="90" y="48" fill="#a8becb" font-size="15" font-weight="600" text-anchor="start">THE AGENT JOURNEY</text>
+<text x="48" y="105" fill="#f7fbfa" font-size="42" font-weight="650" text-anchor="start">Deep work, with continuity.</text>
+<text x="48" y="143" fill="#a8becb" font-size="20" font-weight="400" text-anchor="start">Plan across steps. Delegate work. Keep context when the conversation pauses.</text>
+<path d="M101 219H1099" fill="none" stroke="#38545f" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="72" cy="219" r="15" fill="#101e2b" stroke="#8ce6c4"/>
+<text x="72" y="224" fill="#8ce6c4" font-size="12" font-weight="700" text-anchor="middle">01</text>
+<rect x="48" y="252" width="249" height="154" rx="16" fill="#1b303d" stroke="#35505c"/>
+<g transform="translate(68 271) scale(1)">
+<path d="M3 4h18v20H3z M8 9h8 M8 14h8 M8 19h5" fill="none" stroke="#8ce6c4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="106" y="293" fill="#f7fbfa" font-size="23" font-weight="600" text-anchor="start">Plan &amp; delegate</text>
+<text x="68" y="336" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">Break down a task.</text>
+<text x="68" y="366" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">Call specialist agents.</text>
+<path d="M172 407V448" fill="none" stroke="#426c73" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 7"/>
+<circle cx="357" cy="219" r="15" fill="#101e2b" stroke="#8ce6c4"/>
+<text x="357" y="224" fill="#8ce6c4" font-size="12" font-weight="700" text-anchor="middle">02</text>
+<rect x="333" y="252" width="249" height="154" rx="16" fill="#1b303d" stroke="#35505c"/>
+<g transform="translate(353 271) scale(1)">
+<path d="M5 6l-4 7 4 7 M19 6l4 7-4 7 M15 3l-6 20" fill="none" stroke="#8ce6c4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="391" y="293" fill="#f7fbfa" font-size="23" font-weight="600" text-anchor="start">Use tools</text>
+<text x="353" y="336" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">Validate arguments.</text>
+<text x="353" y="366" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">Apply permissions in code.</text>
+<path d="M457 407V448" fill="none" stroke="#426c73" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 7"/>
+<circle cx="642" cy="219" r="15" fill="#101e2b" stroke="#f3cc85"/>
+<text x="642" y="224" fill="#f3cc85" font-size="12" font-weight="700" text-anchor="middle">03</text>
+<rect x="618" y="252" width="249" height="154" rx="16" fill="#1b303d" stroke="#35505c"/>
+<g transform="translate(638 271) scale(1)">
+<path d="M3 13l6 6L22 5" fill="none" stroke="#f3cc85" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="676" y="293" fill="#f7fbfa" font-size="23" font-weight="600" text-anchor="start">Review</text>
+<text x="638" y="336" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">Pause for a decision.</text>
+<text x="638" y="366" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">Inspect the proposed action.</text>
+<path d="M742 407V448" fill="none" stroke="#426c73" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 7"/>
+<circle cx="927" cy="219" r="15" fill="#101e2b" stroke="#c4b7fa"/>
+<text x="927" y="224" fill="#c4b7fa" font-size="12" font-weight="700" text-anchor="middle">04</text>
+<rect x="903" y="252" width="249" height="154" rx="16" fill="#1b303d" stroke="#35505c"/>
+<g transform="translate(923 271) scale(1)">
+<path d="M4 8a10 10 0 1 1-1 10 M4 1v7h7" fill="none" stroke="#c4b7fa" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="961" y="293" fill="#f7fbfa" font-size="23" font-weight="600" text-anchor="start">Resume</text>
+<text x="923" y="336" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">Load the saved session.</text>
+<text x="923" y="366" fill="#a8becb" font-size="17" font-weight="400" text-anchor="start">Continue from its journal.</text>
+<path d="M1027 407V448" fill="none" stroke="#426c73" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 7"/>
+<rect x="48" y="448" width="1104" height="120" rx="18" fill="#203e46" stroke="#3b6b6b"/>
+<g transform="translate(70 476) scale(1.2)">
+<path d="M3 7c0-5 20-5 20 0s-20 5-20 0v14c0 5 20 5 20 0V7 M3 14c0 5 20 5 20 0" fill="none" stroke="#8ce6c4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="116" y="487" fill="#8ce6c4" font-size="14" font-weight="700" text-anchor="start">CONTINUITY LAYER</text>
+<text x="116" y="524" fill="#f7fbfa" font-size="24" font-weight="600" text-anchor="start">Journal + structured state</text>
+<path d="M564 472V543" fill="none" stroke="#44646b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<g transform="translate(597 476) scale(1.2)">
+<path d="M13 1L2 6v9c0 6 11 11 11 11s11-5 11-11V6z M8 13l4 4 6-7" fill="none" stroke="#c4b7fa" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="643" y="487" fill="#c4b7fa" font-size="14" font-weight="700" text-anchor="start">APPLICATION MEMORY</text>
+<text x="643" y="524" fill="#f7fbfa" font-size="24" font-weight="600" text-anchor="start">Scoped retrieval + Gym playbooks</text>
+<text x="48" y="598" fill="#a8becb" font-size="16" font-weight="400" text-anchor="start">Provider choice, memory scope and action safety remain explicit application decisions.</text>
+</g></svg>

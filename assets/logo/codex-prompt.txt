@@ -1,0 +1,17 @@
+﻿Design a logo for "qagents", an open-source Python framework for building AI agents.
+
+What the project is about (use it for the concept, do not write these words in the logo):
+- one small, readable agent loop (model -> tools -> model) instead of graphs or crews;
+- an append-only journal: every step is written down first, so runs survive crashes, can be resumed and replayed, and every tool call happens exactly once;
+- several agents can work together; works with any model provider.
+
+Deliverables, all saved in the current working directory:
+1. Use your image generation tool to create three distinct logo concepts, each a square icon on a plain white background, flat vector style, no gradients, no 3D, no text inside the icon, readable at 32 px. Ideas to explore (pick your own if better): a lowercase "q" whose bowl is a closed loop with a small arrow or node showing the agent loop; a "q" built from stacked journal lines; a loop of three nodes forming a "q". Copy the generated images into this directory as concept-1.png, concept-2.png and concept-3.png.
+2. Choose the strongest concept and draw it by hand as clean SVG (simple paths, viewBox, no embedded raster, two colours at most plus an optional neutral):
+   - qagents-icon.svg: the icon alone, square.
+   - qagents-logo.svg: horizontal lockup, icon plus the wordmark "qagents" in lowercase; draw the wordmark letters as paths if you can, otherwise use <text> with font-family "Inter, Segoe UI, Helvetica, Arial, sans-serif".
+   - qagents-logo-dark.svg: the same lockup for dark backgrounds.
+   Suggested palette: deep indigo (#3B3F9E or similar) with one bright accent (teal or amber); adjust if your concept needs it, keep enough contrast on white and on #0D1117.
+3. Render PNG previews of the three SVGs at 512 px wide if a converter is available (for example with Python and cairosvg or resvg if installed; otherwise skip this and say so).
+4. Write LOGO.md describing the concept, the colours (hex), and which concept you picked and why.
+Do not access the network except through your image generation tool. Do not modify anything outside this directory.

@@ -1,0 +1,123 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qagents"
+version = "0.2.0"
+description = "A small, explicit agent framework: one loop, typed tools, durable sessions, provider-neutral with first-class QCloud support."
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = [
+    "agents",
+    "llm",
+    "tools",
+    "multi-agent",
+    "qcloud",
+    "anthropic",
+    "openai-compatible",
+    "mcp",
+    "mlflow",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.25,<1",
+    "pydantic>=2.6,<3",
+]
+
+[project.optional-dependencies]
+# qcloud-ai is not on PyPI yet. Until it is, install the SDK from source first
+# (see README), then this extra resolves against the installed package. It is
+# left out of "all" and "dev" for that reason.
+qcloud = ["qcloud-ai>=0.4.0"]
+# Claude through the Messages API (qagents.models.anthropic).
+anthropic = ["anthropic>=2.8,<3"]
+# MLflow tracing (qagents.integrations.mlflow) and qagents.evals.log_to_mlflow.
+mlflow = ["mlflow>=3.5,<4"]
+# Tools of MCP servers (qagents.toolkits.mcp), serving qagents tools over MCP
+# (qagents.integrations.mcp_server), and the docs server (python -m qagents.docs_mcp).
+mcp = ["mcp>=2.3,<3"]
+# The generic ACP client (qagents.integrations.acp): no extra dependency.
+acp = []
+# Devvi as a coding worker (qagents.integrations.devvi): no extra dependency.
+# expose_tools (qagents tools for Devvi's model) needs the mcp extra too.
+devvi = []
+# PostgresStore (qagents.stores.postgres), for AgentRuntime workers on several hosts.
+postgres = ["psycopg[binary]>=3.2,<4", "psycopg-pool>=3.2,<4"]
+# OpenTelemetry spans (qagents.tracing.OTelHooks).
+otel = ["opentelemetry-api>=1.20"]
+# JSONSchemaValid in qagents.evals.
+evals = ["jsonschema>=4.18"]
+all = ["qagents[anthropic,mlflow,mcp,postgres,otel,evals]"]
+dev = [
+    "qagents[all]",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+    "opentelemetry-sdk>=1.20",
+    "fastapi>=0.110",  # for examples/serve_fastapi.py and its test
+    "uvicorn>=0.30",  # the MCP streamable HTTP test serves the fixture server locally
+]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.26",
+]
+
+[project.scripts]
+qagents = "qagents.cli:main"
+
+[project.entry-points.pytest11]
+_qagents_pytest = "_qagents_pytest"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qagents"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/_qagents_pytest.py" = "_qagents_pytest.py"
+# The docs MCP server (python -m qagents.docs_mcp) reads these from the installed package,
+# so a wheel install answers from the docs of its own version.
+"docs" = "qagents/docs_mcp/_bundled/docs"
+"examples" = "qagents/docs_mcp/_bundled/examples"
+"README.md" = "qagents/docs_mcp/_bundled/README.md"
+"AGENTS.md" = "qagents/docs_mcp/_bundled/AGENTS.md"
+"skills/qagents/SKILL.md" = "qagents/docs_mcp/_bundled/skills/qagents/SKILL.md"
+"mkdocs.yml" = "qagents/docs_mcp/_bundled/mkdocs.yml"
+
+[tool.pytest.ini_options]
+addopts = "-p _qagents_pytest"
+markers = [
+    "integration_r1: effect engine and runtime integration",
+    "integration_r2: operators and recovery integration",
+    "integration_r3: crash harness integration",
+    "crash: exhaustive crash testing",
+    "mutants: seeded recovery defects",
+    "process: actual process termination recovery",
+    "network: opt-in live service probes",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Markdown is left alone: the formatter rewrites snippet-include lines in code blocks.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+# Tool.run takes the run's per-call limit as ``timeout`` and applies it itself.
+ignore = ["ASYNC109"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests keep wire payloads and expected values on one line so they read as tables.
+"tests/*" = ["E501"]

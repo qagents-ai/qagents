@@ -1,0 +1,19 @@
+flowchart TB
+  accTitle: The support review assistant and its approval boundary
+  accDescr: Read demo order details, propose a case, persist a pause and await the human decision. Approval writes a deduplicated case to SQLite. A declined action does not write to the review queue.
+  inspect["1 · INSPECT\nRead the order and its recorded facts"]
+  propose["2 · PROPOSE\nOrder id + reason for review"]
+  pause[("3 · PAUSE DURABLY\nShow the exact proposed arguments")]
+  decision{"Human decision"}
+  queue["4 · APPROVE\nQueue a case with a stable operation id"]
+  decline["DECLINE\nLeave the review queue unchanged"]
+  finish["5 · REPORT\nReturn the actual case id and status"]
+  inspect --> propose --> pause --> decision
+  decision -->|approved| queue --> finish
+  decision -->|declined| decline
+  classDef main fill:#ddf4e9,color:#133c36,stroke:#228063,stroke-width:2px;
+  classDef amber fill:#fff5df,color:#634919,stroke:#bf9652;
+  classDef muted fill:#f2f5f8,color:#263746,stroke:#a2b1bf;
+  class inspect,queue,finish main;
+  class pause,decision amber;
+  class propose,decline muted;

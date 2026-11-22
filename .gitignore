@@ -1,0 +1,23 @@
+.venv/
+.work/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+site/
+# The docs bundle a wheel build places in the package (pyproject force-include).
+src/qagents/docs_mcp/_bundled/
