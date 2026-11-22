@@ -11,7 +11,7 @@ The library includes a local documentation server and API checker to help
 Codex, Claude Code and other coding assistants build against the installed version.
 
 [Get started](#quickstart) | [Build with a coding assistant](#build-with-a-coding-assistant) |
-[Providers](#providers) | [Documentation](docs/index.md) |
+[Providers](#providers) | [Documentation](https://qagents-ai.github.io/qagents/) |
 [Application examples](https://github.com/qagents-ai/qagents-examples) |
 [QAgent Gym](https://github.com/qagents-ai/qagent-gym)
 
@@ -338,6 +338,12 @@ remain open. See [design and verification evidence](docs/design.md#what-is-verif
 and [Effects evidence](docs/effects-preview.md).
 
 ## Documentation
+
+Read the [public documentation](https://qagents-ai.github.io/qagents/), go straight
+to the [API reference](https://qagents-ai.github.io/qagents/reference/agent/), or
+follow the [Codex and Claude Code setup](https://qagents-ai.github.io/qagents/coding-agents/).
+The [QAgent Gym guides](https://qagents-ai.github.io/qagent-gym/) cover context
+learning, memory and evaluation. These sites update automatically from `main`.
 
 Start with [installation](docs/getting-started.md), then follow the
 [support review walkthrough](docs/guides/support-review.md). The

@@ -1,4 +1,5 @@
 site_name: QAgents
+site_url: https://qagents-ai.github.io/qagents/
 site_description: Long-running Python agents with persistent sessions, scoped memory and human review.
 repo_url: https://github.com/qagents-ai/qagents
 repo_name: qagents-ai/qagents

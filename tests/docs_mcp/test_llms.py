@@ -26,7 +26,10 @@ def test_writes_both_files(script, tmp_path, capsys, service):
     assert "## Concepts" in index
     links = re.findall(r"^- \[([^\]]+)\]\(([^)]+)\): (.+)$", index, re.MULTILINE)
     assert len(links) >= 30
-    assert ("Permissions and approvals", "concepts/permissions/") in [(t, u) for t, u, _ in links]
+    assert (
+        "Permissions and approvals",
+        "https://qagents-ai.github.io/qagents/concepts/permissions/",
+    ) in [(t, u) for t, u, _ in links]
     assert "research/" not in index and "<!-- page: research.md " not in full
 
     order = [entry.path for entry in service.corpus.nav]

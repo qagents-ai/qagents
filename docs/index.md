@@ -14,6 +14,9 @@ playbook when the agent needs knowledge from earlier sessions.
 [Browse application examples](https://github.com/qagents-ai/qagents-examples) |
 [Read the capability reference](capabilities.md)
 
+[QAgent Gym documentation](https://qagents-ai.github.io/qagent-gym/) covers
+learning loops, persistent playbooks and evaluation around the runtime.
+
 !!! note "Development status"
     The package version is 0.2.0 alpha. Features on `main` may be unreleased.
     Provider tests use controlled transports; live QCloud acceptance remains open.
