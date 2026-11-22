@@ -231,6 +231,7 @@ docstring of [`harness.py`](harness.py).
 | [`quickstart.py`](quickstart.py) | A support assistant on QCloud: tools, streaming, an approval and a durable session. |
 | [`offline_tour.py`](offline_tour.py) | The loop, an approval pause, a resume and a handoff with a scripted model; no key needed. |
 | [`reliability.py`](reliability.py) | Repeated bounded agent runs, pass@k, pass^k and paired case bootstrap; offline. |
+| [`repository_activity.py`](repository_activity.py) | Indexed commits and CI evidence for yesterday/last-week questions, with a fast local query path and a checked read-only agent. |
 | [`custom_provider.py`](custom_provider.py) | A complete model provider in thirty lines. |
 | [`serve_fastapi.py`](serve_fastapi.py) | An agent over HTTP with server-sent events, approvals and questions to the user. |
 | [`live_acceptance.py`](live_acceptance.py) | A short paid acceptance test against the live QCloud API. |

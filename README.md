@@ -271,6 +271,20 @@ it with another agent:
 python -m examples.scoped_memory --database preferences.db
 ```
 
+## Ask about recent repository work
+
+The [repository activity agent](https://qagents-ai.github.io/qagents/guides/repository-activity/)
+answers questions such as "What changed yesterday?" and "Τι έγινε την προηγούμενη
+εβδομάδα;" from indexed commits and CI evidence. Refresh its SQLite index first.
+Queries use local time and full-text indexes, return commit/run citations and
+report freshness. The fast path needs no model call; optional agent mode uses
+the same evidence with QCloud, OpenAI or Anthropic.
+
+```console
+python -m examples.repository_activity index --repo . --github qagents-ai/qagents
+python -m examples.repository_activity query --question "What changed yesterday and what were the results?"
+```
+
 ## Testing your agents
 
 Repeated evaluations can measure both pass@k and pass^k, with paired confidence

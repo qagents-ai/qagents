@@ -63,6 +63,7 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "ruff>=0.9",
+    "tzdata>=2024.1",  # calendar-window example tests also run on Windows
     "opentelemetry-sdk>=1.20",
     "fastapi>=0.110",  # for examples/serve_fastapi.py and its test
     "uvicorn>=0.30",  # the MCP streamable HTTP test serves the fixture server locally

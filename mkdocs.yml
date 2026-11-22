@@ -84,6 +84,7 @@ nav:
       - Hooks, context and tracing: concepts/hooks.md
   - Guides:
       - Support review agent: guides/support-review.md
+      - Indexed repository activity: guides/repository-activity.md
       - Effects preview status: effects-preview.md
       - Recover an external action: guides/recover-effect.md
       - QAgent Gym and integrations: integrations/gym.md

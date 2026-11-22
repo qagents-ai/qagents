@@ -25,6 +25,7 @@ This index describes qagents 0.2.0. Every page below, in this order, is also in 
 ## Guides
 
 - [Support review agent](https://qagents-ai.github.io/qagents/guides/support-review/): The support agent checks an order with a read-only tool, proposes a case, and waits for a person to approve it.
+- [Indexed repository activity](https://qagents-ai.github.io/qagents/guides/repository-activity/): Answer questions from a local index of commits and GitHub Actions outcomes.
 - [Effects preview status](https://qagents-ai.github.io/qagents/effects-preview/): Effects makes an external action, such as a credit or a refund, a declared operation with a journal of intents and receipts.
 - [Recover an external action](https://qagents-ai.github.io/qagents/guides/recover-effect/): A provider can apply a write and lose the response. The worker needs a durable intent before it sends the request.
 - [QAgent Gym and integrations](https://qagents-ai.github.io/qagents/integrations/gym/): qagents runs the agent loop: tools, permissions, sessions, events and recovery.
