@@ -6,21 +6,46 @@ import json
 import re
 import runpy
 import sys
+import time
 
 import pytest
 
 from examples.harness import last_text, main, scripted_context, system_text
 from examples.patterns import long_running_research as example
 from examples.patterns.long_running_research import SURVEYS, instructions, run, search
-from qagents import RunContext, Usage, prompts
+from qagents import AgentRuntime, RunContext, SQLiteStore, Usage, prompts
 from qagents.models.testing import FunctionModel, call
 
 SITES = list(SURVEYS)  # Larissa, Patras, Kavala, in the order the instructions give
 
 
 @pytest.fixture(autouse=True)
-def short_lease(monkeypatch):
-    monkeypatch.setattr(example, "LEASE_TTL_S", 0.5)
+def controlled_lease_expiry(monkeypatch):
+    """Share a test clock across SQLite workers and the fresh module loaded for replay."""
+    now = time.time()
+    store_init = SQLiteStore.__init__
+    runtime_init = AgentRuntime.__init__
+    recover = AgentRuntime.recover
+
+    def init_store(self, path, **kwargs):
+        store_init(self, path, **(kwargs | {"clock": lambda: now}))
+
+    def init_runtime(self, store, agents, **kwargs):
+        # Keep the live workers clear of the short demo heartbeat deadline on slow CI disks.
+        runtime_init(self, store, agents, **(kwargs | {"lease_ttl_s": 30.0}))
+
+    async def recover_after_expiry(self, *, limit=None):
+        nonlocal now
+        if self.worker_id == "worker-b":
+            status = await self.store.status(example.SESSION)
+            assert status.status == "running" and status.lease_expires_at is not None
+            assert await recover(self, limit=limit) == []  # The old lease still fences recovery.
+            now = status.lease_expires_at + self.store.takeover_grace_s + 1.0
+        return await recover(self, limit=limit)
+
+    monkeypatch.setattr(SQLiteStore, "__init__", init_store)
+    monkeypatch.setattr(AgentRuntime, "__init__", init_runtime)
+    monkeypatch.setattr(AgentRuntime, "recover", recover_after_expiry)
 
 
 def plan(done: int, final: bool = False) -> list[dict[str, str]]:
