@@ -21,6 +21,7 @@ from qagents import (
     tool,
 )
 from qagents.errors import ConfigurationError, SessionError
+from qagents.models.base import ModelResponse
 from qagents.models.testing import ScriptedModel, call
 from qagents.workflow import Workflow, WorkflowStatus, WorkflowSuspended
 
@@ -317,6 +318,28 @@ async def test_a_replayed_agent_step_returns_its_output_in_the_output_type():
     changed = Agent(ScriptedModel([]), name="reviewer", output_type=Stricter)
     with pytest.raises(SessionError, match="give the step a new name"):
         await Workflow(store, id="review").run_agent("check", changed, "Review it")
+
+
+async def test_a_truncated_agent_step_can_be_retried_after_reopening_the_workflow():
+    store = InMemoryStore()
+    cut = ModelResponse(message=Message.assistant("The draft starts"), finish_reason="length")
+    model = ScriptedModel([cut, "The finished draft"])
+    writer = Agent(model, name="writer")
+    workflow = Workflow(store, id="proposal")
+
+    partial = await workflow.run_agent("draft", writer, "Write a proposal")
+    assert partial.stop_reason == "max_output_tokens"
+    assert partial.output == "The draft starts"
+    assert await workflow.completed_steps() == {}
+
+    restarted = Workflow(store, id="proposal")
+    result = await restarted.run_agent("draft", writer, "Write a proposal")
+    assert result.output == "The finished draft"
+    assert result.run_id != partial.run_id
+    assert list(await restarted.completed_steps()) == ["draft"]
+    again = await Workflow(store, id="proposal").run_agent("draft", writer, "Write a proposal")
+    assert again.run_id == result.run_id
+    assert len(model.requests) == 2
 
 
 async def test_status_lists_paused_and_failed_agent_steps():

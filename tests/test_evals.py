@@ -369,6 +369,26 @@ async def test_runs_that_do_not_complete_fail_unless_allowed():
     assert lenient.results[0].passed and lenient.require_completed is False
 
 
+@pytest.mark.parametrize(
+    ("finish_reason", "stop_reason"),
+    [("length", "max_output_tokens"), ("content_filter", "content_filter")],
+)
+async def test_provider_stops_fail_completed_evaluation_even_when_text_matches(
+    finish_reason, stop_reason
+):
+    stopped = ModelResponse(message=Message.assistant("expected text"), finish_reason=finish_reason)
+    agent = Agent(ScriptedModel([stopped, stopped]))
+    cases = [Case(name="draft", prompt="Write the draft", expected="expected text")]
+
+    strict = await evaluate(agent, cases, [ExactMatch()])
+    lenient = await evaluate(agent, cases, [ExactMatch()], require_completed=False)
+
+    (item,) = strict.results
+    assert (item.status, item.stop_reason) == ("completed", stop_reason)
+    assert item.scores == {"exact_match": 1.0} and not item.passed
+    assert lenient.results[0].passed
+
+
 async def test_store_keeps_each_case_session():
     store = InMemoryStore()
     report = await evaluate(weather_agent(), weather_dataset(), store=store)
@@ -699,6 +719,29 @@ async def test_llm_judge_with_your_own_agent_and_its_failures():
 
 
 PAID = Usage(requests=1, input_tokens=100, output_tokens=20, cost_usd=0.02)
+
+
+async def test_llm_judge_skips_truncated_drafts_and_rejects_truncated_verdicts():
+    cut = ModelResponse(message=Message.assistant("Partial draft"), finish_reason="length")
+    grader = judge_model(1.0)
+    report = await evaluate(
+        Agent(ScriptedModel([cut])),
+        [Case(name="draft", prompt="write")],
+        [LLMJudge(grader, "rubric")],
+    )
+    (skipped,) = report.results[0].evaluations
+    assert not skipped.passed and "max_output_tokens" in skipped.reason
+    assert grader.requests == []
+
+    cut_verdict = ModelResponse(
+        message=Message.assistant('{"reason": "fine", "score": 1, "passed": true}'),
+        finish_reason="length",
+        usage=PAID,
+    )
+    judge = LLMJudge(ScriptedModel([cut_verdict]), "rubric")
+    verdict = await judge(context("Complete draft"))
+    assert not verdict.passed and verdict.reason == "the judge gave no verdict (max_output_tokens)"
+    assert verdict.usage == PAID
 
 
 async def test_a_judge_that_fails_keeps_the_usage_it_was_billed_for():

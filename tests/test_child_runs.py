@@ -328,6 +328,20 @@ async def test_a_refused_sub_agent_is_an_error_result_never_ok():
         )
 
 
+async def test_a_truncated_sub_agent_is_an_error_result():
+    cut = ModelResponse(message=Message.assistant("The draft starts"), finish_reason="length")
+    writer = Agent(ScriptedModel([cut]), name="writer")
+    lead_model = ScriptedModel([call("writer", task="Write the proposal"), "Try again later"])
+
+    await Agent(lead_model, tools=[writer]).run("Draft a proposal")
+
+    result = lead_model.requests[1].messages[-1].tool_results[0]
+    assert result.is_error
+    assert result.content == prompts.SUBAGENT_STOPPED.format(
+        name="writer", reason="max_output_tokens"
+    )
+
+
 async def test_a_failed_or_timed_out_child_still_counts_its_usage_in_the_parent():
     billed = Usage(requests=1, input_tokens=4000, output_tokens=1000)
     worker = Agent(

@@ -660,8 +660,17 @@ class AnthropicModel(Model):
             raise self._bad_request(f"{self.name} has no effort parameter (output_config.effort).")
         if effort == "xhigh" and base in NO_XHIGH_EFFORT:
             raise self._bad_request(f"{self.name} has no 'xhigh' effort; use 'high' or 'max'.")
-        thinking = extra.get("thinking") or {}
-        if thinking.get("type") == "adaptive" and base in MANUAL_THINKING_ONLY:
+        thinking = extra.get("thinking")
+        if (
+            base == "claude-opus-5-5"
+            and thinking is not None
+            and thinking.get("type") != "adaptive"
+        ):
+            raise self._bad_request(
+                f"{self.name} requires adaptive thinking. Omit thinking or set its type "
+                "to 'adaptive' and use output_config.effort to control reasoning depth."
+            )
+        if thinking and thinking.get("type") == "adaptive" and base in MANUAL_THINKING_ONLY:
             raise self._bad_request(
                 f"{self.name} has no adaptive thinking; use {{'type': 'enabled', "
                 "'budget_tokens': N}."
@@ -982,15 +991,14 @@ class AnthropicModel(Model):
         last = responses[-1]
         parts: list[Part] = []
         usage = Usage()
-        cost: float | None = 0.0
         metadata: dict[str, Any] = {}
         for accumulator in responses:
             parts.extend(accumulator.parts())
-            usage = usage.add(accumulator.usage())
-            piece = self._cost(accumulator)
-            cost = None if cost is None or piece is None else cost + piece
+            segment = accumulator.usage()
+            segment.cost_usd = self._cost(accumulator)
+            # Usage.add classifies each segment by whether its price is known.
+            usage = usage.add(segment)
             metadata.update(accumulator.metadata())
-        usage.cost_usd = cost
         # The size of the last request sent, unlike usage, which sums every segment.
         context_tokens = metadata["context_tokens"] = last.context_tokens()
         finish = _FINISH_REASONS.get(last.stop_reason or "", "stop")
