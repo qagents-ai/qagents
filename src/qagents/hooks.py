@@ -73,7 +73,11 @@ class Hooks:
     async def after_model(
         self, ctx: RunContext[Any], response: ModelResponse
     ) -> ModelResponse | None:
-        """Inspect or replace the model's response before the loop acts on it."""
+        """Inspect or replace the model's response before the loop acts on it.
+
+        The provider's measured usage is already included in the run budget and journal.
+        Replacing or rejecting the response does not change that charge.
+        """
 
     async def before_tool(
         self, ctx: RunContext[Any], call: ToolCallPart

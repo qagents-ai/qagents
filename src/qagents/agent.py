@@ -2239,11 +2239,24 @@ class _Run:
                 )
             return
 
-        response = await self.hooks.after_model(ctx, response)
-        if (updated := await self._save_state()) is not None:
-            yield updated
+        # Provider usage is measured even if the response is rejected or the hook is
+        # cancelled. Settle it before calling application code, without admitting the
+        # response's content to the conversation until that code returns successfully.
+        measured = response.usage.model_dump(mode="json")
         with self._usage_lock:
             self.usage = self.usage.add(response.usage)
+        await self._journal(
+            "model_usage",
+            {
+                "usage": measured,
+                "turn": self.turn,
+                "model": response.model or model.name,
+                "provider": response.provider or model.provider,
+            },
+        )
+        response = await self.hooks.after_model(self._ctx(), response)
+        if (updated := await self._save_state()) is not None:
+            yield updated
         self._last_response = response
         self._refused = response.finish_reason == "content_filter"
         answered_by = {
@@ -2262,7 +2275,8 @@ class _Run:
             update={"name": self.agent.name, "metadata": metadata}
         )
         details = {
-            "usage": response.usage.model_dump(mode="json"),
+            "usage": measured,
+            "model_usage_recorded": True,  # also keep usage on messages for older readers
             **answered_by,
             "turn": self.turn,
         }

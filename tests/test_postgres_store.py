@@ -181,7 +181,8 @@ def test_a_conversation_survives_a_new_store_instance(backend):
             "What is my name?",
         ]
         entries = await backend.store().load("user-1")
-        assert [entry.seq for entry in entries] == list(range(1, 9))
+        assert [entry.seq for entry in entries] == list(range(1, 11))
+        assert [entry.kind for entry in entries].count("model_usage") == 2
         assert [entry.kind for entry in entries].count("run_finished") == 2
 
     backend.run(check)
