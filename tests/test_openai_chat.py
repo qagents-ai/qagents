@@ -216,6 +216,22 @@ async def test_agent_runs_against_an_openai_compatible_server():
     }  # fmt: skip
 
 
+async def test_adapter_waits_for_long_provider_retry_after(monkeypatch):
+    waits = []
+
+    async def record_wait(seconds):
+        waits.append(seconds)
+
+    def reply(request: httpx.Request):
+        if not waits:
+            return httpx.Response(429, headers={"retry-after": "95"}, json={"error": {}})
+        return streaming(sse(delta(content="ok"), delta(finish_reason="stop")))
+
+    monkeypatch.setattr("qagents.models.openai_chat.asyncio.sleep", record_wait)
+    await model_with(reply).request(ModelRequest(messages=[Message.user("x")]))
+    assert waits == [95]
+
+
 async def test_only_requests_that_never_ran_are_sent_again():
     attempts = {"n": 0}
 

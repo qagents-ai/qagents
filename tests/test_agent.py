@@ -24,6 +24,30 @@ from qagents.errors import ConfigurationError, ModelRateLimitError, ModelServerE
 from qagents.models.testing import FunctionModel, ScriptedModel, call
 
 
+async def test_provider_retry_after_is_not_shortened(monkeypatch):
+    waits = []
+
+    async def record_wait(self, seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr("qagents.agent._Run._sleep", record_wait)
+    model = ScriptedModel([ModelRateLimitError("busy", retryable=True, retry_after=95), "done"])
+    result = await Agent(model).run("draft")
+    assert result.output == "done"
+    assert waits == [95]
+
+
+async def test_run_deadline_interrupts_a_long_provider_wait():
+    model = ScriptedModel([ModelRateLimitError("busy", retryable=True, retry_after=95), "unused"])
+    agent = Agent(model, limits=Limits(timeout_s=0.1))
+    result = await asyncio.wait_for(agent.run("draft"), timeout=3)
+    assert (result.status, result.stop_reason, len(model.requests)) == (
+        "limit_reached",
+        "timeout",
+        1,
+    )
+
+
 @tool(read_only=True)
 def get_weather(city: str) -> str:
     """Look up the weather for a city."""

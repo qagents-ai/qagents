@@ -54,6 +54,7 @@ from ..messages import (
     ToolResultPart,
     Usage,
 )
+from ._retry import retry_after_seconds
 from .base import (
     FinishReason,
     Model,
@@ -1103,7 +1104,7 @@ class AnthropicModel(Model):
                 status_code=status,
                 code=error.error_code or kind,
                 request_id=error.request_id,
-                retry_after=_retry_after(error.response.headers),
+                retry_after=retry_after_seconds(error.response.headers),
             )
             message = f"[{status}] {error.api_message or error.message}"
             if started or status < 400:
@@ -1858,22 +1859,3 @@ class _Accumulator:
         if self.served_by and _base_id(self.served_by) != _base_id(self.model):
             metadata["served_by"] = self.served_by
         return metadata
-
-
-def _retry_after(headers: Mapping[str, str]) -> float | None:
-    milliseconds = headers.get("retry-after-ms")
-    if milliseconds is not None:
-        try:
-            value = float(milliseconds) / 1000
-        except ValueError:
-            value = -1.0
-        if value >= 0:
-            return value
-    seconds = headers.get("retry-after")
-    if seconds is None:
-        return None
-    try:
-        value = float(seconds)
-    except ValueError:
-        return None
-    return value if value >= 0 else None
