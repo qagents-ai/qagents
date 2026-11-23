@@ -933,6 +933,51 @@ async def test_a_stream_that_stops_early_is_an_ambiguous_error():
     assert caught.value.ambiguous
 
 
+@pytest.mark.parametrize(
+    ("start", "terminal"),
+    [
+        ([message_start()], [MESSAGE_STOP]),
+        ([message_start()], [message_delta("unexpected_terminal_reason"), MESSAGE_STOP]),
+        ([], [message_delta("tool_use"), MESSAGE_STOP]),
+    ],
+)
+async def test_an_incomplete_or_unrecognized_stream_cannot_authorize_a_tool(start, terminal):
+    ran = []
+
+    @tool(read_only=True)
+    def record(value: str) -> str:
+        """Record the value for this test."""
+        ran.append(value)
+        return value
+
+    fake = FakeAnthropic(
+        sse(*start, *tool_events(0, "tool_1", "record", '{"value":"partial"}'), *terminal),
+        reply(text_events(0, "done")),
+    )
+    with pytest.raises(ModelResponseError) as caught:
+        await Agent(make_model(fake), tools=[record]).run("Check")
+    assert caught.value.ambiguous
+    assert ran == [] and len(fake.bodies) == 1
+
+
+async def test_continuation_reports_final_stop_and_model_but_all_cache_writes():
+    attempt = {**iteration("message", "claude-opus-5", 10, 20), "cache_creation_input_tokens": 100}
+    fake = FakeAnthropic(
+        reply(
+            text_events(0, "Looking. "),
+            start=message_start(model="claude-opus-5", cache_write=40),
+            stop_reason="pause_turn",
+            usage_extra={"iterations": [attempt]},
+        ),
+        reply(text_events(0, "Done."), start=message_start(cache_write=200)),
+    )
+    response = await make_model(fake).request(ModelRequest(messages=[Message.user("hi")]))
+    metadata = response.message.metadata["anthropic"]
+    assert response.finish_reason == "stop" and "stop_reason" not in metadata
+    assert response.model == "claude-opus-5-5" and "served_by" not in metadata
+    assert metadata["cache_creation_input_tokens"] == 300
+
+
 # --- thinking replay -------------------------------------------------------------------------------
 
 

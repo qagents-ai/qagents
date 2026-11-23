@@ -915,7 +915,7 @@ class AnthropicModel(Model):
                     # emitted nothing: repeating the model request would run it again.
                     error.ambiguous = True
                 raise
-            if not accumulator.complete:
+            if not accumulator.started or not accumulator.complete:
                 raise ModelResponseError(
                     "The response stream ended before the model finished.",
                     provider=self.provider,
@@ -989,19 +989,33 @@ class AnthropicModel(Model):
 
     def _response(self, responses: list[_Accumulator]) -> ModelResponse:
         last = responses[-1]
+        if last.stop_reason is None or last.stop_reason not in _FINISH_REASONS:
+            # A message_stop alone does not say whether a tool or answer was cut off.
+            raise ModelResponseError(
+                "The response stream ended without a recognized stop reason.",
+                provider=self.provider,
+                model=self.name,
+                ambiguous=True,
+            )
         parts: list[Part] = []
         usage = Usage()
-        metadata: dict[str, Any] = {}
+        metadata = last.metadata()
+        cache_creation_tokens = 0
         for accumulator in responses:
             parts.extend(accumulator.parts())
             segment = accumulator.usage()
             segment.cost_usd = self._cost(accumulator)
             # Usage.add classifies each segment by whether its price is known.
             usage = usage.add(segment)
-            metadata.update(accumulator.metadata())
+            cache_creation_tokens += sum(
+                entry.cache_creation_tokens
+                for entry in accumulator.iterations or [accumulator.totals()]
+            )
+        if cache_creation_tokens:
+            metadata["cache_creation_input_tokens"] = cache_creation_tokens
         # The size of the last request sent, unlike usage, which sums every segment.
         context_tokens = metadata["context_tokens"] = last.context_tokens()
-        finish = _FINISH_REASONS.get(last.stop_reason or "", "stop")
+        finish = _FINISH_REASONS[last.stop_reason]
         if last.stop_reason in ("pause_turn", "compaction"):
             logger.warning(
                 "%s paused its turn %d times; returning the partial turn. Raise "
@@ -1841,8 +1855,6 @@ class _Accumulator:
             metadata["stop_reason"] = self.stop_reason
         if self.stop_details:
             metadata["stop_details"] = self.stop_details
-        if self.cache_creation_tokens:
-            metadata["cache_creation_input_tokens"] = self.cache_creation_tokens
         if self.served_by and _base_id(self.served_by) != _base_id(self.model):
             metadata["served_by"] = self.served_by
         return metadata
