@@ -6610,6 +6610,7 @@ Entry kinds:
 |---|---|
 | `run_started` | a run began (`agent`; `limits` when given to the run) |
 | `message` | a message joined the conversation (`message`; see below) |
+| `model_usage` | measured `usage`, `turn`, conversation `model_turn`, `model` and `provider` |
 | `tool_started` | a tool call began executing (`tool_call_id`, `name`) |
 | `tool_result` | a tool call finished (`result`; see below) |
 | `tool_deferred` | a tool call waits for a result from outside the run (`input`) |
@@ -6627,9 +6628,11 @@ Entry kinds:
 
 Details:
 
-* A `message` from a model response also has the response's `usage`, the
-  `model` and `provider` that answered, and the run's `turn`; a resume adds
-  them up, so limits and `RunResult.usage` cover the whole run.
+* A `message` from a model response carries its `model`, `provider`, `turn` and `usage`.
+  When it has `model_usage_recorded`, the separate `model_usage` entry already counts that
+  paid turn and usage. Older messages carry their own usage. If a response hook never admitted
+  the response to the conversation, recovery keeps the paid spend while retrying the same
+  logical model turn, subject to the remaining run budget.
 * A `tool_result` has `counted` when the call counts toward
   ``Limits.max_tool_calls``. A call waiting for approval counts only once an
   approval lets it run (its `tool_started`).

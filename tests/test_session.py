@@ -43,10 +43,10 @@ async def test_sqlite_session_survives_a_restart(tmp_path):
 
     kinds = [entry.kind for entry in await Session(store, id="user-1").entries()]
     assert kinds == [
-        "run_started", "message", "message", "run_finished",
-        "run_started", "message", "message", "run_finished",
+        "run_started", "message", "model_usage", "message", "run_finished",
+        "run_started", "message", "model_usage", "message", "run_finished",
     ]  # fmt: skip
-    assert [e.seq for e in await store.load("user-1")] == list(range(1, 9))
+    assert [e.seq for e in await store.load("user-1")] == list(range(1, len(kinds) + 1))
     assert await Session(store, id="someone-else").messages() == []
     await store.aclose()
 
@@ -319,7 +319,7 @@ async def test_a_store_that_overrides_only_append_sees_every_entry_of_a_plain_ru
         store.seen = []
     async with store:
         await Agent(ScriptedModel(["hi"])).run("hello", session=Session(store, id="s"))
-        assert store.seen == ["run_started", "message", "message", "run_finished"]
+        assert store.seen == ["run_started", "message", "model_usage", "message", "run_finished"]
         assert [entry.kind for entry in await store.load("s")] == store.seen
 
 

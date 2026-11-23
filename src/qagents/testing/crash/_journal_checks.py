@@ -476,10 +476,13 @@ def check_usage(entries: Sequence[Entry], model_calls) -> Check:
     for entry in entries:
         data = entry.data
         if (
-            entry.kind != "message"
-            or data.get("message", {}).get("role") != "assistant"
-            or "usage" not in data
-        ):
+            entry.kind != "model_usage"
+            and (
+                entry.kind != "message"
+                or data.get("message", {}).get("role") != "assistant"
+                or data.get("model_usage_recorded") is True
+            )
+        ) or "usage" not in data:
             continue
         tag = (entry.run_id, data.get("turn"))
         if tag[1] is None:
@@ -495,15 +498,18 @@ def check_usage(entries: Sequence[Entry], model_calls) -> Check:
             )
             continue
         seen_turns.add(tag)
+        model_tag = (entry.run_id, data.get("model_turn", tag[1]))
         usage = Usage.model_validate(data["usage"])
-        parts = Message.model_validate(data["message"]).parts
+        # Older entries kept usage with the assistant message. The separate receipt
+        # is recorded before application hooks decide whether to use its content.
+        parts = Message.model_validate(data["message"]).parts if entry.kind == "message" else None
         matched = next(
             (
                 index
                 for index, call in enumerate(remaining)
-                if (call.run_id, call.turn + 1 if call.turn is not None else None) == tag
+                if (call.run_id, call.turn + 1 if call.turn is not None else None) == model_tag
                 and call.response is not None
-                and call.response.message.parts == parts
+                and (parts is None or call.response.message.parts == parts)
                 and call.usage == usage
             ),
             None,
@@ -529,6 +535,7 @@ def check_usage_totals(entries: Sequence[Entry]) -> Check:
         return _check("I7b", [])
     subtotal = Usage()
     countable = {
+        "model_usage",
         "message",
         "tool_result",
         "tool_checkpoint",
@@ -543,6 +550,12 @@ def check_usage_totals(entries: Sequence[Entry]) -> Check:
             break
         if entry.kind in countable:
             for key in ("usage", "added_usage"):
+                if (
+                    key == "usage"
+                    and entry.kind == "message"
+                    and entry.data.get("model_usage_recorded") is True
+                ):
+                    continue
                 if data := entry.data.get(key):
                     subtotal = subtotal.add(Usage.model_validate(data))
     reported = derive_state(list(entries)).run_usage

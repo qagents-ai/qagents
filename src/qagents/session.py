@@ -13,6 +13,7 @@ Entry kinds:
 |---|---|
 | `run_started` | a run began (`agent`; `limits` when given to the run) |
 | `message` | a message joined the conversation (`message`; see below) |
+| `model_usage` | measured `usage`, `turn`, conversation `model_turn`, `model` and `provider` |
 | `tool_started` | a tool call began executing (`tool_call_id`, `name`) |
 | `tool_result` | a tool call finished (`result`; see below) |
 | `tool_deferred` | a tool call waits for a result from outside the run (`input`) |
@@ -30,9 +31,11 @@ Entry kinds:
 
 Details:
 
-* A `message` from a model response also has the response's `usage`, the
-  `model` and `provider` that answered, and the run's `turn`; a resume adds
-  them up, so limits and `RunResult.usage` cover the whole run.
+* A `message` from a model response carries its `model`, `provider`, `turn` and `usage`.
+  When it has `model_usage_recorded`, the separate `model_usage` entry already counts that
+  paid turn and usage. Older messages carry their own usage. If a response hook never admitted
+  the response to the conversation, recovery keeps the paid spend while retrying the same
+  logical model turn, subject to the remaining run budget.
 * A `tool_result` has `counted` when the call counts toward
   ``Limits.max_tool_calls``. A call waiting for approval counts only once an
   approval lets it run (its `tool_started`).
@@ -187,6 +190,8 @@ class SessionState(BaseModel):
     resume continues from it, so limits cover the whole run."""
     run_turns: int = 0
     """Model requests of the latest run that produced a journaled response."""
+    run_model_turns: int = 0
+    """Logical model turns that made it into the conversation, for recovery."""
     run_tool_call_ids: list[str] = Field(default_factory=list)
     """Tool calls of the latest run that count toward ``Limits.max_tool_calls``."""
     checkpoints: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -282,6 +287,12 @@ def derive_state(entries: list[Entry], *, session_id: str | None = None) -> Sess
             checkpoints = {}  # a new message closes the turn whose calls recorded them
             state.open_turn_starts = {}
             if entry.run_id is not None and entry.run_id == state.open_run_id:
+                _count_usage(state, data, model_usage=data.get("model_usage_recorded") is not True)
+                turn = int(data.get("turn") or 0)
+                state.run_model_turns = max(state.run_model_turns, turn)
+                state.run_turns = max(state.run_turns, turn)
+        elif kind == "model_usage":
+            if entry.run_id is not None and entry.run_id == state.open_run_id:
                 _count_usage(state, data)
                 state.run_turns = max(state.run_turns, int(data.get("turn") or 0))
         elif kind == "tool_started":
@@ -327,6 +338,7 @@ def derive_state(entries: list[Entry], *, session_id: str | None = None) -> Sess
             state.run_usage = Usage()
             state.operation_usage = {}
             state.run_turns = 0
+            state.run_model_turns = 0
             counted = {}
             checkpoints = {}
         elif kind == "run_resumed":
@@ -389,11 +401,12 @@ def _mark_blocked(messages: list[Message]) -> None:
             return
 
 
-def _count_usage(state: SessionState, data: dict[str, Any]) -> None:
+def _count_usage(state: SessionState, data: dict[str, Any], *, model_usage: bool = True) -> None:
     """Add an entry's usage: a model response's ``usage``, and ``added_usage``
     (from ``ctx.add_usage``: a compactor's summary request, a sub-agent), with the
     tool calls that added it (``added_usage_by_operation``)."""
-    for key in ("usage", "added_usage"):
+    keys = ("usage", "added_usage") if model_usage else ("added_usage",)
+    for key in keys:
         if usage := data.get(key):
             state.run_usage = state.run_usage.add(Usage.model_validate(usage))
     for operation_id, usage in _usage_loads(data).items():

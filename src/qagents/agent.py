@@ -1120,6 +1120,8 @@ class _Run:
         self.new_messages: list[Message] = []
         self.usage = Usage()
         self.turn = 0
+        # A charged response may be rejected before it joins the conversation.
+        self._model_turn = 0
         self.output: Any = None
         self.tools: dict[str, Tool] = {}
         self.handoffs: dict[str, Agent] = {}
@@ -1559,6 +1561,7 @@ class _Run:
                 self.status, self.stop_reason = "limit_reached", stop_reason
                 return
             self.turn += 1
+            self._model_turn += 1
             yield TurnStarted(turn=self.turn, agent=self.agent.name)
             async with contextlib.aclosing(self._model_phase()) as phase:
                 async for event in phase:
@@ -1758,6 +1761,7 @@ class _Run:
             )
             self._legacy_pause_tokens = False
         self.usage, self.turn = state.run_usage, state.run_turns
+        self._model_turn = state.run_model_turns
         # A call that waited for approval has not been allowed to run yet: it is counted
         # when an approval lets it run (journals list paused calls among the counted ones).
         # One that started after its approval did run (or may have), so it still counts.
@@ -2237,15 +2241,29 @@ class _Run:
                         name=self.agent.name,
                         metadata={"interrupted": True},
                     ),
-                    extra={"turn": self.turn},
+                    extra={"turn": self._model_turn},
                 )
             return
 
-        response = await self.hooks.after_model(ctx, response)
-        if (updated := await self._save_state()) is not None:
-            yield updated
+        # Provider usage is measured even if the response is rejected or the hook is
+        # cancelled. Settle it before calling application code, without admitting the
+        # response's content to the conversation until that code returns successfully.
+        measured = response.usage.model_dump(mode="json")
         with self._usage_lock:
             self.usage = self.usage.add(response.usage)
+        await self._journal(
+            "model_usage",
+            {
+                "usage": measured,
+                "turn": self.turn,
+                "model_turn": self._model_turn,
+                "model": response.model or model.name,
+                "provider": response.provider or model.provider,
+            },
+        )
+        response = await self.hooks.after_model(self._ctx(), response)
+        if (updated := await self._save_state()) is not None:
+            yield updated
         self._last_response = response
         self._refused = response.finish_reason == "content_filter"
         answered_by = {
@@ -2264,9 +2282,10 @@ class _Run:
             update={"name": self.agent.name, "metadata": metadata}
         )
         details = {
-            "usage": response.usage.model_dump(mode="json"),
+            "usage": measured,
+            "model_usage_recorded": True,  # also keep usage on messages for older readers
             **answered_by,
-            "turn": self.turn,
+            "turn": self._model_turn,
         }
         async with self._batched():
             await self._append(message, extra=details)
@@ -2284,7 +2303,7 @@ class _Run:
         async with contextlib.aclosing(stream):
             while True:
                 token = _ports.MODEL_TURN.set(
-                    _ports.ModelTurn(self.session.id, self.run_id, self.turn - 1)
+                    _ports.ModelTurn(self.session.id, self.run_id, self._model_turn - 1)
                 )
                 try:
                     event = await anext(stream)
