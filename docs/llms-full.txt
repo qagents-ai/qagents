@@ -6885,7 +6885,7 @@ Details of one member: get_api("qagents.models.qcloud.QCloudModel.<member>").
 
 ## qagents.models.openai_chat.OpenAIChatModel (class)
 
-Source: `src/qagents/models/openai_chat.py:66` | qagents 0.2.0
+Source: `src/qagents/models/openai_chat.py:67` | qagents 0.2.0
 Import: `from qagents.models.openai_chat import OpenAIChatModel`
 
 ```python

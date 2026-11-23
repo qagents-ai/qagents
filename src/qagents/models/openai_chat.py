@@ -35,6 +35,7 @@ from ..errors import (
     ModelTimeoutError,
 )
 from ._openai_wire import ChatAccumulator, build_chat_body
+from ._retry import retry_after_seconds
 from .base import (
     Model,
     ModelCapabilities,
@@ -384,9 +385,7 @@ class OpenAIChatModel(Model):
             error = self._status_error(response, raw)
             if isinstance(error, ModelRateLimitError) and not last:
                 delay = error.retry_after
-                await asyncio.sleep(
-                    delay if delay is not None and delay <= 60 else _backoff(attempt)
-                )
+                await asyncio.sleep(delay if delay is not None else _backoff(attempt))
                 continue
             raise error
         raise AssertionError("unreachable")
@@ -449,7 +448,7 @@ class OpenAIChatModel(Model):
             status_code=response.status_code if response is not None else None,
             code=code,
             request_id=headers.get("x-request-id") or headers.get("request-id"),
-            retry_after=_retry_after(headers.get("retry-after")),
+            retry_after=retry_after_seconds(headers),
             retryable=retryable,
             ambiguous=ambiguous,
         )
@@ -526,16 +525,6 @@ def _error_code(data: dict[str, Any]) -> str | None:
     if isinstance(error, dict) and isinstance(error.get("code"), str):
         return error["code"]
     return None
-
-
-def _retry_after(value: str | None) -> float | None:
-    if value is None:
-        return None
-    try:
-        delay = float(value)
-    except ValueError:
-        return None
-    return delay if delay >= 0 else None
 
 
 def _backoff(attempt: int) -> float:

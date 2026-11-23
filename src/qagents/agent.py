@@ -2217,8 +2217,10 @@ class _Run:
                 if not may_retry:
                     raise
                 attempt += 1
-                delay = error.retry_after if error.retry_after is not None else 0.5 * 2**attempt
-                await self._sleep(min(delay, 60.0))
+                delay = error.retry_after
+                if delay is None:
+                    delay = min(0.5 * 2 ** min(attempt, 7), 60.0)
+                await self._sleep(delay)
                 continue
             break
 
