@@ -6,7 +6,9 @@ import pytest
 
 from qagents import Agent, Hooks, Limits, Message, Session, SQLiteStore, Usage
 from qagents.errors import ModelServerError
+from qagents.models.base import ModelResponse
 from qagents.models.testing import ScriptedModel, call
+from qagents.testing.crash._model import ModelLedger
 
 MEASURED = Usage(requests=1, input_tokens=13, output_tokens=7, cost_usd=0.42)
 
@@ -46,6 +48,7 @@ async def test_rejected_response_remains_billable_in_sqlite_after_reopen(tmp_pat
         assert receipt == {
             "usage": MEASURED.model_dump(mode="json"),
             "turn": 1,
+            "model_turn": 1,
             "model": "scripted",
             "provider": "test",
         }
@@ -55,6 +58,28 @@ async def test_rejected_response_remains_billable_in_sqlite_after_reopen(tmp_pat
     assert resumed.stop_reason == "max_cost_usd"
     assert resumed.usage == MEASURED
     assert len(model.requests) == 1
+
+
+async def test_recovery_replays_the_same_logical_turn_and_counts_both_responses():
+    first = ModelResponse(message=Message.assistant("First logical answer"), usage=MEASURED)
+    ledger = ModelLedger([first, "The later logical answer"])
+    session = Session()
+    failed = Agent(ledger.for_leg(0), hooks=[RejectResponse()])
+
+    with pytest.raises(ValueError, match="rejected by a hook"):
+        await failed.run("Hello", session=session)
+
+    recovered = Agent(ledger.for_leg(1, recovering=True), limits=Limits(max_turns=2))
+    result = await recovered.resume(session)
+
+    assert result.output == "First logical answer"
+    assert result.turns == 2
+    assert result.usage == MEASURED.add(MEASURED)
+    assert [call.turn for call in ledger.calls] == [0, 0]
+    receipts = [entry.data for entry in await session.entries() if entry.kind == "model_usage"]
+    assert [(receipt["turn"], receipt["model_turn"]) for receipt in receipts] == [(1, 1), (2, 1)]
+    state = await session.state()
+    assert state.run_turns == 2 and state.run_model_turns == 1
 
 
 async def test_cancelling_after_model_preserves_its_already_settled_usage():

@@ -498,6 +498,7 @@ def check_usage(entries: Sequence[Entry], model_calls) -> Check:
             )
             continue
         seen_turns.add(tag)
+        model_tag = (entry.run_id, data.get("model_turn", tag[1]))
         usage = Usage.model_validate(data["usage"])
         # Older entries kept usage with the assistant message. The separate receipt
         # is recorded before application hooks decide whether to use its content.
@@ -506,7 +507,7 @@ def check_usage(entries: Sequence[Entry], model_calls) -> Check:
             (
                 index
                 for index, call in enumerate(remaining)
-                if (call.run_id, call.turn + 1 if call.turn is not None else None) == tag
+                if (call.run_id, call.turn + 1 if call.turn is not None else None) == model_tag
                 and call.response is not None
                 and (parts is None or call.response.message.parts == parts)
                 and call.usage == usage
